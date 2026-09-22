@@ -62,6 +62,8 @@ const (
 	PreferredRootFSTypeNA
 )
 
+type LCOWSharedMemoryRegion = hcsschema.SharedMemoryRegion
+
 type ConfidentialLCOWOptions struct {
 	*ConfidentialCommonOptions
 	UseGuestStateFile  bool   // Use a vmgs file that contains a kernel and initrd, required for SNP
@@ -99,6 +101,7 @@ type OptionsLCOW struct {
 	HclEnabled              *bool                        // Whether to enable the host compatibility layer
 	ExtraVSockPorts         []uint32                     // Extra vsock ports to allow
 	AssignedDevices         []VPCIDeviceID               // AssignedDevices are devices to add on pod boot
+	SharedMemoryRegions     []LCOWSharedMemoryRegion     // Host sections to map into the UVM
 	PolicyBasedRouting      bool                         // Whether we should use policy based routing when configuring net interfaces in guest
 	WritableOverlayDirs     bool                         // Whether init should create writable overlay mounts for /var and /etc
 }
@@ -500,7 +503,22 @@ func makeLCOWSecurityDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM)
 		},
 	}
 
+	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+
 	return doc, nil
+}
+
+func applyLCOWSharedMemory(doc *hcsschema.ComputeSystem, regions []hcsschema.SharedMemoryRegion) {
+	if len(regions) == 0 {
+		return
+	}
+
+	if doc.VirtualMachine.Devices == nil {
+		doc.VirtualMachine.Devices = &hcsschema.Devices{}
+	}
+	doc.VirtualMachine.Devices.SharedMemory = &hcsschema.SharedMemoryConfiguration{
+		Regions: append([]hcsschema.SharedMemoryRegion(nil), regions...),
+	}
 }
 
 /*
@@ -890,6 +908,9 @@ func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 			doc.VirtualMachine.Chipset.LinuxKernelDirect.InitRdPath = rootfsFullPath
 		}
 	}
+
+	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+
 	return doc, nil
 }
 

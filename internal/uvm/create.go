@@ -180,6 +180,17 @@ func VerifyOptions(_ context.Context, options interface{}) error {
 				return errors.New("VPMemSizeBytes must be a multiple of 4096")
 			}
 		}
+		for i, region := range opts.SharedMemoryRegions {
+			if region.SectionName == "" {
+				return fmt.Errorf("shared-memory region %d has an empty section name", i)
+			}
+			if region.StartOffset < 0 {
+				return fmt.Errorf("shared-memory region %d has a negative start offset", i)
+			}
+			if region.Length <= 0 {
+				return fmt.Errorf("shared-memory region %d length must be greater than zero", i)
+			}
+		}
 		if opts.KernelDirect && osversion.Build() < 18286 {
 			return errors.New("KernelDirectBoot is not supported on builds older than 18286")
 		}

@@ -6,8 +6,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/containerd/console"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -15,6 +18,7 @@ import (
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/memory"
@@ -43,6 +47,9 @@ const (
 	securityHardwareFlag          = "security-hardware"
 	noVerityBoot                  = "no-verity-boot"
 	securityPolicyEnforcerArgName = "security-policy-enforcer"
+	sharedMemoryNameArgName       = "shared-memory-name"
+	sharedMemorySizeArgName       = "shared-memory-size"
+	sharedMemoryObserveArgName    = "shared-memory-observe-duration"
 )
 
 var (
@@ -151,26 +158,128 @@ var lcowCommand = cli.Command{
 			Name:  vpmemMountsArgName,
 			Usage: "List of VHDs to VPMem mount into the UVM. Use repeat instances to add multiple. ",
 		},
+		cli.StringFlag{
+			Name: sharedMemoryNameArgName,
+			Usage: "Name of a pagefile-backed Windows section to map into every UVM. " +
+				"Requires --shared-memory-size.",
+		},
+		cli.Uint64Flag{
+			Name:  sharedMemorySizeArgName,
+			Usage: "Size in bytes of the shared-memory section. Maximum 2147483647.",
+		},
+		cli.DurationFlag{
+			Name: sharedMemoryObserveArgName,
+			Usage: "When GCS is disabled, keep the UVM running for this " +
+				"duration before terminating it.",
+		},
 	},
 	Action: func(c *cli.Context) error {
+		var section *sharedMemorySection
+		if c.IsSet(sharedMemoryNameArgName) || c.IsSet(sharedMemorySizeArgName) {
+			name := c.String(sharedMemoryNameArgName)
+			size := c.Uint64(sharedMemorySizeArgName)
+			if name == "" {
+				name = fmt.Sprintf("hcsshim-uvmboot-shared-%d", os.Getpid())
+			}
+
+			var err error
+			section, err = createSharedMemorySection(name, size)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := section.Close(); err != nil {
+					logrus.WithError(err).Warn("failed to close shared-memory section")
+				}
+			}()
+
+			logrus.WithFields(logrus.Fields{
+				"section":     section.name,
+				"hcs-section": section.hcsName,
+				"size":        section.size,
+				"seed":        "HCSHMEM1-HOST-SEED",
+			}).Info("created shared-memory section")
+		}
+
+		var (
+			firstErr error
+			errMu    sync.Mutex
+		)
 		runMany(c, func(id string) error {
 			ctx := context.Background()
 
 			options, err := createLCOWOptions(ctx, c, id)
 			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
 				return err
 			}
+			if section != nil {
+				options.SharedMemoryRegions = []hcsschema.SharedMemoryRegion{
+					{
+						SectionName:     section.hcsName,
+						Length:          int32(section.size),
+						AllowGuestWrite: true,
+					},
+				}
+			}
 
-			return runLCOW(ctx, options, c)
+			err = runLCOW(ctx, options, c)
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+			}
+			return err
 		})
 
+		markerVerified := false
+		if section != nil {
+			prefix, err := section.hexPrefix(96)
+			if err != nil {
+				return err
+			}
+			logrus.WithField("hex", prefix).Info(
+				"final shared-memory prefix",
+			)
+			if c.Duration(sharedMemoryObserveArgName) > 0 {
+				const markerOffset = 64
+				marker := []byte("GUEST-WROTE-OK")
+				if err := section.expect(markerOffset, marker); err != nil {
+					return err
+				}
+				logrus.WithFields(logrus.Fields{
+					"marker": string(marker),
+					"offset": markerOffset,
+				}).Info("observed guest shared-memory marker")
+				markerVerified = true
+			}
+		}
+		if section != nil && firstErr != nil {
+			if markerVerified {
+				logrus.WithError(firstErr).Warn(
+					"ignoring UVM lifecycle error after verified " +
+						"shared-memory marker",
+				)
+				return nil
+			}
+			return firstErr
+		}
 		return nil
 	},
 }
 
 func init() {
 	lcowCommand.CustomHelpTemplate = cli.CommandHelpTemplate + "EXAMPLES:\n" +
-		`.\uvmboot.exe -gcs lcow -boot-files-path "C:\ContainerPlat\LinuxBootFiles" -root-fs-type vhd -t -exec "/bin/bash"`
+		`.\uvmboot.exe -gcs lcow -boot-files-path "C:\ContainerPlat\LinuxBootFiles" -root-fs-type vhd -t -exec "/bin/bash"` +
+		"\n" +
+		`.\uvmboot.exe -count 2 -parallel 2 -gcs lcow -boot-files-path "C:\ContainerPlat\LinuxBootFiles" ` +
+		`-root-fs-type vhd -shared-memory-size 1048576 -exec "sleep 300"`
 }
 
 func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.OptionsLCOW, error) {
@@ -190,6 +299,10 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	}
 
 	setGlobalOptions(c, options.Options)
+	options.ConsolePipe = fmt.Sprintf(`\\.\pipe\uvmpipe-%s`, id)
+	if !useGCS && c.Duration(sharedMemoryObserveArgName) > 0 {
+		options.ConsolePipe = ""
+	}
 
 	// boot
 	if c.IsSet(bootFilesPathArgName) {
@@ -236,6 +349,13 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	}
 	if c.IsSet(vpMemMaxSizeArgName) {
 		options.VPMemSizeBytes = c.Uint64(vpMemMaxSizeArgName) * memory.MiB // convert from MB to bytes
+	}
+	if size := c.Uint64(sharedMemorySizeArgName); size > math.MaxInt32 {
+		return nil, fmt.Errorf(
+			"shared-memory size %d exceeds HCS schema limit %d",
+			size,
+			math.MaxInt32,
+		)
 	}
 
 	// GCS
@@ -340,6 +460,28 @@ func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) erro
 		return err
 	}
 
+	if len(options.SharedMemoryRegions) > 0 {
+		regions, err := vm.SharedMemoryRegions(ctx)
+		if err != nil {
+			return err
+		}
+		if len(regions) == 0 {
+			return fmt.Errorf("HCS returned no shared-memory region information")
+		}
+
+		for _, region := range regions {
+			rawAddress := uint32(region.GuestPhysicalAddress)
+			fmt.Printf(
+				"UVM %s: shared-memory section %q mapped at raw address %#x; "+
+					"if page-based, byte GPA is %#x\n",
+				vm.ID(),
+				region.SectionName,
+				rawAddress,
+				uint64(rawAddress)<<12,
+			)
+		}
+	}
+
 	if err := mountSCSI(ctx, c, vm); err != nil {
 		return err
 	}
@@ -360,6 +502,37 @@ func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) erro
 		_ = vm.WaitCtx(ctx)
 
 		return vm.ExitError()
+	}
+
+	if duration := c.Duration(sharedMemoryObserveArgName); duration > 0 {
+		exit := make(chan error, 1)
+		go func() {
+			exit <- vm.WaitCtx(ctx)
+		}()
+
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+
+		select {
+		case err := <-exit:
+			return fmt.Errorf(
+				"UVM exited before the %s observation completed: %w",
+				duration,
+				err,
+			)
+		case <-timer.C:
+			if err := vm.Terminate(ctx); err != nil {
+				return fmt.Errorf(
+					"terminate UVM after %s observation: %w",
+					duration,
+					err,
+				)
+			}
+			<-exit
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	return vm.WaitCtx(ctx)
