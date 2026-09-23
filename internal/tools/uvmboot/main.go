@@ -149,6 +149,11 @@ func setGlobalOptions(c *cli.Context, options *uvm.Options) {
 // todo: add a context here to propagate cancel/timeouts to runFunc uvm
 
 func runMany(c *cli.Context, runFunc uvmRunFunc) {
+	// urfave/cli v1 initializes command and global IsSet state lazily.
+	// Populate both maps before worker goroutines begin reading them.
+	_ = c.IsSet("help")
+	_ = c.GlobalIsSet("help")
+
 	parallelCount := c.GlobalInt(parallelArgName)
 
 	var wg sync.WaitGroup

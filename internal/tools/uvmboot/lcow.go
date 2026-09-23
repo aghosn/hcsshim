@@ -28,29 +28,32 @@ import (
 )
 
 const (
-	annotationsArgName            = "annotation"
-	bootFilesPathArgName          = "boot-files-path"
-	consolePipeArgName            = "console-pipe"
-	kernelDirectArgName           = "kernel-direct"
-	kernelFileArgName             = "kernel-file"
-	forwardStdoutArgName          = "fwd-stdout"
-	forwardStderrArgName          = "fwd-stderr"
-	outputHandlingArgName         = "output-handling"
-	kernelArgsArgName             = "kernel-args"
-	rootFSTypeArgName             = "root-fs-type"
-	vpMemMaxCountArgName          = "vpmem-max-count"
-	vpMemMaxSizeArgName           = "vpmem-max-size"
-	scsiMountsArgName             = "mount-scsi"
-	vpmemMountsArgName            = "mount-vpmem"
-	shareFilesArgName             = "share"
-	securityPolicyArgName         = "security-policy"
-	securityHardwareFlag          = "security-hardware"
-	noVerityBoot                  = "no-verity-boot"
-	securityPolicyEnforcerArgName = "security-policy-enforcer"
-	sharedMemoryNameArgName       = "shared-memory-name"
-	sharedMemorySizeArgName       = "shared-memory-size"
-	sharedMemoryObserveArgName    = "shared-memory-observe-duration"
-	sharedMemoryTwoUVMArgName     = "shared-memory-two-uvm-proof"
+	annotationsArgName                = "annotation"
+	bootFilesPathArgName              = "boot-files-path"
+	consolePipeArgName                = "console-pipe"
+	execFileArgName                   = "exec-file"
+	kernelDirectArgName               = "kernel-direct"
+	kernelFileArgName                 = "kernel-file"
+	forwardStdoutArgName              = "fwd-stdout"
+	forwardStderrArgName              = "fwd-stderr"
+	outputHandlingArgName             = "output-handling"
+	kernelArgsArgName                 = "kernel-args"
+	rootFSTypeArgName                 = "root-fs-type"
+	vpMemMaxCountArgName              = "vpmem-max-count"
+	vpMemMaxSizeArgName               = "vpmem-max-size"
+	scsiMountsArgName                 = "mount-scsi"
+	vpmemMountsArgName                = "mount-vpmem"
+	shareFilesArgName                 = "share"
+	securityPolicyArgName             = "security-policy"
+	securityHardwareFlag              = "security-hardware"
+	noVerityBoot                      = "no-verity-boot"
+	securityPolicyEnforcerArgName     = "security-policy-enforcer"
+	sharedMemoryNameArgName           = "shared-memory-name"
+	sharedMemorySizeArgName           = "shared-memory-size"
+	sharedMemoryObserveArgName        = "shared-memory-observe-duration"
+	sharedMemoryTwoUVMArgName         = "shared-memory-two-uvm-proof"
+	sharedMemoryMappingOnlyArgName    = "shared-memory-mapping-only"
+	sharedMemoryGuestInventoryArgName = "shared-memory-guest-inventory"
 )
 
 var (
@@ -122,6 +125,11 @@ var lcowCommand = cli.Command{
 			Name:  execCommandLineArgName,
 			Usage: "Command to execute in the UVM.",
 		},
+		cli.StringFlag{
+			Name: execFileArgName,
+			Usage: "Read the command to execute in the UVM from a host " +
+				"file. Mutually exclusive with --exec.",
+		},
 		cli.BoolFlag{
 			Name:  forwardStdoutArgName,
 			Usage: "Whether stdout from the process in the UVM should be forwarded",
@@ -178,8 +186,65 @@ var lcowCommand = cli.Command{
 			Usage: "Assign proof roles A and B to exactly two parallel UVMs " +
 				"and verify their shared-memory handshake.",
 		},
+		cli.BoolFlag{
+			Name: sharedMemoryMappingOnlyArgName,
+			Usage: "Require every UVM to start with the same shared-memory " +
+				"mapping, without accessing the guest pages.",
+		},
+		cli.BoolFlag{
+			Name: sharedMemoryGuestInventoryArgName,
+			Usage: "Continue when HCS does not expose the shared-memory GPA " +
+				"so a read-only guest resource inventory can run.",
+		},
 	},
 	Action: func(c *cli.Context) error {
+		execCommand, err := loadExecCommand(c)
+		if err != nil {
+			return err
+		}
+
+		if c.Bool(sharedMemoryGuestInventoryArgName) &&
+			(c.Bool(sharedMemoryMappingOnlyArgName) ||
+				c.Bool(sharedMemoryTwoUVMArgName)) {
+			return fmt.Errorf(
+				"--%s is mutually exclusive with --%s and --%s",
+				sharedMemoryGuestInventoryArgName,
+				sharedMemoryMappingOnlyArgName,
+				sharedMemoryTwoUVMArgName,
+			)
+		}
+		if c.Bool(sharedMemoryGuestInventoryArgName) &&
+			!c.IsSet(sharedMemorySizeArgName) {
+			return fmt.Errorf(
+				"--%s requires --%s",
+				sharedMemoryGuestInventoryArgName,
+				sharedMemorySizeArgName,
+			)
+		}
+		if c.Bool(sharedMemoryMappingOnlyArgName) &&
+			c.Bool(sharedMemoryTwoUVMArgName) {
+			return fmt.Errorf(
+				"--%s and --%s are mutually exclusive",
+				sharedMemoryMappingOnlyArgName,
+				sharedMemoryTwoUVMArgName,
+			)
+		}
+		if c.Bool(sharedMemoryMappingOnlyArgName) {
+			if !c.IsSet(sharedMemorySizeArgName) {
+				return fmt.Errorf(
+					"--%s requires --%s",
+					sharedMemoryMappingOnlyArgName,
+					sharedMemorySizeArgName,
+				)
+			}
+			if c.Duration(sharedMemoryObserveArgName) <= 0 {
+				return fmt.Errorf(
+					"--%s requires a positive --%s",
+					sharedMemoryMappingOnlyArgName,
+					sharedMemoryObserveArgName,
+				)
+			}
+		}
 		if c.Bool(sharedMemoryTwoUVMArgName) {
 			if c.GlobalInt(countArgName) != 2 ||
 				c.GlobalInt(parallelArgName) != 2 {
@@ -225,8 +290,10 @@ var lcowCommand = cli.Command{
 		}
 
 		var (
-			firstErr error
-			errMu    sync.Mutex
+			firstErr       error
+			errMu          sync.Mutex
+			mappingMu      sync.Mutex
+			mappingAddress = make(map[string]uint32)
 		)
 		runMany(c, func(id string) error {
 			ctx := context.Background()
@@ -240,6 +307,12 @@ var lcowCommand = cli.Command{
 				errMu.Unlock()
 				return err
 			}
+			if c.Bool(securityHardwareFlag) {
+				defer os.RemoveAll(options.BundleDirectory)
+			}
+			if !useGCS && execCommand != "" {
+				options.ExecCommandLine = execCommand
+			}
 			if section != nil {
 				options.SharedMemoryRegions = []hcsschema.SharedMemoryRegion{
 					{
@@ -250,7 +323,34 @@ var lcowCommand = cli.Command{
 				}
 			}
 
-			err = runLCOW(ctx, options, c)
+			err = runLCOW(
+				ctx,
+				options,
+				c,
+				execCommand,
+				func(
+					uvmID string,
+					regions []hcsschema.SharedMemoryRegionInfo,
+				) error {
+					if !c.Bool(sharedMemoryMappingOnlyArgName) {
+						return nil
+					}
+					if len(regions) != 1 {
+						return fmt.Errorf(
+							"UVM %s returned %d shared-memory mappings, expected 1",
+							uvmID,
+							len(regions),
+						)
+					}
+					rawAddress := uint32(
+						regions[0].GuestPhysicalAddress,
+					)
+					mappingMu.Lock()
+					mappingAddress[uvmID] = rawAddress
+					mappingMu.Unlock()
+					return nil
+				},
+			)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -261,10 +361,49 @@ var lcowCommand = cli.Command{
 			return err
 		})
 
+		if c.Bool(sharedMemoryMappingOnlyArgName) {
+			if firstErr != nil {
+				return firstErr
+			}
+			if len(mappingAddress) != c.GlobalInt(countArgName) {
+				return fmt.Errorf(
+					"received %d shared-memory mappings for %d UVMs",
+					len(mappingAddress),
+					c.GlobalInt(countArgName),
+				)
+			}
+			var (
+				expected     uint32
+				haveExpected bool
+			)
+			for id, address := range mappingAddress {
+				if !haveExpected {
+					expected = address
+					haveExpected = true
+					continue
+				}
+				if address != expected {
+					return fmt.Errorf(
+						"UVM %s mapped shared memory at %#x, expected %#x",
+						id,
+						address,
+						expected,
+					)
+				}
+			}
+			logrus.WithFields(logrus.Fields{
+				"byte-gpa":  uint64(expected) << 12,
+				"raw":       fmt.Sprintf("%#x", expected),
+				"uvm-count": len(mappingAddress),
+			}).Info("verified identical shared-memory mappings")
+		}
+
 		markerVerified := false
 		if section != nil {
 			prefixLength := uint64(96)
-			if c.Bool(sharedMemoryTwoUVMArgName) {
+			if c.Bool(sharedMemoryMappingOnlyArgName) {
+				// Mapping-only mode intentionally does not access guest pages.
+			} else if c.Bool(sharedMemoryTwoUVMArgName) {
 				prefixLength = 160
 			}
 			prefix, err := section.hexPrefix(prefixLength)
@@ -274,7 +413,9 @@ var lcowCommand = cli.Command{
 			logrus.WithField("hex", prefix).Info(
 				"final shared-memory prefix",
 			)
-			if c.Bool(sharedMemoryTwoUVMArgName) {
+			if c.Bool(sharedMemoryMappingOnlyArgName) {
+				// Mapping-only mode intentionally does not access guest pages.
+			} else if c.Bool(sharedMemoryTwoUVMArgName) {
 				markers := []struct {
 					offset uint64
 					value  string
@@ -321,6 +462,26 @@ var lcowCommand = cli.Command{
 		}
 		return nil
 	},
+}
+
+func loadExecCommand(c *cli.Context) (string, error) {
+	if c.IsSet(execCommandLineArgName) && c.IsSet(execFileArgName) {
+		return "", fmt.Errorf(
+			"--%s and --%s are mutually exclusive",
+			execCommandLineArgName,
+			execFileArgName,
+		)
+	}
+	if !c.IsSet(execFileArgName) {
+		return c.String(execCommandLineArgName), nil
+	}
+
+	path := c.String(execFileArgName)
+	command, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read UVM command file %q: %w", path, err)
+	}
+	return strings.ReplaceAll(string(command), "\r\n", "\n"), nil
 }
 
 func init() {
@@ -470,7 +631,17 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
 		options.SecurityPolicyEnabled = true
-		options.BundleDirectory = os.TempDir()
+		bundleDirectory, err := os.MkdirTemp(
+			"",
+			fmt.Sprintf("uvmboot-snp-%s-", id),
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"create temporary SNP bundle directory: %w",
+				err,
+			)
+		}
+		options.BundleDirectory = bundleDirectory
 		options.AllowOvercommit = false
 
 		if !c.IsSet(noVerityBoot) {
@@ -513,7 +684,16 @@ func parseAnnotations(ctx context.Context, c *cli.Context, name string) map[stri
 	return annots
 }
 
-func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) error {
+func runLCOW(
+	ctx context.Context,
+	options *uvm.OptionsLCOW,
+	c *cli.Context,
+	execCommand string,
+	mappingObserver func(
+		string,
+		[]hcsschema.SharedMemoryRegionInfo,
+	) error,
+) error {
 	vm, err := uvm.CreateLCOW(ctx, options)
 	if err != nil {
 		return err
@@ -522,29 +702,64 @@ func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) erro
 		_ = vm.CloseCtx(ctx)
 	}()
 
+	var (
+		preStartRegions []hcsschema.SharedMemoryRegionInfo
+		preStartErr     error
+	)
+	if len(options.SharedMemoryRegions) > 0 {
+		preStartRegions, preStartErr = vm.SharedMemoryRegions(ctx)
+		if preStartErr != nil {
+			logrus.WithError(preStartErr).Debug(
+				"shared-memory mapping not queryable before UVM start",
+			)
+		} else {
+			logSharedMemoryRegions(vm.ID(), "before start", preStartRegions)
+		}
+	}
+
 	if err := vm.Start(ctx); err != nil {
 		return err
 	}
 
 	if len(options.SharedMemoryRegions) > 0 {
 		regions, err := vm.SharedMemoryRegions(ctx)
+		phase := "after start"
 		if err != nil {
-			return err
+			if c.Bool(sharedMemoryGuestInventoryArgName) {
+				logrus.WithError(err).Warn(
+					"continuing guest inventory without an HCS " +
+						"shared-memory GPA",
+				)
+				regions = nil
+			} else if len(preStartRegions) == 0 {
+				return fmt.Errorf(
+					"shared-memory mapping query failed before and after "+
+						"UVM start: before: %v; after: %w",
+					preStartErr,
+					err,
+				)
+			}
+			if len(preStartRegions) > 0 {
+				logrus.WithError(err).Warn(
+					"using pre-start shared-memory mapping because the " +
+						"post-start query failed",
+				)
+				regions = preStartRegions
+				phase = "before start (retained)"
+			}
 		}
-		if len(regions) == 0 {
+		if len(regions) == 0 &&
+			!c.Bool(sharedMemoryGuestInventoryArgName) {
 			return fmt.Errorf("HCS returned no shared-memory region information")
 		}
 
-		for _, region := range regions {
-			rawAddress := uint32(region.GuestPhysicalAddress)
-			fmt.Printf(
-				"UVM %s: shared-memory section %q mapped at raw address %#x; "+
-					"if page-based, byte GPA is %#x\n",
-				vm.ID(),
-				region.SectionName,
-				rawAddress,
-				uint64(rawAddress)<<12,
-			)
+		if len(regions) > 0 {
+			logSharedMemoryRegions(vm.ID(), phase, regions)
+		}
+		if mappingObserver != nil && len(regions) > 0 {
+			if err := mappingObserver(vm.ID(), regions); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -560,8 +775,16 @@ func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) erro
 		return err
 	}
 
+	if c.Bool(sharedMemoryMappingOnlyArgName) {
+		return observeLCOW(
+			ctx,
+			vm,
+			c.Duration(sharedMemoryObserveArgName),
+		)
+	}
+
 	if options.UseGuestConnection {
-		if err := execViaGCS(ctx, vm, c); err != nil {
+		if err := execViaGCS(ctx, vm, c, execCommand); err != nil {
 			return err
 		}
 		_ = vm.Terminate(ctx)
@@ -571,41 +794,73 @@ func runLCOW(ctx context.Context, options *uvm.OptionsLCOW, c *cli.Context) erro
 	}
 
 	if duration := c.Duration(sharedMemoryObserveArgName); duration > 0 {
-		exit := make(chan error, 1)
-		go func() {
-			exit <- vm.WaitCtx(ctx)
-		}()
-
-		timer := time.NewTimer(duration)
-		defer timer.Stop()
-
-		select {
-		case err := <-exit:
-			return fmt.Errorf(
-				"UVM exited before the %s observation completed: %w",
-				duration,
-				err,
-			)
-		case <-timer.C:
-			if err := vm.Terminate(ctx); err != nil {
-				return fmt.Errorf(
-					"terminate UVM after %s observation: %w",
-					duration,
-					err,
-				)
-			}
-			<-exit
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return observeLCOW(ctx, vm, duration)
 	}
 
 	return vm.WaitCtx(ctx)
 }
 
-func execViaGCS(ctx context.Context, vm *uvm.UtilityVM, cCtx *cli.Context) error {
-	c := cmd.CommandContext(ctx, vm, "sh", "-c", cCtx.String(execCommandLineArgName))
+func logSharedMemoryRegions(
+	uvmID string,
+	phase string,
+	regions []hcsschema.SharedMemoryRegionInfo,
+) {
+	for _, region := range regions {
+		rawAddress := uint32(region.GuestPhysicalAddress)
+		fmt.Printf(
+			"UVM %s: shared-memory section %q mapped %s at raw address %#x; "+
+				"if page-based, byte GPA is %#x\n",
+			uvmID,
+			region.SectionName,
+			phase,
+			rawAddress,
+			uint64(rawAddress)<<12,
+		)
+	}
+}
+
+func observeLCOW(
+	ctx context.Context,
+	vm *uvm.UtilityVM,
+	duration time.Duration,
+) error {
+	exit := make(chan error, 1)
+	go func() {
+		exit <- vm.WaitCtx(ctx)
+	}()
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case err := <-exit:
+		return fmt.Errorf(
+			"UVM exited before the %s observation completed: %w",
+			duration,
+			err,
+		)
+	case <-timer.C:
+		if err := vm.Terminate(ctx); err != nil {
+			return fmt.Errorf(
+				"terminate UVM after %s observation: %w",
+				duration,
+				err,
+			)
+		}
+		<-exit
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func execViaGCS(
+	ctx context.Context,
+	vm *uvm.UtilityVM,
+	cCtx *cli.Context,
+	execCommand string,
+) error {
+	c := cmd.CommandContext(ctx, vm, "sh", "-c", execCommand)
 	c.Log = log.L.Dup()
 	if lcowUseTerminal {
 		c.Spec.Terminal = true
