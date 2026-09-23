@@ -50,6 +50,7 @@ const (
 	sharedMemoryNameArgName       = "shared-memory-name"
 	sharedMemorySizeArgName       = "shared-memory-size"
 	sharedMemoryObserveArgName    = "shared-memory-observe-duration"
+	sharedMemoryTwoUVMArgName     = "shared-memory-two-uvm-proof"
 )
 
 var (
@@ -172,8 +173,30 @@ var lcowCommand = cli.Command{
 			Usage: "When GCS is disabled, keep the UVM running for this " +
 				"duration before terminating it.",
 		},
+		cli.BoolFlag{
+			Name: sharedMemoryTwoUVMArgName,
+			Usage: "Assign proof roles A and B to exactly two parallel UVMs " +
+				"and verify their shared-memory handshake.",
+		},
 	},
 	Action: func(c *cli.Context) error {
+		if c.Bool(sharedMemoryTwoUVMArgName) {
+			if c.GlobalInt(countArgName) != 2 ||
+				c.GlobalInt(parallelArgName) != 2 {
+				return fmt.Errorf(
+					"--%s requires --count 2 --parallel 2",
+					sharedMemoryTwoUVMArgName,
+				)
+			}
+			if c.Duration(sharedMemoryObserveArgName) < 6*time.Second {
+				return fmt.Errorf(
+					"--%s requires --%s of at least 6s",
+					sharedMemoryTwoUVMArgName,
+					sharedMemoryObserveArgName,
+				)
+			}
+		}
+
 		var section *sharedMemorySection
 		if c.IsSet(sharedMemoryNameArgName) || c.IsSet(sharedMemorySizeArgName) {
 			name := c.String(sharedMemoryNameArgName)
@@ -240,14 +263,40 @@ var lcowCommand = cli.Command{
 
 		markerVerified := false
 		if section != nil {
-			prefix, err := section.hexPrefix(96)
+			prefixLength := uint64(96)
+			if c.Bool(sharedMemoryTwoUVMArgName) {
+				prefixLength = 160
+			}
+			prefix, err := section.hexPrefix(prefixLength)
 			if err != nil {
 				return err
 			}
 			logrus.WithField("hex", prefix).Info(
 				"final shared-memory prefix",
 			)
-			if c.Duration(sharedMemoryObserveArgName) > 0 {
+			if c.Bool(sharedMemoryTwoUVMArgName) {
+				markers := []struct {
+					offset uint64
+					value  string
+				}{
+					{offset: 64, value: "GUEST-A-READY"},
+					{offset: 96, value: "GUEST-B-SEEN-A"},
+					{offset: 128, value: "GUEST-A-SEEN-B"},
+				}
+				for _, marker := range markers {
+					if err := section.expect(
+						marker.offset,
+						[]byte(marker.value),
+					); err != nil {
+						return err
+					}
+					logrus.WithFields(logrus.Fields{
+						"marker": marker.value,
+						"offset": marker.offset,
+					}).Info("observed guest shared-memory marker")
+				}
+				markerVerified = true
+			} else if c.Duration(sharedMemoryObserveArgName) > 0 {
 				const markerOffset = 64
 				marker := []byte("GUEST-WROTE-OK")
 				if err := section.expect(markerOffset, marker); err != nil {
@@ -325,6 +374,23 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	}
 	if c.IsSet(kernelArgsArgName) {
 		options.KernelBootOptions = c.String(kernelArgsArgName)
+	}
+	if c.Bool(sharedMemoryTwoUVMArgName) {
+		var role string
+		switch id {
+		case "uvmboot-0":
+			role = "a"
+		case "uvmboot-1":
+			role = "b"
+		default:
+			return nil, fmt.Errorf(
+				"cannot assign shared-memory proof role to UVM %q",
+				id,
+			)
+		}
+		options.KernelBootOptions = strings.TrimSpace(
+			options.KernelBootOptions + " hcs_shmem_diag.role=" + role,
+		)
 	}
 
 	// rootfs
