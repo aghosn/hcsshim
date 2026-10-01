@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,7 @@ const (
 	sharedMemoryTwoUVMArgName         = "shared-memory-two-uvm-proof"
 	sharedMemoryMappingOnlyArgName    = "shared-memory-mapping-only"
 	sharedMemoryGuestInventoryArgName = "shared-memory-guest-inventory"
+	sharedMemoryGuestModuleArgName    = "shared-memory-guest-module"
 )
 
 var (
@@ -196,6 +198,11 @@ var lcowCommand = cli.Command{
 			Usage: "Continue when HCS does not expose the shared-memory GPA " +
 				"so a read-only guest resource inventory can run.",
 		},
+		cli.StringFlag{
+			Name: sharedMemoryGuestModuleArgName,
+			Usage: "Load this matching hcs_shmem_diag.ko through GCS using " +
+				"the exact GPA returned by HCS.",
+		},
 	},
 	Action: func(c *cli.Context) error {
 		execCommand, err := loadExecCommand(c)
@@ -220,6 +227,51 @@ var lcowCommand = cli.Command{
 				sharedMemoryGuestInventoryArgName,
 				sharedMemorySizeArgName,
 			)
+		}
+		if c.IsSet(sharedMemoryGuestModuleArgName) {
+			if !useGCS {
+				return fmt.Errorf(
+					"--%s requires --gcs",
+					sharedMemoryGuestModuleArgName,
+				)
+			}
+			if !c.IsSet(sharedMemorySizeArgName) {
+				return fmt.Errorf(
+					"--%s requires --%s",
+					sharedMemoryGuestModuleArgName,
+					sharedMemorySizeArgName,
+				)
+			}
+			if c.IsSet(execCommandLineArgName) || c.IsSet(execFileArgName) {
+				return fmt.Errorf(
+					"--%s is mutually exclusive with --%s and --%s",
+					sharedMemoryGuestModuleArgName,
+					execCommandLineArgName,
+					execFileArgName,
+				)
+			}
+			if c.GlobalInt(countArgName) != 1 ||
+				c.GlobalInt(parallelArgName) != 1 {
+				return fmt.Errorf(
+					"--%s requires --count 1 --parallel 1",
+					sharedMemoryGuestModuleArgName,
+				)
+			}
+			if c.Bool(sharedMemoryMappingOnlyArgName) ||
+				c.Bool(sharedMemoryTwoUVMArgName) ||
+				c.Bool(sharedMemoryGuestInventoryArgName) {
+				return fmt.Errorf(
+					"--%s is incompatible with other shared-memory "+
+						"diagnostic modes",
+					sharedMemoryGuestModuleArgName,
+				)
+			}
+			if _, err := os.Stat(c.String(sharedMemoryGuestModuleArgName)); err != nil {
+				return fmt.Errorf(
+					"inspect shared-memory guest module: %w",
+					err,
+				)
+			}
 		}
 		if c.Bool(sharedMemoryMappingOnlyArgName) &&
 			c.Bool(sharedMemoryTwoUVMArgName) {
@@ -437,7 +489,8 @@ var lcowCommand = cli.Command{
 					}).Info("observed guest shared-memory marker")
 				}
 				markerVerified = true
-			} else if c.Duration(sharedMemoryObserveArgName) > 0 {
+			} else if c.Duration(sharedMemoryObserveArgName) > 0 ||
+				c.IsSet(sharedMemoryGuestModuleArgName) {
 				const markerOffset = 64
 				marker := []byte("GUEST-WROTE-OK")
 				if err := section.expect(markerOffset, marker); err != nil {
@@ -705,6 +758,7 @@ func runLCOW(
 	var (
 		preStartRegions []hcsschema.SharedMemoryRegionInfo
 		preStartErr     error
+		mappedRegions   []hcsschema.SharedMemoryRegionInfo
 	)
 	if len(options.SharedMemoryRegions) > 0 {
 		preStartRegions, preStartErr = vm.SharedMemoryRegions(ctx)
@@ -755,6 +809,7 @@ func runLCOW(
 
 		if len(regions) > 0 {
 			logSharedMemoryRegions(vm.ID(), phase, regions)
+			mappedRegions = regions
 		}
 		if mappingObserver != nil && len(regions) > 0 {
 			if err := mappingObserver(vm.ID(), regions); err != nil {
@@ -769,6 +824,29 @@ func runLCOW(
 
 	if err := shareFiles(ctx, c, vm); err != nil {
 		return err
+	}
+
+	if modulePath := c.String(sharedMemoryGuestModuleArgName); modulePath != "" {
+		const guestModuleRoot = "/run/hcs-shmem-diag-module"
+
+		if err := vm.Share(ctx, modulePath, guestModuleRoot, true); err != nil {
+			return fmt.Errorf("share HCS shared-memory diagnostic module: %w", err)
+		}
+		if len(options.SharedMemoryRegions) != 1 || len(mappedRegions) != 1 {
+			return fmt.Errorf(
+				"guest module requires exactly one configured and one mapped " +
+					"shared-memory region",
+			)
+		}
+		guestModulePath := guestModuleRoot + "/" + filepath.Base(modulePath)
+		execCommand, err = sharedMemoryGuestModuleCommand(
+			guestModulePath,
+			options.SharedMemoryRegions[0],
+			mappedRegions[0],
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	if err := mountVPMem(ctx, c, vm); err != nil {
@@ -798,6 +876,41 @@ func runLCOW(
 	}
 
 	return vm.WaitCtx(ctx)
+}
+
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func sharedMemoryGuestModuleCommand(
+	modulePath string,
+	configured hcsschema.SharedMemoryRegion,
+	mapped hcsschema.SharedMemoryRegionInfo,
+) (string, error) {
+	if !strings.EqualFold(configured.SectionName, mapped.SectionName) {
+		return "", fmt.Errorf(
+			"HCS returned section %q, expected %q",
+			mapped.SectionName,
+			configured.SectionName,
+		)
+	}
+	if configured.Length <= 0 {
+		return "", fmt.Errorf(
+			"shared-memory section %q has invalid length %d",
+			configured.SectionName,
+			configured.Length,
+		)
+	}
+
+	byteGPA := uint64(uint32(mapped.GuestPhysicalAddress)) << 12
+	return fmt.Sprintf(
+		"set -eu; insmod %s gpa=%#x length=%#x decrypted=1 "+
+			"read_only=0 role=single; "+
+			"dmesg | grep -F 'hcs-shmem-diag:'",
+		shellSingleQuote(modulePath),
+		byteGPA,
+		uint64(configured.Length),
+	), nil
 }
 
 func logSharedMemoryRegions(
