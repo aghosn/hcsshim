@@ -250,15 +250,15 @@ var lcowCommand = cli.Command{
 					execFileArgName,
 				)
 			}
-			if c.GlobalInt(countArgName) != 1 ||
-				c.GlobalInt(parallelArgName) != 1 {
+			if !c.Bool(sharedMemoryTwoUVMArgName) &&
+				(c.GlobalInt(countArgName) != 1 ||
+					c.GlobalInt(parallelArgName) != 1) {
 				return fmt.Errorf(
 					"--%s requires --count 1 --parallel 1",
 					sharedMemoryGuestModuleArgName,
 				)
 			}
 			if c.Bool(sharedMemoryMappingOnlyArgName) ||
-				c.Bool(sharedMemoryTwoUVMArgName) ||
 				c.Bool(sharedMemoryGuestInventoryArgName) {
 				return fmt.Errorf(
 					"--%s is incompatible with other shared-memory "+
@@ -305,7 +305,8 @@ var lcowCommand = cli.Command{
 					sharedMemoryTwoUVMArgName,
 				)
 			}
-			if c.Duration(sharedMemoryObserveArgName) < 6*time.Second {
+			if !c.IsSet(sharedMemoryGuestModuleArgName) &&
+				c.Duration(sharedMemoryObserveArgName) < 6*time.Second {
 				return fmt.Errorf(
 					"--%s requires --%s of at least 6s",
 					sharedMemoryTwoUVMArgName,
@@ -590,17 +591,9 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		options.KernelBootOptions = c.String(kernelArgsArgName)
 	}
 	if c.Bool(sharedMemoryTwoUVMArgName) {
-		var role string
-		switch id {
-		case "uvmboot-0":
-			role = "a"
-		case "uvmboot-1":
-			role = "b"
-		default:
-			return nil, fmt.Errorf(
-				"cannot assign shared-memory proof role to UVM %q",
-				id,
-			)
+		role, err := sharedMemoryProofRole(id)
+		if err != nil {
+			return nil, err
 		}
 		options.KernelBootOptions = strings.TrimSpace(
 			options.KernelBootOptions + " hcs_shmem_diag.role=" + role,
@@ -839,10 +832,18 @@ func runLCOW(
 			)
 		}
 		guestModulePath := guestModuleRoot + "/" + filepath.Base(modulePath)
+		role := "single"
+		if c.Bool(sharedMemoryTwoUVMArgName) {
+			role, err = sharedMemoryProofRole(vm.ID())
+			if err != nil {
+				return err
+			}
+		}
 		execCommand, err = sharedMemoryGuestModuleCommand(
 			guestModulePath,
 			options.SharedMemoryRegions[0],
 			mappedRegions[0],
+			role,
 		)
 		if err != nil {
 			return err
@@ -882,10 +883,25 @@ func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
+func sharedMemoryProofRole(uvmID string) (string, error) {
+	switch uvmID {
+	case "uvmboot-0":
+		return "a", nil
+	case "uvmboot-1":
+		return "b", nil
+	default:
+		return "", fmt.Errorf(
+			"cannot assign shared-memory proof role to UVM %q",
+			uvmID,
+		)
+	}
+}
+
 func sharedMemoryGuestModuleCommand(
 	modulePath string,
 	configured hcsschema.SharedMemoryRegion,
 	mapped hcsschema.SharedMemoryRegionInfo,
+	role string,
 ) (string, error) {
 	if !strings.EqualFold(configured.SectionName, mapped.SectionName) {
 		return "", fmt.Errorf(
@@ -905,11 +921,12 @@ func sharedMemoryGuestModuleCommand(
 	byteGPA := uint64(uint32(mapped.GuestPhysicalAddress)) << 12
 	return fmt.Sprintf(
 		"set -eu; insmod %s gpa=%#x length=%#x decrypted=1 "+
-			"read_only=0 role=single; "+
+			"read_only=0 role=%s; "+
 			"dmesg | grep -F 'hcs-shmem-diag:'",
 		shellSingleQuote(modulePath),
 		byteGPA,
 		uint64(configured.Length),
+		shellSingleQuote(role),
 	), nil
 }
 

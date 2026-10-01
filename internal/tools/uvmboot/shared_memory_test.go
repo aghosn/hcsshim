@@ -52,6 +52,7 @@ func TestSharedMemoryGuestModuleCommandConvertsGPN(t *testing.T) {
 			SectionName:          "section",
 			GuestPhysicalAddress: 0x20000,
 		},
+		"a",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +61,7 @@ func TestSharedMemoryGuestModuleCommandConvertsGPN(t *testing.T) {
 		"gpa=0x20000000",
 		"length=0x100000",
 		"decrypted=1",
+		"role='a'",
 	} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("command %q does not contain %q", command, expected)
@@ -78,8 +80,38 @@ func TestSharedMemoryGuestModuleCommandRejectsDifferentSection(t *testing.T) {
 			SectionName:          "other",
 			GuestPhysicalAddress: 0x20000,
 		},
+		"single",
 	)
 	if err == nil {
 		t.Fatal("expected mismatched section to fail")
+	}
+}
+
+func TestSharedMemoryProofRole(t *testing.T) {
+	for _, test := range []struct {
+		id   string
+		role string
+	}{
+		{id: "uvmboot-0", role: "a"},
+		{id: "uvmboot-1", role: "b"},
+	} {
+		role, err := sharedMemoryProofRole(test.id)
+		if err != nil {
+			t.Fatalf("sharedMemoryProofRole(%q): %v", test.id, err)
+		}
+		if role != test.role {
+			t.Fatalf(
+				"sharedMemoryProofRole(%q) = %q, want %q",
+				test.id,
+				role,
+				test.role,
+			)
+		}
+	}
+}
+
+func TestSharedMemoryProofRoleRejectsUnexpectedID(t *testing.T) {
+	if _, err := sharedMemoryProofRole("uvmboot-2"); err == nil {
+		t.Fatal("expected unexpected UVM ID to fail")
 	}
 }
