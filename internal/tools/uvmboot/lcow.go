@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/containerd/console"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -316,6 +317,17 @@ var lcowCommand = cli.Command{
 		}
 
 		var section *sharedMemorySection
+		var siblingCommunicationGroupID string
+		if c.Bool(sharedMemoryTwoUVMArgName) {
+			groupID, err := guid.NewV4()
+			if err != nil {
+				return fmt.Errorf("create sibling communication group ID: %w", err)
+			}
+			siblingCommunicationGroupID = groupID.String()
+			logrus.WithField("group-id", siblingCommunicationGroupID).
+				Info("created sibling communication group")
+		}
+
 		if c.IsSet(sharedMemoryNameArgName) || c.IsSet(sharedMemorySizeArgName) {
 			name := c.String(sharedMemoryNameArgName)
 			size := c.Uint64(sharedMemorySizeArgName)
@@ -374,6 +386,17 @@ var lcowCommand = cli.Command{
 						AllowGuestWrite: true,
 					},
 				}
+			}
+			if siblingCommunicationGroupID != "" {
+				endpoint, err := siblingCommunicationEndpoint(
+					id,
+					siblingCommunicationGroupID,
+				)
+				if err != nil {
+					return err
+				}
+				options.SiblingCommunicationEndpoints =
+					[]hcsschema.SiblingCommunicationEndpoint{endpoint}
 			}
 
 			err = runLCOW(
@@ -839,11 +862,24 @@ func runLCOW(
 				return err
 			}
 		}
+		eventArgs := ""
+		if len(options.SiblingCommunicationEndpoints) == 1 {
+			route, err := waitForSiblingCommunicationRoute(
+				ctx,
+				vm,
+				options.SiblingCommunicationEndpoints[0],
+			)
+			if err != nil {
+				return err
+			}
+			eventArgs = siblingEventModuleArgs(route)
+		}
 		execCommand, err = sharedMemoryGuestModuleCommand(
 			guestModulePath,
 			options.SharedMemoryRegions[0],
 			mappedRegions[0],
 			role,
+			eventArgs,
 		)
 		if err != nil {
 			return err
@@ -897,11 +933,102 @@ func sharedMemoryProofRole(uvmID string) (string, error) {
 	}
 }
 
+func siblingCommunicationEndpoint(
+	uvmID string,
+	groupID string,
+) (hcsschema.SiblingCommunicationEndpoint, error) {
+	const (
+		targetSINT        = 3
+		backendEventFlag  = 11
+		workloadEventFlag = 12
+	)
+
+	switch uvmID {
+	case "uvmboot-0":
+		return hcsschema.SiblingCommunicationEndpoint{
+			GroupID:         groupID,
+			Role:            hcsschema.SiblingCommunicationEndpointRoleBackend,
+			TargetVP:        0,
+			TargetSINT:      targetSINT,
+			EventFlagNumber: backendEventFlag,
+		}, nil
+	case "uvmboot-1":
+		return hcsschema.SiblingCommunicationEndpoint{
+			GroupID:         groupID,
+			Role:            hcsschema.SiblingCommunicationEndpointRoleWorkload,
+			TargetVP:        0,
+			TargetSINT:      targetSINT,
+			EventFlagNumber: workloadEventFlag,
+		}, nil
+	default:
+		return hcsschema.SiblingCommunicationEndpoint{}, fmt.Errorf(
+			"cannot assign sibling communication endpoint to UVM %q",
+			uvmID,
+		)
+	}
+}
+
+// waitForSiblingCommunicationRoute polls until HCS reports the outbound
+// connection ID for endpoint, which happens once the peer UVM has registered.
+func waitForSiblingCommunicationRoute(
+	ctx context.Context,
+	vm *uvm.UtilityVM,
+	endpoint hcsschema.SiblingCommunicationEndpoint,
+) (hcsschema.SiblingCommunicationRouteInfo, error) {
+	const (
+		timeout  = 30 * time.Second
+		interval = 100 * time.Millisecond
+	)
+
+	deadline := time.Now().Add(timeout)
+	for {
+		routes, err := vm.SiblingCommunicationRoutes(ctx)
+		if err != nil {
+			return hcsschema.SiblingCommunicationRouteInfo{}, err
+		}
+		for _, route := range routes {
+			if strings.EqualFold(route.GroupID, endpoint.GroupID) &&
+				route.OutboundConnectionID != 0 {
+				logrus.WithFields(logrus.Fields{
+					"uvm":                  vm.ID(),
+					"groupId":              route.GroupID,
+					"role":                 route.Role,
+					"outboundConnectionId": fmt.Sprintf("%#x", route.OutboundConnectionID),
+				}).Info("sibling communication route ready")
+				return route, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return hcsschema.SiblingCommunicationRouteInfo{}, fmt.Errorf(
+				"sibling communication group %s has no outbound connection after %v",
+				endpoint.GroupID,
+				timeout,
+			)
+		}
+		select {
+		case <-ctx.Done():
+			return hcsschema.SiblingCommunicationRouteInfo{}, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+func siblingEventModuleArgs(route hcsschema.SiblingCommunicationRouteInfo) string {
+	return fmt.Sprintf(
+		" signal_conn=%#x rx_vp=%d rx_sint=%d rx_flag=%d",
+		route.OutboundConnectionID,
+		route.TargetVP,
+		route.TargetSINT,
+		route.EventFlagNumber,
+	)
+}
+
 func sharedMemoryGuestModuleCommand(
 	modulePath string,
 	configured hcsschema.SharedMemoryRegion,
 	mapped hcsschema.SharedMemoryRegionInfo,
 	role string,
+	eventArgs string,
 ) (string, error) {
 	if !strings.EqualFold(configured.SectionName, mapped.SectionName) {
 		return "", fmt.Errorf(
@@ -921,12 +1048,13 @@ func sharedMemoryGuestModuleCommand(
 	byteGPA := uint64(uint32(mapped.GuestPhysicalAddress)) << 12
 	return fmt.Sprintf(
 		"set -eu; insmod %s gpa=%#x length=%#x decrypted=1 "+
-			"read_only=0 role=%s; "+
+			"read_only=0 role=%s%s; "+
 			"dmesg | grep -F 'hcs-shmem-diag:'",
 		shellSingleQuote(modulePath),
 		byteGPA,
 		uint64(configured.Length),
 		shellSingleQuote(role),
+		eventArgs,
 	), nil
 }
 

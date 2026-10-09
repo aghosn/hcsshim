@@ -40,6 +40,8 @@ type Devices struct {
 
 	SharedMemory *SharedMemoryConfiguration `json:"SharedMemory,omitempty"`
 
+	SiblingCommunicationEndpoints []SiblingCommunicationEndpoint `json:"SiblingCommunicationEndpoints,omitempty"`
+
 	// TODO: This is pre-release support in schema 2.3. Need to add build number
 	// docs when a public build with this is out.
 	VirtualPci map[string]VirtualPciDevice `json:",omitempty"`

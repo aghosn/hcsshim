@@ -191,6 +191,31 @@ func VerifyOptions(_ context.Context, options interface{}) error {
 				return fmt.Errorf("shared-memory region %d length must be greater than zero", i)
 			}
 		}
+		for i, endpoint := range opts.SiblingCommunicationEndpoints {
+			if endpoint.GroupID == "" {
+				return fmt.Errorf("sibling communication endpoint %d has an empty group ID", i)
+			}
+			if endpoint.Role != hcsschema.SiblingCommunicationEndpointRoleWorkload &&
+				endpoint.Role != hcsschema.SiblingCommunicationEndpointRoleBackend {
+				return fmt.Errorf(
+					"sibling communication endpoint %d has invalid role %q",
+					i,
+					endpoint.Role,
+				)
+			}
+			if endpoint.TargetSINT >= 16 {
+				return fmt.Errorf(
+					"sibling communication endpoint %d target SINT must be less than 16",
+					i,
+				)
+			}
+			if endpoint.EventFlagNumber >= 2048 {
+				return fmt.Errorf(
+					"sibling communication endpoint %d event flag must be less than 2048",
+					i,
+				)
+			}
+		}
 		if opts.KernelDirect && osversion.Build() < 18286 {
 			return errors.New("KernelDirectBoot is not supported on builds older than 18286")
 		}

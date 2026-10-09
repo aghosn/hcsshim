@@ -80,30 +80,31 @@ type OptionsLCOW struct {
 	// Folder in which kernel and root file system reside. Defaults to \Program Files\Linux Containers.
 	//
 	// It is preferred to use [UpdateBootFilesPath] to change this value and update associated fields.
-	BootFilesPath           string
-	KernelFile              string                       // Filename under `BootFilesPath` for the kernel. Defaults to `kernel`
-	KernelDirect            bool                         // Skip UEFI and boot directly to `kernel`
-	RootFSFile              string                       // Filename under `BootFilesPath` for the UVMs root file system. Defaults to `InitrdFile`
-	KernelBootOptions       string                       // Additional boot options for the kernel
-	UseGuestConnection      bool                         // Whether the HCS should connect to the UVM's GCS. Defaults to true
-	ExecCommandLine         string                       // The command line to exec from init. Defaults to GCS
-	ForwardStdout           bool                         // Whether stdout will be forwarded from the executed program. Defaults to false
-	ForwardStderr           bool                         // Whether stderr will be forwarded from the executed program. Defaults to true
-	OutputHandlerCreator    vmutils.OutputHandlerCreator `json:"-"` // Creates an [OutputHandler] that controls how output received over HVSocket from the UVM is handled. Defaults to parsing output as logrus messages
-	VPMemDeviceCount        uint32                       // Number of VPMem devices. Defaults to `DefaultVPMEMCount`. Limit at 128. If booting UVM from VHD, device 0 is taken.
-	VPMemSizeBytes          uint64                       // Size of the VPMem devices. Defaults to `DefaultVPMemSizeBytes`.
-	VPMemNoMultiMapping     bool                         // Disables LCOW layer multi mapping
-	PreferredRootFSType     PreferredRootFSType          // If `KernelFile` is `InitrdFile` use `PreferredRootFSTypeInitRd`. If `KernelFile` is `VhdFile` use `PreferredRootFSTypeVHD`
-	EnableColdDiscardHint   bool                         // Whether the HCS should use cold discard hints. Defaults to false
-	VPCIEnabled             bool                         // Whether the kernel should enable pci
-	EnableScratchEncryption bool                         // Whether the scratch should be encrypted
-	DisableTimeSyncService  bool                         // Disables the time synchronization service
-	HclEnabled              *bool                        // Whether to enable the host compatibility layer
-	ExtraVSockPorts         []uint32                     // Extra vsock ports to allow
-	AssignedDevices         []VPCIDeviceID               // AssignedDevices are devices to add on pod boot
-	SharedMemoryRegions     []LCOWSharedMemoryRegion     // Host sections to map into the UVM
-	PolicyBasedRouting      bool                         // Whether we should use policy based routing when configuring net interfaces in guest
-	WritableOverlayDirs     bool                         // Whether init should create writable overlay mounts for /var and /etc
+	BootFilesPath                 string
+	KernelFile                    string                                   // Filename under `BootFilesPath` for the kernel. Defaults to `kernel`
+	KernelDirect                  bool                                     // Skip UEFI and boot directly to `kernel`
+	RootFSFile                    string                                   // Filename under `BootFilesPath` for the UVMs root file system. Defaults to `InitrdFile`
+	KernelBootOptions             string                                   // Additional boot options for the kernel
+	UseGuestConnection            bool                                     // Whether the HCS should connect to the UVM's GCS. Defaults to true
+	ExecCommandLine               string                                   // The command line to exec from init. Defaults to GCS
+	ForwardStdout                 bool                                     // Whether stdout will be forwarded from the executed program. Defaults to false
+	ForwardStderr                 bool                                     // Whether stderr will be forwarded from the executed program. Defaults to true
+	OutputHandlerCreator          vmutils.OutputHandlerCreator             `json:"-"` // Creates an [OutputHandler] that controls how output received over HVSocket from the UVM is handled. Defaults to parsing output as logrus messages
+	VPMemDeviceCount              uint32                                   // Number of VPMem devices. Defaults to `DefaultVPMEMCount`. Limit at 128. If booting UVM from VHD, device 0 is taken.
+	VPMemSizeBytes                uint64                                   // Size of the VPMem devices. Defaults to `DefaultVPMemSizeBytes`.
+	VPMemNoMultiMapping           bool                                     // Disables LCOW layer multi mapping
+	PreferredRootFSType           PreferredRootFSType                      // If `KernelFile` is `InitrdFile` use `PreferredRootFSTypeInitRd`. If `KernelFile` is `VhdFile` use `PreferredRootFSTypeVHD`
+	EnableColdDiscardHint         bool                                     // Whether the HCS should use cold discard hints. Defaults to false
+	VPCIEnabled                   bool                                     // Whether the kernel should enable pci
+	EnableScratchEncryption       bool                                     // Whether the scratch should be encrypted
+	DisableTimeSyncService        bool                                     // Disables the time synchronization service
+	HclEnabled                    *bool                                    // Whether to enable the host compatibility layer
+	ExtraVSockPorts               []uint32                                 // Extra vsock ports to allow
+	AssignedDevices               []VPCIDeviceID                           // AssignedDevices are devices to add on pod boot
+	SharedMemoryRegions           []LCOWSharedMemoryRegion                 // Host sections to map into the UVM
+	SiblingCommunicationEndpoints []hcsschema.SiblingCommunicationEndpoint // Direct sibling communication endpoint registrations
+	PolicyBasedRouting            bool                                     // Whether we should use policy based routing when configuring net interfaces in guest
+	WritableOverlayDirs           bool                                     // Whether init should create writable overlay mounts for /var and /etc
 }
 
 // NewDefaultOptionsLCOW creates the default options for a bootable version of
@@ -504,6 +505,7 @@ func makeLCOWSecurityDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM)
 	}
 
 	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+	applyLCOWSiblingCommunication(doc, opts.SiblingCommunicationEndpoints)
 
 	return doc, nil
 }
@@ -519,6 +521,18 @@ func applyLCOWSharedMemory(doc *hcsschema.ComputeSystem, regions []hcsschema.Sha
 	doc.VirtualMachine.Devices.SharedMemory = &hcsschema.SharedMemoryConfiguration{
 		Regions: append([]hcsschema.SharedMemoryRegion(nil), regions...),
 	}
+}
+
+func applyLCOWSiblingCommunication(doc *hcsschema.ComputeSystem, endpoints []hcsschema.SiblingCommunicationEndpoint) {
+	if len(endpoints) == 0 {
+		return
+	}
+
+	if doc.VirtualMachine.Devices == nil {
+		doc.VirtualMachine.Devices = &hcsschema.Devices{}
+	}
+	doc.VirtualMachine.Devices.SiblingCommunicationEndpoints =
+		append([]hcsschema.SiblingCommunicationEndpoint(nil), endpoints...)
 }
 
 /*
@@ -910,6 +924,7 @@ func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 	}
 
 	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+	applyLCOWSiblingCommunication(doc, opts.SiblingCommunicationEndpoints)
 
 	return doc, nil
 }

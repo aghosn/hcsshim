@@ -53,6 +53,12 @@ func TestSharedMemoryGuestModuleCommandConvertsGPN(t *testing.T) {
 			GuestPhysicalAddress: 0x20000,
 		},
 		"a",
+		siblingEventModuleArgs(hcsschema.SiblingCommunicationRouteInfo{
+			TargetVP:             0,
+			TargetSINT:           3,
+			EventFlagNumber:      11,
+			OutboundConnectionID: 0x100015,
+		}),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +67,7 @@ func TestSharedMemoryGuestModuleCommandConvertsGPN(t *testing.T) {
 		"gpa=0x20000000",
 		"length=0x100000",
 		"decrypted=1",
-		"role='a'",
+		"role='a' signal_conn=0x100015 rx_vp=0 rx_sint=3 rx_flag=11;",
 	} {
 		if !strings.Contains(command, expected) {
 			t.Fatalf("command %q does not contain %q", command, expected)
@@ -81,6 +87,7 @@ func TestSharedMemoryGuestModuleCommandRejectsDifferentSection(t *testing.T) {
 			GuestPhysicalAddress: 0x20000,
 		},
 		"single",
+		"",
 	)
 	if err == nil {
 		t.Fatal("expected mismatched section to fail")
