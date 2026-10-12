@@ -966,12 +966,19 @@ func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
+// Proof role a is the diode (sibling backend, NetVSP); role b is the
+// workload (sibling consumer, NetVSC).
+const (
+	diodeRole    = "a"
+	workloadRole = "b"
+)
+
 func sharedMemoryProofRole(uvmID string) (string, error) {
 	switch uvmID {
 	case "uvmboot-0":
-		return "a", nil
+		return diodeRole, nil
 	case "uvmboot-1":
-		return "b", nil
+		return workloadRole, nil
 	default:
 		return "", fmt.Errorf(
 			"cannot assign shared-memory proof role to UVM %q",
@@ -1107,10 +1114,10 @@ func sharedMemoryGuestModuleCommand(
 
 // siblingBusGuestModuleCommand loads sibling_bus.ko and the role's network
 // module from the same directory, waits for the echo channel, then runs a
-// ping from the workload (b) to the backend (a) over the sibling NetVSC.
+// ping from the workload to the diode over the sibling NetVSC.
 // The backend stays up until the workload closes the network channel.
 func siblingNetModuleName(role string) string {
-	if role == "b" {
+	if role == workloadRole {
 		return "diode_netvsc.ko"
 	}
 	return "diode_netvsp.ko"
@@ -1147,7 +1154,7 @@ const siblingNetRelayCheck = `set +eu; ` + siblingTCPBulkStage + `snap() { set -
 
 func siblingBusGuestModuleCommand(modulePath, netModulePath, role string) string {
 	ifName, addr := "dvsp0", "10.200.0.1"
-	if role == "b" {
+	if role == workloadRole {
 		ifName, addr = "dvsc0", "10.200.0.2"
 	}
 	waitFor := func(cond, what string) string {
@@ -1167,7 +1174,7 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string) string
 		"if command -v ip >/dev/null; then ip addr add " + addr + "/30 dev " + ifName +
 		" && ip link set " + ifName + " up; else ifconfig " + ifName + " " + addr +
 		" netmask 255.255.255.252 up; fi; "
-	if role == "b" {
+	if role == workloadRole {
 		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
 			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
 			"else echo 'diode_net: ping failed'; fi; " + siblingNetRelayCheck
