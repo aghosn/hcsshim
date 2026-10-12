@@ -57,6 +57,7 @@ const (
 	sharedMemoryMappingOnlyArgName    = "shared-memory-mapping-only"
 	sharedMemoryGuestInventoryArgName = "shared-memory-guest-inventory"
 	sharedMemoryGuestModuleArgName    = "shared-memory-guest-module"
+	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
 )
 
 var (
@@ -204,6 +205,11 @@ var lcowCommand = cli.Command{
 			Usage: "Load this matching hcs_shmem_diag.ko through GCS using " +
 				"the exact GPA returned by HCS.",
 		},
+		cli.StringFlag{
+			Name: siblingBusGuestModuleArgName,
+			Usage: "After the shared-memory guest module, load this matching " +
+				"sibling_bus.ko and wait for the host's sibling-link offer.",
+		},
 	},
 	Action: func(c *cli.Context) error {
 		execCommand, err := loadExecCommand(c)
@@ -272,6 +278,20 @@ var lcowCommand = cli.Command{
 					"inspect shared-memory guest module: %w",
 					err,
 				)
+			}
+		}
+		if c.IsSet(siblingBusGuestModuleArgName) {
+			if !c.IsSet(sharedMemoryGuestModuleArgName) ||
+				!c.Bool(sharedMemoryTwoUVMArgName) {
+				return fmt.Errorf(
+					"--%s requires --%s and --%s",
+					siblingBusGuestModuleArgName,
+					sharedMemoryGuestModuleArgName,
+					sharedMemoryTwoUVMArgName,
+				)
+			}
+			if _, err := os.Stat(c.String(siblingBusGuestModuleArgName)); err != nil {
+				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
 		}
 		if c.Bool(sharedMemoryMappingOnlyArgName) &&
@@ -394,6 +414,9 @@ var lcowCommand = cli.Command{
 				)
 				if err != nil {
 					return err
+				}
+				if section != nil {
+					endpoint.SharedMemorySectionName = section.hcsName
 				}
 				options.SiblingCommunicationEndpoints =
 					[]hcsschema.SiblingCommunicationEndpoint{endpoint}
@@ -884,6 +907,30 @@ func runLCOW(
 		if err != nil {
 			return err
 		}
+		if busModulePath := c.String(siblingBusGuestModuleArgName); busModulePath != "" {
+			const busModuleRoot = "/run/sibling-bus-module"
+
+			if err := vm.Share(ctx, busModulePath, busModuleRoot, true); err != nil {
+				return fmt.Errorf("share sibling-bus module: %w", err)
+			}
+			// Plan9 file shares expose only the named file, so the role's
+			// net module (next to sibling_bus.ko on the host) is shared too.
+			const netModuleRoot = "/run/diode-net-module"
+			netModuleName := siblingNetModuleName(role)
+			netModulePath := filepath.Join(filepath.Dir(busModulePath), netModuleName)
+			if err := vm.Share(ctx, netModulePath, netModuleRoot, true); err != nil {
+				return fmt.Errorf("share diode net module: %w", err)
+			}
+			tcpBulkPath := filepath.Join(filepath.Dir(busModulePath), "diode_tcpbulk")
+			if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
+				return fmt.Errorf("share diode_tcpbulk: %w", err)
+			}
+			execCommand += "; " + siblingBusGuestModuleCommand(
+				busModuleRoot+"/"+filepath.Base(busModulePath),
+				netModuleRoot+"/"+netModuleName,
+				role,
+			)
+		}
 	}
 
 	if err := mountVPMem(ctx, c, vm); err != nil {
@@ -1058,6 +1105,84 @@ func sharedMemoryGuestModuleCommand(
 	), nil
 }
 
+// siblingBusGuestModuleCommand loads sibling_bus.ko and the role's network
+// module from the same directory, waits for the echo channel, then runs a
+// ping from the workload (b) to the backend (a) over the sibling NetVSC.
+// The backend stays up until the workload closes the network channel.
+func siblingNetModuleName(role string) string {
+	if role == "b" {
+		return "diode_netvsc.ko"
+	}
+	return "diode_netvsp.ko"
+}
+
+// siblingTCPBulkStage copies diode_tcpbulk from its Plan9 share into an exec
+// tmpfs (the guest /tmp is noexec). Plan9 runs over VMBus, so this must happen
+// before the relay-check window. $dtb is the binary to run.
+const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run/dtb-exec && ` +
+	`mount -t tmpfs -o exec,size=8m tmpfs /run/dtb-exec 2>/dev/null && ` +
+	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; `
+
+// siblingNetRelayCheck runs bulk traffic from the workload over dvsc0 and
+// compares, over that window, the root VMBus channel interrupts with the
+// sibling doorbells. Nothing is printed inside the window because guest
+// output itself travels over VMBus (hvsock).
+const siblingNetRelayCheck = `set +eu; ` + siblingTCPBulkStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
+	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
+	`for f in /sys/bus/vmbus/devices/*/channels/*/interrupts; do [ -r $f ] && c=$((c+$(cat $f))); done; ` +
+	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; ` +
+	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
+	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; ` +
+	`snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
+	`ping -q -A -c 2000 -s 1400 10.200.0.1 >/tmp/dn-ping 2>&1 || ` +
+	`ping -q -c 300 -i 0.01 -s 1400 10.200.0.1 >>/tmp/dn-ping 2>&1; ` +
+	`snap; t1=$t b1=$b; ` +
+	`"$dtb" send 10.200.0.1 5001 256 >/tmp/dn-tcp 2>&1; snap; ` +
+	`echo "diode_net: ping-flood $(grep -E 'transmitted|round-trip' /tmp/dn-ping | tr '\n' ' ') cs=$((t1-t0))"; ` +
+	`echo "diode_net: tcp-bulk $(tr '\n' ' ' </tmp/dn-tcp) cs=$((t-t1)) bytes=$((b-b1))"; ` +
+	`echo "diode_net: relay check cs=$((t-t0)) vmbus_chan_irqs=$((c-c0)) hyp_irqs=$((h-h0)) ` +
+	`doorbells_rx=$((d-d0)) signals_tx=$((g-g0)) tx_bytes=$((b-b0)) rx_bytes=$((r-r0))"; ` +
+	`if [ $((d-d0)) -gt 100 ] && [ $(((c-c0)*100)) -lt $((d-d0)) ]; then echo 'diode_net: no-relay ok'; ` +
+	`else echo 'diode_net: no-relay inconclusive'; fi; `
+
+func siblingBusGuestModuleCommand(modulePath, netModulePath, role string) string {
+	ifName, addr := "dvsp0", "10.200.0.1"
+	if role == "b" {
+		ifName, addr = "dvsc0", "10.200.0.2"
+	}
+	waitFor := func(cond, what string) string {
+		return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
+			"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
+			"dmesg | grep -E 'sibling_bus:|diode_net' >&2 || true; exit 1; }; " +
+			"sleep 1; done; "
+	}
+	cmd := fmt.Sprintf("insmod %s; insmod %s; ",
+		shellSingleQuote(modulePath),
+		shellSingleQuote(netModulePath)) +
+		waitFor("dmesg | grep -qE 'sibling_bus: (chan: relid=1 echo|bus: link broken)'",
+			"echo") +
+		"dmesg | grep -F 'sibling_bus:'; " +
+		"echo \"diode_net: tools $(command -v ip ifconfig ping | tr '\\n' ' ')\"; " +
+		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) +
+		"if command -v ip >/dev/null; then ip addr add " + addr + "/30 dev " + ifName +
+		" && ip link set " + ifName + " up; else ifconfig " + ifName + " " + addr +
+		" netmask 255.255.255.252 up; fi; "
+	if role == "b" {
+		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
+			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
+			"else echo 'diode_net: ping failed'; fi; " + siblingNetRelayCheck
+	} else {
+		cmd += siblingTCPBulkStage +
+			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
+			"i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do " +
+			"i=$((i+1)); [ $i -le 150 ] || break; sleep 1; done; " +
+			"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
+	}
+	cmd += "echo \"diode_net: " + ifName + " tx=$(cat /sys/class/net/" + ifName +
+		"/statistics/tx_packets) rx=$(cat /sys/class/net/" + ifName +
+		"/statistics/rx_packets)\"; dmesg | grep -E 'diode_net'"
+	return cmd
+}
 func logSharedMemoryRegions(
 	uvmID string,
 	phase string,

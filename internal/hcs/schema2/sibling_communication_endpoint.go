@@ -19,6 +19,10 @@ type SiblingCommunicationEndpoint struct {
 	TargetVP        uint32                           `json:"TargetVp,omitempty"`
 	TargetSINT      uint16                           `json:"TargetSint"`
 	EventFlagNumber uint16                           `json:"EventFlagNumber"`
+	// SharedMemorySectionName names the SharedMemory region backing the
+	// sibling link. When set, HCS offers the sibling-link VMBus device to the
+	// guest once both endpoints have started.
+	SharedMemorySectionName string `json:"SharedMemorySectionName,omitempty"`
 }
 
 // SiblingCommunicationRouteInfo is returned by the "SiblingCommunication"
