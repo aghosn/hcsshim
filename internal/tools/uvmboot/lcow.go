@@ -58,6 +58,7 @@ const (
 	sharedMemoryGuestInventoryArgName = "shared-memory-guest-inventory"
 	sharedMemoryGuestModuleArgName    = "shared-memory-guest-module"
 	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
+	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
 )
 
 var (
@@ -209,6 +210,12 @@ var lcowCommand = cli.Command{
 			Name: siblingBusGuestModuleArgName,
 			Usage: "After the shared-memory guest module, load this matching " +
 				"sibling_bus.ko and wait for the host's sibling-link offer.",
+		},
+		cli.BoolFlag{
+			Name: siblingDiodeUplinkArgName,
+			Usage: "With the sibling bus, give the diode a NIC on the " +
+				diodeUplinkNetworkName + " HNS NAT network, NAT the workload " +
+				"through it and route the workload's default traffic via the diode.",
 		},
 	},
 	Action: func(c *cli.Context) error {
@@ -925,10 +932,32 @@ func runLCOW(
 			if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
 				return fmt.Errorf("share diode_tcpbulk: %w", err)
 			}
+			egress := c.Bool(siblingDiodeUplinkArgName)
+			netCfg, err := siblingNetConfigFor(role, egress)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("sibling net: role=%s if=%s addr=%s gw=%s dns=%s\n", role,
+				netCfg.ifName, netCfg.address, netCfg.gateway, strings.Join(netCfg.dns, ","))
+			var uplink *diodeUplink
+			if egress && role == diodeRole {
+				iptablesPath := filepath.Join(filepath.Dir(busModulePath), "diode_iptables")
+				if err := vm.Share(ctx, iptablesPath, "/run/diode-iptables", true); err != nil {
+					return fmt.Errorf("share diode_iptables: %w", err)
+				}
+				var cleanup func()
+				uplink, cleanup, err = attachDiodeUplink(ctx, vm)
+				if err != nil {
+					return err
+				}
+				defer cleanup()
+			}
 			execCommand += "; " + siblingBusGuestModuleCommand(
 				busModuleRoot+"/"+filepath.Base(busModulePath),
 				netModuleRoot+"/"+netModuleName,
 				role,
+				netCfg,
+				uplink,
 			)
 		}
 	}
@@ -1152,11 +1181,92 @@ const siblingNetRelayCheck = `set +eu; ` + siblingTCPBulkStage + `snap() { set -
 	`if [ $((d-d0)) -gt 100 ] && [ $(((c-c0)*100)) -lt $((d-d0)) ]; then echo 'diode_net: no-relay ok'; ` +
 	`else echo 'diode_net: no-relay inconclusive'; fi; `
 
-func siblingBusGuestModuleCommand(modulePath, netModulePath, role string) string {
-	ifName, addr := "dvsp0", "10.200.0.1"
-	if role == workloadRole {
-		ifName, addr = "dvsc0", "10.200.0.2"
+// siblingDiodeUplinkCommand configures the diode's uplink NIC (the only
+// interface besides dvsp0 backed by a device) and masquerades the workload
+// subnet out of it. It needs the exec tmpfs from siblingTCPBulkStage.
+func siblingDiodeUplinkCommand(uplink *diodeUplink, waitFor func(cond, what string) string) string {
+	return "ipt=/run/dtb-exec/ipt; cp /run/diode-iptables/diode_iptables $ipt && chmod 755 $ipt; " +
+		waitFor("up=; for n in /sys/class/net/*; do n=${n##*/}; [ $n != dvsp0 ] && "+
+			"[ -e /sys/class/net/$n/device ] && up=$n; done; [ -n \"$up\" ]", "uplink nic") +
+		"ip addr add " + uplink.address + " dev $up; ip link set $up up; " +
+		"ip route add default via " + uplink.gateway + " dev $up; " +
+		"echo 1 >/proc/sys/net/ipv4/ip_forward; " +
+		"if $ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o $up -j MASQUERADE; " +
+		"then echo \"diode_net: nat ok dev=$up addr=" + uplink.address + " gw=" + uplink.gateway + "\"; " +
+		"else echo 'diode_net: nat failed'; fi; " +
+		"if ping -c 2 -W 2 " + uplink.gateway + " >/dev/null 2>&1; " +
+		"then echo 'diode_net: uplink gateway ok'; else echo 'diode_net: uplink gateway no reply'; fi; "
+}
+
+// siblingNetConfig is the host-chosen configuration of a sibling network
+// interface. For the workload, gateway and dns make the diode its default
+// route and the host's DNS servers its resolvers.
+type siblingNetConfig struct {
+	ifName  string
+	address string // CIDR
+	gateway string
+	dns     []string
+}
+
+func siblingNetConfigFor(role string, egress bool) (siblingNetConfig, error) {
+	if role == diodeRole {
+		return siblingNetConfig{ifName: "dvsp0", address: "10.200.0.1/30"}, nil
 	}
+	cfg := siblingNetConfig{ifName: "dvsc0", address: "10.200.0.2/30"}
+	if egress {
+		dns, err := hostDNSServers()
+		if err != nil {
+			return cfg, err
+		}
+		cfg.gateway, cfg.dns = "10.200.0.1", dns
+	}
+	return cfg, nil
+}
+
+// command configures the interface once it exists. It prints nothing, so it
+// can precede the relay check.
+func (cfg siblingNetConfig) command() string {
+	cmd := "ip addr add " + cfg.address + " dev " + cfg.ifName +
+		" && ip link set " + cfg.ifName + " up; "
+	if cfg.gateway != "" {
+		cmd += "ip route replace default via " + cfg.gateway + " dev " + cfg.ifName + "; "
+	}
+	if len(cfg.dns) > 0 {
+		// The rootfs is read-only and may lack /etc/resolv.conf, so bind over
+		// an existing file or overlay /etc with a tmpfs upper layer.
+		cmd += "printf 'nameserver %s\\n' " + strings.Join(cfg.dns, " ") + " >/run/resolv.conf; " +
+			"if cp /run/resolv.conf /etc/resolv.conf 2>/dev/null; then :; " +
+			"elif [ -e /etc/resolv.conf ]; then mount --bind /run/resolv.conf /etc/resolv.conf; " +
+			"else o=/run/etc-overlay; mkdir -p $o && mount -t tmpfs tmpfs $o && " +
+			"mkdir $o/up $o/work && mount -t overlay overlay " +
+			"-o lowerdir=/etc,upperdir=$o/up,workdir=$o/work /etc && " +
+			"cp /run/resolv.conf /etc/resolv.conf; fi || " +
+			"echo 'diode_net: resolv.conf not writable' >&2; "
+	}
+	return cmd
+}
+
+// siblingWorkloadEgressCommand checks that the workload's only NIC is dvsc0
+// and reports what ICMP, UDP (DNS) and TCP (HTTP HEAD) reach through the
+// diode. It runs after siblingNetRelayCheck, which stages $dtb. The host may
+// drop ICMP, so the diode's MASQUERADE counters are the definitive check.
+func siblingWorkloadEgressCommand(dnsServers []string) string {
+	return "echo \"diode_net: workload interfaces $(ls /sys/class/net | tr '\\n' ' ')" +
+		"nics=$(ls -d /sys/class/net/*/device 2>/dev/null | wc -l)\"; " +
+		"echo \"diode_net: workload route $(ip route | grep default)\"; " +
+		"echo \"diode_net: workload resolv $(grep nameserver /etc/resolv.conf | tr '\\n' ' ')\"; " +
+		"for dst in " + diodeUplinkGateway + " 1.1.1.1; do " +
+		"if ping -c 3 -W 2 $dst >/dev/null 2>&1; then echo \"diode_net: egress ping $dst ok\"; " +
+		"else echo \"diode_net: egress ping $dst no reply\"; fi; done; " +
+		"for ns in " + strings.Join(dnsServers, " ") + " 1.1.1.1; do r=$(\"$dtb\" dns $ns example.com); echo \"diode_net: egress $r\"; " +
+		"case $r in *' ok addr='*) ip=${r#*addr=}; ip=${ip%% *};; esac; done; " +
+		"for dst in 1.1.1.1:80 ${ip:+$ip:80}; do " +
+		"echo \"diode_net: egress $(\"$dtb\" connect ${dst%:*} ${dst#*:})\"; done; "
+}
+
+func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
+	net siblingNetConfig, uplink *diodeUplink) string {
+	ifName := net.ifName
 	waitFor := func(cond, what string) string {
 		return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
 			"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
@@ -1170,20 +1280,28 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string) string
 			"echo") +
 		"dmesg | grep -F 'sibling_bus:'; " +
 		"echo \"diode_net: tools $(command -v ip ifconfig ping | tr '\\n' ' ')\"; " +
-		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) +
-		"if command -v ip >/dev/null; then ip addr add " + addr + "/30 dev " + ifName +
-		" && ip link set " + ifName + " up; else ifconfig " + ifName + " " + addr +
-		" netmask 255.255.255.252 up; fi; "
+		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command()
 	if role == workloadRole {
 		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
 			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
 			"else echo 'diode_net: ping failed'; fi; " + siblingNetRelayCheck
+		if net.gateway != "" {
+			cmd += siblingWorkloadEgressCommand(net.dns)
+		}
 	} else {
 		cmd += siblingTCPBulkStage +
-			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
+			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); "
+		if uplink != nil {
+			cmd += "set +eu; " + siblingDiodeUplinkCommand(uplink, waitFor)
+		}
+		cmd +=
 			"i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do " +
-			"i=$((i+1)); [ $i -le 150 ] || break; sleep 1; done; " +
-			"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
+				"i=$((i+1)); [ $i -le 150 ] || break; sleep 1; done; " +
+				"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
+		if uplink != nil {
+			cmd += "echo \"diode_net: nat counters $($ipt iptables -t nat -L POSTROUTING -v -n -x | " +
+				"grep MASQUERADE | tr -s ' ')\"; "
+		}
 	}
 	cmd += "echo \"diode_net: " + ifName + " tx=$(cat /sys/class/net/" + ifName +
 		"/statistics/tx_packets) rx=$(cat /sys/class/net/" + ifName +
