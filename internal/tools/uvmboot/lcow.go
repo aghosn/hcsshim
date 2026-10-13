@@ -217,9 +217,39 @@ var lcowCommand = cli.Command{
 				diodeUplinkNetworkName + " HNS NAT network, NAT the workload " +
 				"through it and route the workload's default traffic via the diode.",
 		},
+		cli.StringFlag{
+			Name: baselineNICArgName,
+			Usage: "Baseline without the diode: give one UVM a NIC on the " +
+				diodeUplinkNetworkName + " HNS NAT network and measure the host " +
+				"endpoint over it with this diode_tcpbulk `file`.",
+		},
+		cli.StringFlag{
+			Name: baselinePairArgName,
+			Usage: "Reference without the diode: give two UVMs NICs on the " +
+				diodeUplinkNetworkName + " HNS NAT network and measure one from " +
+				"the other through the host vSwitch with this diode_tcpbulk `file`.",
+		},
+		cli.IntFlag{
+			Name:  benchSecondsArgName,
+			Value: 15,
+			Usage: "Duration of each iperf test (bulk and round trips) in seconds.",
+		},
+		cli.StringFlag{
+			Name: cpuGroupLPsArgName,
+			Usage: "Pin each UVM to a host CPU group: semicolon-separated logical " +
+				"processor lists, the Nth for uvmboot-N, e.g. \"2,3;4,5\".",
+		},
 	},
 	Action: func(c *cli.Context) error {
 		execCommand, err := loadExecCommand(c)
+		if err != nil {
+			return err
+		}
+		benchSeconds = c.Int(benchSecondsArgName)
+		if benchSeconds < 1 {
+			return fmt.Errorf("--%s must be at least 1", benchSecondsArgName)
+		}
+		cpuGroupLPs, err := parseCPUGroupLPs(c.String(cpuGroupLPsArgName))
 		if err != nil {
 			return err
 		}
@@ -300,6 +330,35 @@ var lcowCommand = cli.Command{
 			if _, err := os.Stat(c.String(siblingBusGuestModuleArgName)); err != nil {
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
+		}
+		for _, flag := range []struct {
+			name  string
+			count int
+		}{{baselineNICArgName, 1}, {baselinePairArgName, 2}} {
+			if !c.IsSet(flag.name) {
+				continue
+			}
+			if !useGCS || c.GlobalInt(countArgName) != flag.count ||
+				c.GlobalInt(parallelArgName) != flag.count {
+				return fmt.Errorf("--%s requires --gcs --count %d --parallel %d",
+					flag.name, flag.count, flag.count)
+			}
+			if c.IsSet(sharedMemorySizeArgName) || c.IsSet(sharedMemoryNameArgName) ||
+				c.Bool(sharedMemoryTwoUVMArgName) || c.IsSet(execCommandLineArgName) ||
+				c.IsSet(execFileArgName) || (c.IsSet(baselineNICArgName) && c.IsSet(baselinePairArgName)) {
+				return fmt.Errorf("--%s is mutually exclusive with shared memory, the other "+
+					"baseline and --%s/--%s", flag.name, execCommandLineArgName, execFileArgName)
+			}
+			if _, err := os.Stat(c.String(flag.name)); err != nil {
+				return fmt.Errorf("inspect diode_tcpbulk: %w", err)
+			}
+		}
+		if c.IsSet(baselineNICArgName) || c.Bool(siblingDiodeUplinkArgName) {
+			stop, err := startHostEndpoint()
+			if err != nil {
+				return err
+			}
+			defer stop()
 		}
 		if c.Bool(sharedMemoryMappingOnlyArgName) &&
 			c.Bool(sharedMemoryTwoUVMArgName) {
@@ -398,6 +457,9 @@ var lcowCommand = cli.Command{
 				}
 				errMu.Unlock()
 				return err
+			}
+			if deleteGroup := joinCPUGroup(ctx, id, cpuGroupLPs, options); deleteGroup != nil {
+				defer deleteGroup()
 			}
 			if c.Bool(securityHardwareFlag) {
 				defer os.RemoveAll(options.BundleDirectory)
@@ -932,6 +994,10 @@ func runLCOW(
 			if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
 				return fmt.Errorf("share diode_tcpbulk: %w", err)
 			}
+			iperfPath := filepath.Join(filepath.Dir(busModulePath), iperfGuestName)
+			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
+				return fmt.Errorf("share %s: %w", iperfGuestName, err)
+			}
 			egress := c.Bool(siblingDiodeUplinkArgName)
 			netCfg, err := siblingNetConfigFor(role, egress)
 			if err != nil {
@@ -960,6 +1026,15 @@ func runLCOW(
 				uplink,
 			)
 		}
+	}
+
+	if c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) {
+		cmd, cleanup, err := baselineCommand(ctx, c, vm)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		execCommand = cmd
 	}
 
 	if err := mountVPMem(ctx, c, vm); err != nil {
@@ -1154,10 +1229,12 @@ func siblingNetModuleName(role string) string {
 
 // siblingTCPBulkStage copies diode_tcpbulk from its Plan9 share into an exec
 // tmpfs (the guest /tmp is noexec). Plan9 runs over VMBus, so this must happen
-// before the relay-check window. $dtb is the binary to run.
+// before the relay-check window. $dtb is the binary to run; iperfStage adds
+// $ipf and ipbench.
 const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run/dtb-exec && ` +
-	`mount -t tmpfs -o exec,size=8m tmpfs /run/dtb-exec 2>/dev/null && ` +
-	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; `
+	`mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec 2>/dev/null && ` +
+	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; ` +
+	iperfStage
 
 // siblingNetRelayCheck runs bulk traffic from the workload over dvsc0 and
 // compares, over that window, the root VMBus channel interrupts with the
@@ -1166,31 +1243,37 @@ const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run
 const siblingNetRelayCheck = `set +eu; ` + siblingTCPBulkStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
 	`for f in /sys/bus/vmbus/devices/*/channels/*/interrupts; do [ -r $f ] && c=$((c+$(cat $f))); done; ` +
-	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; ` +
+	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
 	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
 	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; ` +
 	`snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
 	`ping -q -A -c 2000 -s 1400 10.200.0.1 >/tmp/dn-ping 2>&1 || ` +
 	`ping -q -c 300 -i 0.01 -s 1400 10.200.0.1 >>/tmp/dn-ping 2>&1; ` +
-	`snap; t1=$t b1=$b; ` +
+	`snap; t1=$t b1=$b d1=$d m1=$m; ` +
 	`"$dtb" send 10.200.0.1 5001 256 >/tmp/dn-tcp 2>&1; snap; ` +
 	`echo "diode_net: ping-flood $(grep -E 'transmitted|round-trip' /tmp/dn-ping | tr '\n' ' ') cs=$((t1-t0))"; ` +
-	`echo "diode_net: tcp-bulk $(tr '\n' ' ' </tmp/dn-tcp) cs=$((t-t1)) bytes=$((b-b1))"; ` +
+	`echo "diode_net: tcp-bulk $(tr '\n' ' ' </tmp/dn-tcp) cs=$((t-t1)) bytes=$((b-b1)) doorbells_rx=$((d-d1)) signals_masked=$((m-m1))"; ` +
 	`echo "diode_net: relay check cs=$((t-t0)) vmbus_chan_irqs=$((c-c0)) hyp_irqs=$((h-h0)) ` +
 	`doorbells_rx=$((d-d0)) signals_tx=$((g-g0)) tx_bytes=$((b-b0)) rx_bytes=$((r-r0))"; ` +
 	`if [ $((d-d0)) -gt 100 ] && [ $(((c-c0)*100)) -lt $((d-d0)) ]; then echo 'diode_net: no-relay ok'; ` +
 	`else echo 'diode_net: no-relay inconclusive'; fi; `
 
 // siblingDiodeUplinkCommand configures the diode's uplink NIC (the only
-// interface besides dvsp0 backed by a device) and masquerades the workload
-// subnet out of it. It needs the exec tmpfs from siblingTCPBulkStage.
+// interface besides dvsp0 backed by a device). It needs the exec tmpfs from
+// siblingTCPBulkStage.
 func siblingDiodeUplinkCommand(uplink *diodeUplink, waitFor func(cond, what string) string) string {
 	return "ipt=/run/dtb-exec/ipt; cp /run/diode-iptables/diode_iptables $ipt && chmod 755 $ipt; " +
 		waitFor("up=; for n in /sys/class/net/*; do n=${n##*/}; [ $n != dvsp0 ] && "+
 			"[ -e /sys/class/net/$n/device ] && up=$n; done; [ -n \"$up\" ]", "uplink nic") +
 		"ip addr add " + uplink.address + " dev $up; ip link set $up up; " +
-		"ip route add default via " + uplink.gateway + " dev $up; " +
-		"echo 1 >/proc/sys/net/ipv4/ip_forward; " +
+		"ip route add default via " + uplink.gateway + " dev $up; "
+}
+
+// siblingDiodeNATCommand forwards and masquerades the workload subnet out of
+// the uplink NIC ($up). Installing the nat table enables conntrack for all
+// traffic.
+func siblingDiodeNATCommand(uplink *diodeUplink) string {
+	return "echo 1 >/proc/sys/net/ipv4/ip_forward; " +
 		"if $ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o $up -j MASQUERADE; " +
 		"then echo \"diode_net: nat ok dev=$up addr=" + uplink.address + " gw=" + uplink.gateway + "\"; " +
 		"else echo 'diode_net: nat failed'; fi; " +
@@ -1264,15 +1347,19 @@ func siblingWorkloadEgressCommand(dnsServers []string) string {
 		"echo \"diode_net: egress $(\"$dtb\" connect ${dst%:*} ${dst#*:})\"; done; "
 }
 
+// guestWaitFor polls cond once a second for up to 30s, then fails the guest
+// command.
+func guestWaitFor(cond, what string) string {
+	return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
+		"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
+		"dmesg | grep -E 'sibling_bus:|diode_net' >&2 || true; exit 1; }; " +
+		"sleep 1; done; "
+}
+
 func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 	net siblingNetConfig, uplink *diodeUplink) string {
 	ifName := net.ifName
-	waitFor := func(cond, what string) string {
-		return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
-			"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
-			"dmesg | grep -E 'sibling_bus:|diode_net' >&2 || true; exit 1; }; " +
-			"sleep 1; done; "
-	}
+	waitFor := guestWaitFor
 	cmd := fmt.Sprintf("insmod %s; insmod %s; ",
 		shellSingleQuote(modulePath),
 		shellSingleQuote(netModulePath)) +
@@ -1286,20 +1373,43 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
 			"else echo 'diode_net: ping failed'; fi; " + siblingNetRelayCheck
 		if net.gateway != "" {
-			cmd += siblingWorkloadEgressCommand(net.dns)
+			// Benchmark the sibling link before NAT, like the VM-pair
+			// reference, then signal the diode on 5004. The diode then
+			// installs NAT and listens on 5002, so the next run measures
+			// throughput under conntrack.
+			cmd += ipbench("link", "10.200.0.1", iperfLinkPort) +
+				"\"$dtb\" send 10.200.0.1 5004 1 >/dev/null 2>&1; " +
+				"snap; t1=$t d1=$d m1=$m; \"$dtb\" send 10.200.0.1 5002 256 >/tmp/dn-tcp2 2>&1; snap; " +
+				"echo \"diode_net: tcp-bulk-nat $(tr '\\n' ' ' </tmp/dn-tcp2) cs=$((t-t1)) doorbells_rx=$((d-d1)) signals_masked=$((m-m1))\"; " +
+				siblingWorkloadEgressCommand(net.dns) + hostEndpointTests()
 		}
 	} else {
 		cmd += siblingTCPBulkStage +
-			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); "
+			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
+			fmt.Sprintf("(\"$ipf\" -s -p %d >/dev/null 2>&1 &); ", iperfLinkPort)
 		if uplink != nil {
-			cmd += "set +eu; " + siblingDiodeUplinkCommand(uplink, waitFor)
+			// Install NAT once the workload has benchmarked the link (sink
+			// 5004), then accept a second bulk run, to compare sibling
+			// throughput without and with conntrack.
+			cmd += "set +eu; " + siblingDiodeUplinkCommand(uplink, waitFor) +
+				"(\"$dtb\" sink 5004 >/tmp/dn-go 2>&1 &); " +
+				fmt.Sprintf("i=0; until grep -q sink /tmp/dn-go 2>/dev/null; do i=$((i+1)); [ $i -le %d ] || break; sleep 1; done; ",
+					2*benchSeconds+180) +
+				"s1=$(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); " +
+				siblingDiodeNATCommand(uplink) +
+				"(\"$dtb\" sink 5002 >/tmp/dn-tcp2 2>&1 &); " +
+				"i=0; until grep -q sink /tmp/dn-tcp2 2>/dev/null; do i=$((i+1)); [ $i -le 120 ] || break; sleep 1; done; " +
+				"s2=$(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); "
 		}
-		cmd +=
-			"i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do " +
-				"i=$((i+1)); [ $i -le 150 ] || break; sleep 1; done; " +
-				"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
+		// The workload benchmarks the host endpoint before closing.
+		cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do "+
+			"i=$((i+1)); [ $i -le %d ] || break; sleep 1; done; ", 2*benchSeconds+300) +
+			"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
 		if uplink != nil {
-			cmd += "echo \"diode_net: nat counters $($ipt iptables -t nat -L POSTROUTING -v -n -x | " +
+			cmd += "echo \"diode_net: diode stats after-bulk $s1\"; echo \"diode_net: diode stats after-bulk-nat $s2\"; " +
+				"echo \"diode_net: listener-nat $(tr '\\n' ' ' </tmp/dn-tcp2 2>/dev/null)\"; " +
+				"echo \"diode_net: conntrack count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)\"; " +
+				"echo \"diode_net: nat counters $($ipt iptables -t nat -L POSTROUTING -v -n -x | " +
 				"grep MASQUERADE | tr -s ' ')\"; "
 		}
 	}
