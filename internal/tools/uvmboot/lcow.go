@@ -235,6 +235,11 @@ var lcowCommand = cli.Command{
 			Usage: "Duration of each iperf test (bulk and round trips) in seconds.",
 		},
 		cli.StringFlag{
+			Name:  siblingTestsArgName,
+			Value: allSiblingTests,
+			Usage: "Comma-separated tests the sibling workload runs: " + allSiblingTests + ".",
+		},
+		cli.StringFlag{
 			Name: cpuGroupLPsArgName,
 			Usage: "Pin each UVM to a host CPU group: semicolon-separated logical " +
 				"processor lists, the Nth for uvmboot-N, e.g. \"2,3;4,5\".",
@@ -248,6 +253,9 @@ var lcowCommand = cli.Command{
 		benchSeconds = c.Int(benchSecondsArgName)
 		if benchSeconds < 1 {
 			return fmt.Errorf("--%s must be at least 1", benchSecondsArgName)
+		}
+		if siblingTests, err = parseSiblingTests(c.String(siblingTestsArgName)); err != nil {
+			return err
 		}
 		cpuGroupLPs, err := parseCPUGroupLPs(c.String(cpuGroupLPsArgName))
 		if err != nil {
@@ -581,6 +589,10 @@ var lcowCommand = cli.Command{
 			logrus.WithField("hex", prefix).Info(
 				"final shared-memory prefix",
 			)
+			if c.Bool(sharedMemoryTwoUVMArgName) &&
+				!c.Bool(sharedMemoryMappingOnlyArgName) {
+				section.printCrashLogs()
+			}
 			if c.Bool(sharedMemoryMappingOnlyArgName) {
 				// Mapping-only mode intentionally does not access guest pages.
 			} else if c.Bool(sharedMemoryTwoUVMArgName) {
@@ -1236,17 +1248,21 @@ const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run
 	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; ` +
 	iperfStage
 
-// siblingNetRelayCheck runs bulk traffic from the workload over dvsc0 and
-// compares, over that window, the root VMBus channel interrupts with the
-// sibling doorbells. Nothing is printed inside the window because guest
-// output itself travels over VMBus (hvsock).
-const siblingNetRelayCheck = `set +eu; ` + siblingTCPBulkStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
+// siblingWorkloadStage stages $dtb and $ipf and defines snap, which reads
+// the root VMBus channel interrupts, the sibling bus counters, uptime and
+// dvsc0's byte counters.
+const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
 	`for f in /sys/bus/vmbus/devices/*/channels/*/interrupts; do [ -r $f ] && c=$((c+$(cat $f))); done; ` +
 	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
 	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
-	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; ` +
-	`snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
+	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; `
+
+// siblingNetRelayCheck runs bulk traffic from the workload over dvsc0 and
+// compares, over that window, the root VMBus channel interrupts with the
+// sibling doorbells. Nothing is printed inside the window because guest
+// output itself travels over VMBus (hvsock). It needs siblingWorkloadStage.
+const siblingNetRelayCheck = `snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
 	`ping -q -A -c 2000 -s 1400 10.200.0.1 >/tmp/dn-ping 2>&1 || ` +
 	`ping -q -c 300 -i 0.01 -s 1400 10.200.0.1 >>/tmp/dn-ping 2>&1; ` +
 	`snap; t1=$t b1=$b d1=$d m1=$m; ` +
@@ -1331,7 +1347,7 @@ func (cfg siblingNetConfig) command() string {
 
 // siblingWorkloadEgressCommand checks that the workload's only NIC is dvsc0
 // and reports what ICMP, UDP (DNS) and TCP (HTTP HEAD) reach through the
-// diode. It runs after siblingNetRelayCheck, which stages $dtb. The host may
+// diode. It needs siblingWorkloadStage, which stages $dtb. The host may
 // drop ICMP, so the diode's MASQUERADE counters are the definitive check.
 func siblingWorkloadEgressCommand(dnsServers []string) string {
 	return "echo \"diode_net: workload interfaces $(ls /sys/class/net | tr '\\n' ' ')" +
@@ -1371,17 +1387,32 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 	if role == workloadRole {
 		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
 			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
-			"else echo 'diode_net: ping failed'; fi; " + siblingNetRelayCheck
+			"else echo 'diode_net: ping failed'; fi; " + siblingWorkloadStage
+		if siblingTests["checks"] {
+			cmd += siblingNetRelayCheck
+		}
 		if net.gateway != "" {
 			// Benchmark the sibling link before NAT, like the VM-pair
 			// reference, then signal the diode on 5004. The diode then
 			// installs NAT and listens on 5002, so the next run measures
-			// throughput under conntrack.
-			cmd += ipbench("link", "10.200.0.1", iperfLinkPort) +
-				"\"$dtb\" send 10.200.0.1 5004 1 >/dev/null 2>&1; " +
-				"snap; t1=$t d1=$d m1=$m; \"$dtb\" send 10.200.0.1 5002 256 >/tmp/dn-tcp2 2>&1; snap; " +
-				"echo \"diode_net: tcp-bulk-nat $(tr '\\n' ' ' </tmp/dn-tcp2) cs=$((t-t1)) doorbells_rx=$((d-d1)) signals_masked=$((m-m1))\"; " +
-				siblingWorkloadEgressCommand(net.dns) + hostEndpointTests()
+			// throughput under conntrack. Without that run, a 1 MB send
+			// to 5002 waits for NAT before the egress tests.
+			if siblingTests["link"] {
+				cmd += ipbench("link", "10.200.0.1", iperfLinkPort)
+			}
+			cmd += "\"$dtb\" send 10.200.0.1 5004 1 >/dev/null 2>&1; "
+			if siblingTests["nat"] {
+				cmd += "snap; t1=$t d1=$d m1=$m; \"$dtb\" send 10.200.0.1 5002 256 >/tmp/dn-tcp2 2>&1; snap; " +
+					"echo \"diode_net: tcp-bulk-nat $(tr '\\n' ' ' </tmp/dn-tcp2) cs=$((t-t1)) doorbells_rx=$((d-d1)) signals_masked=$((m-m1))\"; "
+			} else {
+				cmd += "\"$dtb\" send 10.200.0.1 5002 1 >/dev/null 2>&1; "
+			}
+			if siblingTests["checks"] {
+				cmd += siblingWorkloadEgressCommand(net.dns)
+			}
+			if siblingTests["host"] {
+				cmd += hostEndpointTests()
+			}
 		}
 	} else {
 		cmd += siblingTCPBulkStage +
@@ -1401,9 +1432,21 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 				"i=0; until grep -q sink /tmp/dn-tcp2 2>/dev/null; do i=$((i+1)); [ $i -le 120 ] || break; sleep 1; done; " +
 				"s2=$(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); "
 		}
-		// The workload benchmarks the host endpoint before closing.
+		// The workload benchmarks the host endpoint before closing. Each
+		// second, report memory, swiotlb use, forwarding counters and new
+		// kernel messages, so a diode that dies mid-run leaves a trail.
+		mon := ":"
+		if uplink != nil {
+			cmd += "mount -t debugfs none /sys/kernel/debug 2>/dev/null; k=$(dmesg | wc -l); " +
+				"mon() { n=/sys/class/net; echo \"diode_net: mon $(grep MemAvailable /proc/meminfo | tr -s ' ')" +
+				" swiotlb=$(cat /sys/kernel/debug/swiotlb/io_tlb_used 2>/dev/null)" +
+				" $up=$(cat $n/$up/statistics/tx_packets)/$(cat $n/$up/statistics/tx_dropped)/$(cat $n/$up/statistics/tx_errors)" +
+				" dvsp0=$(cat $n/dvsp0/statistics/rx_packets)/$(cat $n/dvsp0/statistics/rx_errors)/$(cat $n/dvsp0/statistics/rx_dropped)\"; " +
+				"dmesg | tail -n +$((k+1)); k=$(dmesg | wc -l); }; "
+			mon = "mon"
+		}
 		cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do "+
-			"i=$((i+1)); [ $i -le %d ] || break; sleep 1; done; ", 2*benchSeconds+300) +
+			"i=$((i+1)); [ $i -le %d ] || break; %s; sleep 1; done; ", 2*benchSeconds+300, mon) +
 			"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
 		if uplink != nil {
 			cmd += "echo \"diode_net: diode stats after-bulk $s1\"; echo \"diode_net: diode stats after-bulk-nat $s2\"; " +
