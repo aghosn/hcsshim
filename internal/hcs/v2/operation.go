@@ -20,6 +20,33 @@ const infiniteTimeout = ^uint32(0)
 // tracking the operation.
 const hcsErrOperationTimeout = syscall.Errno(0x80370118)
 
+// OperationResource is an existing HCS operation capability, not a JSON handle.
+// The caller owns Handle and must keep it open through the resource-bearing
+// create/modify call. HCS duplicates it at attachment; the operation owns that
+// duplicate. URI selects the capability and must match the consuming schema.
+type OperationResource struct {
+	Type   uint32
+	URI    string
+	Handle syscall.Handle
+}
+
+// attachOperationResources attaches borrowed resources before any VM operation
+// starts. Failure prevents dispatch; closing the operation releases any prefix
+// of attached resources, never the caller's handles.
+func attachOperationResources(ctx context.Context, op computecore.HcsOperation, resources []OperationResource) error {
+	seen := make(map[string]bool)
+	for _, r := range resources {
+		if r.URI == "" || seen[r.URI] || r.Handle == 0 || r.Handle == syscall.InvalidHandle {
+			return errors.New("invalid or duplicate HCS operation resource")
+		}
+		seen[r.URI] = true
+		if err := computecore.HcsAddResourceToOperation(ctx, op, r.Type, r.URI, r.Handle); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // waitTimeoutMs derives the TimeoutMs argument for HcsWaitForOperationResult
 // from ctx's deadline. With no deadline (or one already past) it falls back
 // to INFINITE / a minimal poll respectively.

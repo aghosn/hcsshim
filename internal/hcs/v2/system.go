@@ -71,6 +71,15 @@ func siloNameFmt(containerID string) string {
 
 // CreateComputeSystem creates a new compute system with the given configuration but does not start it.
 func CreateComputeSystem(ctx context.Context, id string, hcsDocumentInterface interface{}) (_ *System, err error) {
+	return CreateComputeSystemWithResources(ctx, id, hcsDocumentInterface, nil)
+}
+
+// CreateComputeSystemWithResources creates but does not start a system, attaching
+// borrowed capabilities before dispatch. Resources must remain open until return;
+// HCS owns its duplicates. Private failure cleanup has a separate bounded budget
+// and reports errors; attachment or creation errors never imply success.
+// The returned system is caller-owned; Close releases its handle.
+func CreateComputeSystemWithResources(ctx context.Context, id string, hcsDocumentInterface interface{}, resources []OperationResource) (_ *System, err error) {
 	operation := "hcs::CreateComputeSystem"
 
 	ctx, span := ot.StartSpan(ctx, operation)
@@ -93,14 +102,30 @@ func CreateComputeSystem(ctx context.Context, id string, hcsDocumentInterface in
 	// including a synchronous create failure.
 	defer func() {
 		if err != nil {
-			_ = computeSystem.Terminate(ctx)
-			computeSystem.Close()
+			if len(resources) == 0 {
+				_ = computeSystem.Terminate(ctx)
+				computeSystem.Close()
+			} else {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				err = errors.Join(err, computeSystem.Terminate(cleanupCtx))
+				// Only registered systems have a running notification waiter.
+				// Earlier failures are closed under terminate-on-last-handle;
+				// the launcher must not infer completed preparation cleanup.
+				if computeSystem.notificationID != 0 {
+					err = errors.Join(err, computeSystem.WaitCtx(cleanupCtx))
+				}
+				err = errors.Join(err, computeSystem.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
 	createCtx, cancel := context.WithTimeout(ctx, timeout.SystemCreate)
 	defer cancel()
 	_, createErr := runOperation(createCtx, func(op computecore.HcsOperation) error {
+		if err := attachOperationResources(ctx, op, resources); err != nil {
+			return err
+		}
 		var hErr error
 		computeSystem.handle, hErr = computecore.HcsCreateComputeSystem(ctx, id, hcsDocument, op, nil)
 		return hErr
@@ -939,6 +964,13 @@ func (computeSystem *System) CloseCtx(ctx context.Context) (err error) {
 
 // Modify the System by sending a request to HCS
 func (computeSystem *System) Modify(ctx context.Context, config interface{}) error {
+	return computeSystem.ModifyWithResources(ctx, config, nil)
+}
+
+// ModifyWithResources borrows capabilities through completion and attaches them
+// before dispatch. It retains the system read lock and the ordinary Modify error
+// contract; callers query protected progress even when this returns an error.
+func (computeSystem *System) ModifyWithResources(ctx context.Context, config interface{}, resources []OperationResource) error {
 	computeSystem.handleLock.RLock()
 	defer computeSystem.handleLock.RUnlock()
 
@@ -956,6 +988,9 @@ func (computeSystem *System) Modify(ctx context.Context, config interface{}) err
 	requestJSON := string(requestBytes)
 
 	_, callErr := runOperation(ctx, func(op computecore.HcsOperation) error {
+		if err := attachOperationResources(ctx, op, resources); err != nil {
+			return err
+		}
 		return computecore.HcsModifyComputeSystem(ctx, computeSystem.handle, op, requestJSON, 0)
 	})
 	if callErr != nil {

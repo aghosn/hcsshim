@@ -9,8 +9,147 @@
 
 package hcsschema
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 type SharedMemoryRegionInfo struct {
 	SectionName string `json:"SectionName,omitempty"`
 
 	GuestPhysicalAddress int32 `json:"GuestPhysicalAddress,omitempty"`
+
+	ProtectedShared *ProtectedSharedRegionInfo `json:"ProtectedShared,omitempty"`
+}
+
+// ProtectedSharedRegistrationInfo is one logical binding or retained history.
+// State is Pending/Installed/Removing/Removed (0..3); identifiers are not attestations.
+type ProtectedSharedRegistrationInfo struct {
+	RegistrationId  uint64 `json:"RegistrationId"`
+	PartitionId     uint64 `json:"PartitionId"`
+	GpaPage         uint64 `json:"GpaPage"`
+	SharePermission uint32 `json:"SharePermission"`
+	Vtl             uint32 `json:"Vtl"`
+	State           uint32 `json:"State"`
+	RemovalReason   uint32 `json:"RemovalReason"`
+}
+
+// ProtectedSharedRegionInfo mirrors the private OS v1 metadata. Operation and
+// query framing are independent. LastMap describes the latest controller-wide
+// attempt, not this participant. A complete page is not an atomic region snapshot.
+type ProtectedSharedRegionInfo struct {
+	Version               uint32                            `json:"Version"`
+	Prepared              bool                              `json:"Prepared"`
+	Installed             bool                              `json:"Installed"`
+	Removed               bool                              `json:"Removed"`
+	LeaseId               uint64                            `json:"LeaseId"`
+	PageCount             uint64                            `json:"PageCount"`
+	InitializedPages      uint64                            `json:"InitializedPages"`
+	PreparedParticipants  uint64                            `json:"PreparedParticipants"`
+	OperationHresult      uint32                            `json:"OperationHresult"`
+	OperationStatus       uint32                            `json:"OperationStatus"`
+	OperationResultValid  bool                              `json:"OperationResultValid"`
+	PagesProcessed        uint32                            `json:"PagesProcessed"`
+	MapSequence           uint64                            `json:"MapSequence"`
+	LastMapPagesProcessed uint64                            `json:"LastMapPagesProcessed"`
+	LastMapStatus         uint32                            `json:"LastMapStatus"`
+	PageIndex             uint64                            `json:"PageIndex"`
+	NextPageIndex         uint64                            `json:"NextPageIndex"`
+	RegionComplete        bool                              `json:"RegionComplete"`
+	QueryHresult          uint32                            `json:"QueryHresult"`
+	QueryStatus           uint32                            `json:"QueryStatus"`
+	QueryResultValid      bool                              `json:"QueryResultValid"`
+	SnapshotValid         bool                              `json:"SnapshotValid"`
+	Complete              bool                              `json:"Complete"`
+	SpaPage               uint64                            `json:"SpaPage"`
+	LifetimeId            uint64                            `json:"LifetimeId"`
+	MutationSequence      uint64                            `json:"MutationSequence"`
+	ShareCount            uint64                            `json:"ShareCount"`
+	State                 uint32                            `json:"State"`
+	Initialization        uint32                            `json:"Initialization"`
+	RootProtection        uint32                            `json:"RootProtection"`
+	Reclaim               uint32                            `json:"Reclaim"`
+	PageType              uint32                            `json:"PageType"`
+	PageOwnership         uint32                            `json:"PageOwnership"`
+	Registrations         []ProtectedSharedRegistrationInfo `json:"Registrations"`
+}
+
+// decodeProtectedSharedObject checks the private object's exact required names
+// and nulls before scalar decoding can erase missing/null numeric or bool fields.
+// Schema.Responses.System.mars does not mark these fields OmitEmpty, so the OS
+// emits zero/default values too. Only nullable may contain JSON null; the caller
+// checks its inventory contract. Ordinary HCS objects do not use this helper.
+// Typed encoding/json decoding remains responsible for primitive types, integer
+// widths and nested registrations. The destination must be a fresh local value;
+// it may be partially populated on error and must not be published by the caller.
+func decodeProtectedSharedObject(data []byte, required []string, nullable string, destination any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range required {
+		raw, present := fields[name]
+		if !present || (name != nullable && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
+			return fmt.Errorf("missing or null private field %q", name)
+		}
+		delete(fields, name)
+	}
+	// Reject case-folded aliases as well as unknown private-v1 fields. Otherwise
+	// encoding/json could overwrite a checked field through a differently cased
+	// name that was not itself checked for presence and null.
+	for name := range fields {
+		return fmt.Errorf("unexpected private field %q", name)
+	}
+	return json.Unmarshal(data, destination)
+}
+
+// UnmarshalJSON decodes a complete private registration atomically. Every field
+// is explicit, including zero GPA, permission, VTL and removal reason. A null
+// array entry is not a zero-valued registration. Errors retain the original
+// metadata and validation/JSON error; the receiver is unchanged on failure.
+// The caller must exclusively own the receiver while decoding.
+func (r *ProtectedSharedRegistrationInfo) UnmarshalJSON(data []byte) error {
+	type registration ProtectedSharedRegistrationInfo
+	var next registration
+	if err := decodeProtectedSharedObject(data, []string{
+		"RegistrationId", "PartitionId", "GpaPage", "SharePermission",
+		"Vtl", "State", "RemovalReason",
+	}, "", &next); err != nil {
+		return fmt.Errorf("decode ProtectedSharedRegistrationInfo %s: %w", data, err)
+	}
+	*r = ProtectedSharedRegistrationInfo(next)
+	return nil
+}
+
+// UnmarshalJSON preserves private response provenance for both direct HCS
+// properties and named/wrapped responses. All private fields must be present;
+// success statuses must be explicit zero, never missing/null defaults. A nil
+// registration slice is accepted only for zero-share inventory (Go can marshal
+// it as null; the OS emits an empty array). Semantic status/lifetime validation
+// remains separate, so a valid failed-action prefix and independent snapshot
+// survive decoding. Errors retain the raw private JSON, not a trusted partial
+// frame. The receiver and its existing registrations are unchanged on failure.
+// The caller must exclusively own the receiver while decoding.
+func (p *ProtectedSharedRegionInfo) UnmarshalJSON(data []byte) error {
+	type region ProtectedSharedRegionInfo
+	var next region
+	err := decodeProtectedSharedObject(data, []string{
+		"Version", "Prepared", "Installed", "Removed", "LeaseId", "PageCount",
+		"InitializedPages", "PreparedParticipants", "OperationHresult",
+		"OperationStatus", "OperationResultValid", "PagesProcessed",
+		"MapSequence", "LastMapPagesProcessed", "LastMapStatus", "PageIndex",
+		"NextPageIndex", "RegionComplete", "QueryHresult", "QueryStatus",
+		"QueryResultValid", "SnapshotValid", "Complete", "SpaPage", "LifetimeId",
+		"MutationSequence", "ShareCount", "State", "Initialization",
+		"RootProtection", "Reclaim", "PageType", "PageOwnership", "Registrations",
+	}, "Registrations", &next)
+	if err == nil && next.Registrations == nil && next.ShareCount != 0 {
+		err = fmt.Errorf("null private registration inventory with nonzero share count")
+	}
+	if err != nil {
+		return fmt.Errorf("decode ProtectedSharedRegionInfo %s: %w", data, err)
+	}
+	*p = ProtectedSharedRegionInfo(next)
+	return nil
 }

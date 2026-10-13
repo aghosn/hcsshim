@@ -9,6 +9,21 @@
 
 package hcsschema
 
+// ProtectedSharedAction is the private, default-off worker lifecycle action.
+// Empty serializes like None by omission; preparation is not installation.
+type ProtectedSharedAction string
+
+const (
+	ProtectedSharedNone          ProtectedSharedAction = "None"
+	ProtectedSharedInitialize    ProtectedSharedAction = "Initialize"
+	ProtectedSharedInstall       ProtectedSharedAction = "Install"
+	ProtectedSharedSeal          ProtectedSharedAction = "Seal"
+	ProtectedSharedQuery         ProtectedSharedAction = "Query"
+	ProtectedSharedBeginTeardown ProtectedSharedAction = "BeginTeardown"
+	ProtectedSharedRemove        ProtectedSharedAction = "Remove"
+	ProtectedSharedReclaim       ProtectedSharedAction = "Reclaim"
+)
+
 type SharedMemoryRegion struct {
 	SectionName string `json:"SectionName,omitempty"`
 
@@ -19,4 +34,12 @@ type SharedMemoryRegion struct {
 	AllowGuestWrite bool `json:"AllowGuestWrite,omitempty"`
 
 	HiddenFromGuest bool `json:"HiddenFromGuest,omitempty"`
+
+	ProtectedShared              bool                  `json:"ProtectedShared,omitempty"`
+	ProtectedSharedControllerUri string                `json:"ProtectedSharedControllerUri,omitempty"`
+	ProtectedSharedOperation     ProtectedSharedAction `json:"ProtectedSharedOperation,omitempty"`
+	ProtectedSharedLeaseId       uint64                `json:"ProtectedSharedLeaseId,omitempty"`
+	ProtectedSharedLifetimeId    uint64                `json:"ProtectedSharedLifetimeId,omitempty"`
+	ProtectedSharedPageIndex     uint64                `json:"ProtectedSharedPageIndex,omitempty"`
+	ProtectedSharedPageCount     uint32                `json:"ProtectedSharedPageCount,omitempty"`
 }

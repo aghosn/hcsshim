@@ -5,6 +5,7 @@ package uvm
 import (
 	"context"
 	"encoding/base64"
+	stderrors "errors"
 	"fmt"
 	"maps"
 	"net"
@@ -12,12 +13,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/copyfile"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/ot"
@@ -102,6 +105,10 @@ type OptionsLCOW struct {
 	ExtraVSockPorts               []uint32                                 // Extra vsock ports to allow
 	AssignedDevices               []VPCIDeviceID                           // AssignedDevices are devices to add on pod boot
 	SharedMemoryRegions           []LCOWSharedMemoryRegion                 // Host sections to map into the UVM
+	// ProtectedSharedResources borrows the SAME controller for all participants.
+	// Keep handles open through CreateLCOW and all protected lifecycle operations.
+	// Capabilities are never part of the JSON VM document or option logging.
+	ProtectedSharedResources []hcsv2.OperationResource `json:"-"`
 	SiblingCommunicationEndpoints []hcsschema.SiblingCommunicationEndpoint // Direct sibling communication endpoint registrations
 	PolicyBasedRouting            bool                                     // Whether we should use policy based routing when configuring net interfaces in guest
 	WritableOverlayDirs           bool                                     // Whether init should create writable overlay mounts for /var and /etc
@@ -932,6 +939,10 @@ func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 // CreateLCOW creates an HCS compute system representing a utility VM. It
 // consumes a set of options derived from various defaults and options
 // expressed as annotations.
+// Private protected regions must be hidden preparations with borrowed operation
+// capabilities kept open through return; no controller HANDLE is serialized.
+// Private failure cleanup is separately bounded and preserves termination errors;
+// a failed creation supplies no proof that all prepared attachments have drained.
 func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error) {
 	ctx, span := ot.StartSpan(ctx, "uvm::CreateLCOW")
 	defer span.End()
@@ -974,7 +985,16 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 
 	defer func() {
 		if err != nil {
-			uvm.Close()
+			if len(opts.ProtectedSharedResources) == 0 {
+				uvm.Close()
+			} else {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				if uvm.hcsSystem != nil {
+					err = stderrors.Join(err, uvm.hcsSystem.Terminate(cleanupCtx), uvm.hcsSystem.WaitCtx(cleanupCtx))
+				}
+				err = stderrors.Join(err, uvm.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
@@ -1011,7 +1031,10 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 		return nil, err
 	}
 
-	if err = uvm.create(ctx, doc); err != nil {
+	if err = validateProtectedSharedOptions(opts); err != nil {
+		return nil, err
+	}
+	if err = uvm.create(ctx, doc, opts.ProtectedSharedResources...); err != nil {
 		return nil, fmt.Errorf("error while creating the compute system: %w", err)
 	}
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {

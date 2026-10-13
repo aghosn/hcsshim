@@ -20,8 +20,13 @@ type sharedMemorySection struct {
 	hcsName string
 	size    uint64
 	view    uintptr
+	// protected blocks ordinary content access and release from the moment
+	// initialization starts (including partial failure) until explicit reclaim.
+	protected bool
 }
 
+// createSharedMemorySection creates and seeds a host-owned section before any
+// protection begins. The returned owner must survive all protected lifetimes.
 func createSharedMemorySection(name string, size uint64) (*sharedMemorySection, error) {
 	if name == "" {
 		return nil, errors.New("shared-memory section name is empty")
@@ -131,9 +136,14 @@ func sharedMemorySectionNames(name string, sessionID uint32) (string, string, er
 	), nil
 }
 
+// Close releases the host view and handle only outside a protected lifetime.
+// Errors are returned; protected cleanup must complete before calling Close.
 func (s *sharedMemorySection) Close() error {
 	if s == nil {
 		return nil
+	}
+	if s.protected {
+		return errors.New("refusing section release before explicit reclaim")
 	}
 
 	var closeErr error
@@ -160,7 +170,12 @@ func (s *sharedMemorySection) Close() error {
 	return closeErr
 }
 
+// write writes pre-initialization or reclaimed bytes using a fault-reporting
+// Windows API. It never permits ordinary positive access while protected.
 func (s *sharedMemorySection) write(offset uint64, data []byte) error {
+	if s != nil && s.protected {
+		return errors.New("positive host write disabled during protected lifetime")
+	}
 	if s == nil || s.view == 0 {
 		return errors.New("shared-memory section is not mapped")
 	}
@@ -202,6 +217,7 @@ func (s *sharedMemorySection) write(offset uint64, data []byte) error {
 	return nil
 }
 
+// hexPrefix formats only bytes obtained through the phase-checked read method.
 func (s *sharedMemorySection) hexPrefix(length uint64) (string, error) {
 	data, err := s.read(0, length)
 	if err != nil {
@@ -210,6 +226,7 @@ func (s *sharedMemorySection) hexPrefix(length uint64) (string, error) {
 	return hex.EncodeToString(data), nil
 }
 
+// expect compares accessible bytes; it cannot inspect protected guest markers.
 func (s *sharedMemorySection) expect(offset uint64, expected []byte) error {
 	actual, err := s.read(offset, uint64(len(expected)))
 	if err != nil {
@@ -226,7 +243,12 @@ func (s *sharedMemorySection) expect(offset uint64, expected []byte) error {
 	return nil
 }
 
+// read copies accessible section bytes into a new owned buffer, checking bounds,
+// API status and byte count. Protection blocks even attempted positive reads.
 func (s *sharedMemorySection) read(offset, length uint64) ([]byte, error) {
+	if s != nil && s.protected {
+		return nil, errors.New("positive host read disabled during protected lifetime")
+	}
 	if s == nil || s.view == 0 {
 		return nil, errors.New("shared-memory section is not mapped")
 	}

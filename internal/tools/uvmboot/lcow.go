@@ -68,6 +68,20 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  protectedModeFlag,
+			Usage: "Private CPU-only SNP proof: m1, m2-control, m2, m3-a or m3-b. Creates fresh owned VMs.",
+		},
+		cli.DurationFlag{
+			Name:  protectedTimeoutFlag,
+			Value: 3 * time.Minute,
+			Usage: "Bound for the protected proof (maximum 10m).",
+		},
+		cli.DurationFlag{
+			Name:  protectedCleanupFlag,
+			Value: 2 * time.Minute,
+			Usage: "Independent uncancelled protected cleanup bound (maximum 10m).",
+		},
 		cli.StringSliceFlag{
 			Name: annotationsArgName,
 			Usage: "Annotations in the form of `key=value` to apply to the uVM. Use repeat instances to add multiple. " +
@@ -205,7 +219,12 @@ var lcowCommand = cli.Command{
 				"the exact GPA returned by HCS.",
 		},
 	},
+	// The private proof has its own phase/cleanup ledger and must return before
+	// any ordinary-mode host marker reads or success-overriding fallbacks.
 	Action: func(c *cli.Context) error {
+		if c.IsSet(protectedModeFlag) {
+			return runProtectedSharedCLI(c)
+		}
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
 			return err
@@ -1023,6 +1042,9 @@ func siblingEventModuleArgs(route hcsschema.SiblingCommunicationRouteInfo) strin
 	)
 }
 
+// sharedMemoryGuestModuleCommand produces the ordinary diagnostic command with
+// a checked signed page-index conversion. Protected mode uses a separate fresh
+// post-seal command and cannot enter this host-seed protocol.
 func sharedMemoryGuestModuleCommand(
 	modulePath string,
 	configured hcsschema.SharedMemoryRegion,
@@ -1045,7 +1067,13 @@ func sharedMemoryGuestModuleCommand(
 		)
 	}
 
-	byteGPA := uint64(uint32(mapped.GuestPhysicalAddress)) << 12
+	byteGPA, err := uvm.SharedMemoryByteGPA(int64(mapped.GuestPhysicalAddress), int64(configured.Length))
+	if err != nil {
+		return "", err
+	}
+	if configured.ProtectedShared || mapped.ProtectedShared != nil {
+		return "", fmt.Errorf("ordinary guest command cannot consume protected backing")
+	}
 	return fmt.Sprintf(
 		"set -eu; insmod %s gpa=%#x length=%#x decrypted=1 "+
 			"read_only=0 role=%s%s; "+

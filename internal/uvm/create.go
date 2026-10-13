@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/sirupsen/logrus"
@@ -302,16 +303,26 @@ func (uvm *UtilityVM) OS() string {
 	return uvm.operatingSystem
 }
 
-func (uvm *UtilityVM) create(ctx context.Context, doc interface{}) error {
+// create creates the backing HCS system and caches its runtime identity.
+// Optional capabilities are borrowed through HCS creation, never serialized.
+// Failed private creation uses a separate bounded termination/wait/close budget;
+// cleanup errors remain failures. Ordinary callers retain their existing cleanup.
+func (uvm *UtilityVM) create(ctx context.Context, doc interface{}, resources ...hcs.OperationResource) (err error) {
 	uvm.exitCh = make(chan struct{})
-	system, err := hcs.CreateComputeSystem(ctx, uvm.id, doc)
+	system, err := hcs.CreateComputeSystemWithResources(ctx, uvm.id, doc, resources)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if system != nil {
-			_ = system.Terminate(ctx)
-			_ = system.WaitCtx(ctx)
+			if len(resources) == 0 {
+				_ = system.Terminate(ctx)
+				_ = system.WaitCtx(ctx)
+			} else {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				err = errors.Join(err, system.Terminate(cleanupCtx), system.WaitCtx(cleanupCtx), system.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
