@@ -95,6 +95,8 @@ func main() {
 		lcowCommand,
 		wcowCommand,
 		cwcowCommand,
+		siblingAttachCommand,
+		siblingStopCommand,
 	}
 
 	app.Before = func(c *cli.Context) error {

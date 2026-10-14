@@ -239,6 +239,11 @@ var lcowCommand = cli.Command{
 			Value: allSiblingTests,
 			Usage: "Comma-separated tests the sibling workload runs: " + allSiblingTests + ".",
 		},
+		cli.BoolFlag{
+			Name: siblingInteractiveArgName,
+			Usage: "With the two-UVM sibling network, run no tests and keep both UVMs " +
+				"running for \"attach workload|diode\" until \"stop\".",
+		},
 		cli.StringFlag{
 			Name: cpuGroupLPsArgName,
 			Usage: "Pin each UVM to a host CPU group: semicolon-separated logical " +
@@ -256,6 +261,12 @@ var lcowCommand = cli.Command{
 		}
 		if siblingTests, err = parseSiblingTests(c.String(siblingTestsArgName)); err != nil {
 			return err
+		}
+		if siblingInteractive = c.Bool(siblingInteractiveArgName); siblingInteractive {
+			if !c.Bool(sharedMemoryTwoUVMArgName) {
+				return fmt.Errorf("--%s requires --%s", siblingInteractiveArgName, sharedMemoryTwoUVMArgName)
+			}
+			siblingTests = map[string]bool{}
 		}
 		cpuGroupLPs, err := parseCPUGroupLPs(c.String(cpuGroupLPsArgName))
 		if err != nil {
@@ -1006,6 +1017,22 @@ func runLCOW(
 			if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
 				return fmt.Errorf("share diode_tcpbulk: %w", err)
 			}
+			// Interactive demo helpers, staged on both roles (the diode runs
+			// capture/filter/smooth, the workload runs the covert client).
+			for shareName, guestDir := range map[string]string{
+				"demo.sh":       "/run/diode-demo",
+				"covert_udp":    "/run/diode-covert",
+				"diode_tcpdump": "/run/diode-tcpdump",
+				"diode_tc":      "/run/diode-tc",
+			} {
+				hostPath := filepath.Join(filepath.Dir(busModulePath), shareName)
+				if _, statErr := os.Stat(hostPath); statErr != nil {
+					continue
+				}
+				if err := vm.Share(ctx, hostPath, guestDir, true); err != nil {
+					return fmt.Errorf("share %s: %w", shareName, err)
+				}
+			}
 			iperfPath := filepath.Join(filepath.Dir(busModulePath), iperfGuestName)
 			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
 				return fmt.Errorf("share %s: %w", iperfGuestName, err)
@@ -1064,6 +1091,15 @@ func runLCOW(
 	if options.UseGuestConnection {
 		if err := execViaGCS(ctx, vm, c, execCommand); err != nil {
 			return err
+		}
+		if siblingInteractive {
+			role, err := sharedMemoryProofRole(vm.ID())
+			if err != nil {
+				return err
+			}
+			if err := serveSiblingShells(ctx, vm, role); err != nil {
+				return err
+			}
 		}
 		_ = vm.Terminate(ctx)
 		_ = vm.WaitCtx(ctx)
@@ -1246,6 +1282,10 @@ func siblingNetModuleName(role string) string {
 const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run/dtb-exec && ` +
 	`mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec 2>/dev/null && ` +
 	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; ` +
+	`for m in demo.sh:demo.sh:/run/diode-demo covert:covert_udp:/run/diode-covert ` +
+	`tcpdump:diode_tcpdump:/run/diode-tcpdump tc:diode_tc:/run/diode-tc; do ` +
+	`d=${m%%:*}; r=${m#*:}; s=${r#*:}/${r%%:*}; ` +
+	`if [ -f "$s" ]; then cp "$s" /run/dtb-exec/$d && chmod 755 /run/dtb-exec/$d; fi; done; ` +
 	iperfStage
 
 // siblingWorkloadStage stages $dtb and $ipf and defines snap, which reads
@@ -1289,12 +1329,15 @@ func siblingDiodeUplinkCommand(uplink *diodeUplink, waitFor func(cond, what stri
 // the uplink NIC ($up). Installing the nat table enables conntrack for all
 // traffic.
 func siblingDiodeNATCommand(uplink *diodeUplink) string {
-	return "echo 1 >/proc/sys/net/ipv4/ip_forward; " +
+	cmd := "echo 1 >/proc/sys/net/ipv4/ip_forward; " +
 		"if $ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o $up -j MASQUERADE; " +
 		"then echo \"diode_net: nat ok dev=$up addr=" + uplink.address + " gw=" + uplink.gateway + "\"; " +
-		"else echo 'diode_net: nat failed'; fi; " +
-		"if ping -c 2 -W 2 " + uplink.gateway + " >/dev/null 2>&1; " +
-		"then echo 'diode_net: uplink gateway ok'; else echo 'diode_net: uplink gateway no reply'; fi; "
+		"else echo 'diode_net: nat failed'; fi; "
+	if !siblingInteractive {
+		cmd += "if ping -c 2 -W 2 " + uplink.gateway + " >/dev/null 2>&1; " +
+			"then echo 'diode_net: uplink gateway ok'; else echo 'diode_net: uplink gateway no reply'; fi; "
+	}
+	return cmd
 }
 
 // siblingNetConfig is the host-chosen configuration of a sibling network
@@ -1385,9 +1428,12 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 		"echo \"diode_net: tools $(command -v ip ifconfig ping | tr '\\n' ' ')\"; " +
 		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command()
 	if role == workloadRole {
-		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
-			"if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
-			"else echo 'diode_net: ping failed'; fi; " + siblingWorkloadStage
+		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter")
+		if !siblingInteractive {
+			cmd += "if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
+				"else echo 'diode_net: ping failed'; fi; "
+		}
+		cmd += siblingWorkloadStage
 		if siblingTests["checks"] {
 			cmd += siblingNetRelayCheck
 		}
@@ -1445,10 +1491,12 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 				"dmesg | tail -n +$((k+1)); k=$(dmesg | wc -l); }; "
 			mon = "mon"
 		}
-		cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do "+
-			"i=$((i+1)); [ $i -le %d ] || break; %s; sleep 1; done; ", 2*benchSeconds+300, mon) +
-			"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
-		if uplink != nil {
+		if !siblingInteractive {
+			cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do "+
+				"i=$((i+1)); [ $i -le %d ] || break; %s; sleep 1; done; ", 2*benchSeconds+300, mon) +
+				"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
+		}
+		if uplink != nil && !siblingInteractive {
 			cmd += "echo \"diode_net: diode stats after-bulk $s1\"; echo \"diode_net: diode stats after-bulk-nat $s2\"; " +
 				"echo \"diode_net: listener-nat $(tr '\\n' ' ' </tmp/dn-tcp2 2>/dev/null)\"; " +
 				"echo \"diode_net: conntrack count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)\"; " +
