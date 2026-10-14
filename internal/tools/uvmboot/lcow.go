@@ -75,12 +75,14 @@ var lcowCommand = cli.Command{
 		cli.DurationFlag{
 			Name:  protectedTimeoutFlag,
 			Value: 3 * time.Minute,
-			Usage: "Bound for the protected proof (maximum 10m).",
+			Usage: "Time budget for M1 creation, setup and guest exchange, not a VM lifetime limit " +
+				"(greater than 0, at most 10m). In-flight native VID calls are not forcibly interrupted.",
 		},
 		cli.DurationFlag{
 			Name:  protectedCleanupFlag,
 			Value: 2 * time.Minute,
-			Usage: "Independent uncancelled protected cleanup bound (maximum 10m).",
+			Usage: "Fresh, independent budget for safe M1 cleanup after success, failure or forward timeout " +
+				"(greater than 0, at most 10m). Expiry does not force backing release.",
 		},
 		cli.StringSliceFlag{
 			Name: annotationsArgName,
