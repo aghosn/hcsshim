@@ -135,7 +135,8 @@ var lcowCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  securityHardwareFlag,
-			Usage: "Use VMGS file to run on SNP secure hardware when true; omitted or false uses plain boot. " +
+			Usage: "Use VMGS file to run on SNP secure hardware when true; omitted or false applies no CLI hardware-security override. " +
+				"Ordinary commands still respect annotation-derived settings. " +
 				"('root-fs-type' must be set to 'none' when true)",
 		},
 		cli.BoolFlag{
@@ -595,9 +596,12 @@ func init() {
 // createLCOWOptions derives owned LCOW options for id from defaults, annotations
 // and c's CLI overrides, using ctx for option derivation and boot-path updates.
 // Memory/VPMem CLI sizes are in MiB; shared-region size is in bytes and must fit
-// the signed HCS schema. It creates no VM. Only a true security-hardware value
-// selects SNP state-file boot, disabled HCL, enabled security policy, verity
-// defaults and physical primary backing; omitted/false keeps ordinary boot.
+// the signed HCS schema. It creates no VM. A true security-hardware value applies
+// the CLI override for SNP state-file boot, disabled HCL, enabled security policy,
+// verity defaults and physical primary backing. Omitted/false does not apply that
+// override or clear annotation-derived settings; ordinary commands still respect
+// those settings. The protected M1 proof forbids annotations and validates its
+// plain/SNP boot options separately.
 // Errors return no usable options. On success the caller owns any temporary SNP
 // BundleDirectory and must retain it through VM use, then remove it after safe
 // cleanup. CLI/global settings must remain unchanged during construction;
