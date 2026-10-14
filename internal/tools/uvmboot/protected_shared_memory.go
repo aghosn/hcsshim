@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ import (
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/windows"
 )
@@ -314,11 +316,14 @@ func (v *proofVM) acceptRemoval(info *hcsschema.ProtectedSharedRegionInfo, actio
 	return nil
 }
 
-// realProof owns the only launcher controller and the host section. Calls are
-// serialized except for the two independent guest exchange commands.
+// realProof owns the only launcher controller and the host section for either
+// plain or SNP boot. snp is immutable after CLI preflight; it selects only boot
+// and guest mapping options, never lifecycle authority. Calls are serialized
+// except for the two independent guest exchange commands.
 type realProof struct {
 	evidence         *proofEvidence
 	cli              *cli.Context
+	snp              bool
 	pages            uint64
 	runID            string
 	section          *sharedMemorySection
@@ -330,6 +335,16 @@ type realProof struct {
 	reclaimed        uint64
 	prepareUncertain bool
 	vms              map[string]*proofVM
+}
+
+// guestMode returns the selected diagnostic boot label, not attestation or
+// runtime certification. The immutable snp selection can be read concurrently;
+// this method acquires no resources and has no side effects.
+func (p *realProof) guestMode() string {
+	if p.snp {
+		return "snp"
+	}
+	return "plain"
 }
 
 // controlPages calls the actual private vid.dll wrapper. All output is retained
@@ -397,10 +412,17 @@ func (p *realProof) guest(ctx context.Context, id, command string) (string, erro
 	return output, err
 }
 
-// prepare creates/starts one SNP UVM, retaining its owner before any subsequent
-// error. Starting hidden backing prepares it but does not install a GPA mapping.
+// prepare creates/starts one UVM in the immutable CLI-selected boot mode for
+// participant id. Calls are serialized; ctx bounds HCS/start/module delivery.
+// Options (including any SNP bundle) and then the VM are retained before later
+// failures for cleanup. Plain requires direct vmlinux/vhd boot and virtual
+// primary backing with no state file/paravisor; SNP requires state-file boot,
+// explicitly disabled HCL and non-overcommit primary backing.
+// Starting hidden backing prepares it but does not install a GPA mapping.
 // Requires a cached native preparation receipt before accepting the lease/GPA;
-// missing framing or failed creation retains ownership for conservative cleanup.
+// GPA is checked in bytes before retaining a 4-KiB page index. Missing framing
+// or failed creation returns an error with ownership/uncertainty preserved.
+// Both modes borrow the same retained controller and share the module via GCS.
 func (p *realProof) prepare(ctx context.Context, id string) error {
 	options, err := createLCOWOptions(ctx, p.cli, "protected-"+p.runID+"-"+id)
 	if err != nil {
@@ -408,9 +430,23 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	}
 	v := &proofVM{options: options}
 	p.vms[id] = v
-	if options.HclEnabled == nil || *options.HclEnabled || options.GuestStateFilePath == "" ||
-		len(options.AssignedDevices) != 0 || len(options.SiblingCommunicationEndpoints) != 0 {
-		return errors.New("proof requires independent paravisor-free SNP VMs without assigned backing devices")
+	// Validate the built options, not just raw flags: defaults and backing
+	// policy must not silently select a different boot path or device policy.
+	if len(options.AssignedDevices) != 0 || len(options.SiblingCommunicationEndpoints) != 0 ||
+		options.EnableDeferredCommit || options.ResourcePartitionID != nil {
+		return errors.New("proof requires independent VMs without assigned devices, sibling endpoints, deferred commit or resource partitions")
+	}
+	if p.snp {
+		if options.HclEnabled == nil || *options.HclEnabled || options.GuestStateFilePath == "" ||
+			options.PreferredRootFSType != uvm.PreferredRootFSTypeNA || options.AllowOvercommit {
+			return errors.New("SNP proof requires state-file boot, explicitly disabled HCL and non-overcommit backing")
+		}
+	} else if options.GuestStateFilePath != "" || options.UseGuestStateFile || options.BundleDirectory != "" ||
+		(options.HclEnabled != nil && *options.HclEnabled) || options.SecurityPolicyEnabled ||
+		options.DmVerityMode || !options.KernelDirect || options.KernelFile != vmutils.UncompressedKernelFile ||
+		options.PreferredRootFSType != uvm.PreferredRootFSTypeVHD || options.RootFSFile != vmutils.VhdFile ||
+		!options.AllowOvercommit || options.FullyPhysicallyBacked {
+		return errors.New("plain proof requires direct vmlinux/vhd boot, no SNP state/policy/paravisor and virtual backing")
 	}
 	v.region = hcsschema.SharedMemoryRegion{SectionName: p.section.hcsName, Length: int32(p.pages * 4096),
 		AllowGuestWrite: true, HiddenFromGuest: true, ProtectedShared: true, ProtectedSharedControllerUri: p.resource.URI}
@@ -455,7 +491,12 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	}
 	v.gpn = address / 4096
 	p.evidence.record("vm", map[string]any{"Participant": id, "ID": v.vm.ID(),
-		"Runtime": fmt.Sprint(v.vm.RuntimeID()), "GPA": address, "LeaseId": p.lease})
+		"Runtime": fmt.Sprint(v.vm.RuntimeID()), "GPA": address, "LeaseId": p.lease,
+		"GuestMode": p.guestMode(), "GuestStateFileBoot": options.GuestStateFilePath != "",
+		"KernelDirect": options.GuestStateFilePath == "" && options.KernelDirect,
+		"KernelFile": options.KernelFile, "RootFSFile": options.RootFSFile,
+		"AllowOvercommit": options.AllowOvercommit, "FullyPhysicallyBacked": options.FullyPhysicallyBacked,
+		"HclEnabled": options.HclEnabled, "DmVerityMode": options.DmVerityMode})
 	return v.vm.Share(ctx, p.cli.String(sharedMemoryGuestModuleArgName), "/run/protected-module", true)
 }
 
@@ -542,9 +583,13 @@ func proofWin32Status(err error) uint32 {
 }
 
 // exchange generates a challenge only after the caller's explicit seal barrier
-// and delivers it via GCS. Concurrent module loads prove fresh A->B->A causality,
+// and delivers it via GCS to the two owned VMs under ctx. Commands use each
+// retained GPA in bytes and the section byte length, with decrypted=0 for plain
+// backing and decrypted=1 for SNP; neither converts guest-private page state.
+// Concurrent module loads prove fresh A->B->A causality,
 // verify the host-denied write sentinel and report through guest output.
-// Both commands use finite post-exit stream drains; both finish before cleanup.
+// Randomness, transport or missing causal receipts return errors. Both commands
+// use finite post-exit stream drains and finish before cleanup can touch owners.
 func (p *realProof) exchange(ctx context.Context) error {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -552,6 +597,10 @@ func (p *realProof) exchange(ctx context.Context) error {
 	}
 	challenge := hex.EncodeToString(nonce[:])
 	p.evidence.record("challenge", map[string]any{"Token": challenge})
+	decrypted := 0
+	if p.snp {
+		decrypted = 1
+	}
 	results := make(chan error, 2)
 	for _, id := range []string{"a", "b"} {
 		// Each command owns its output buffer; only its result crosses back to
@@ -559,8 +608,8 @@ func (p *realProof) exchange(ctx context.Context) error {
 		go func(id string) {
 			v := p.vms[id]
 			module := "/run/protected-module/" + filepath.Base(p.cli.String(sharedMemoryGuestModuleArgName))
-			command := fmt.Sprintf("set -eu; insmod %s gpa=%#x length=%#x decrypted=1 protected_mode=1 role=%s challenge=%s; dmesg | grep -F 'hcs-shmem-diag:'",
-				shellSingleQuote(module), v.gpn*4096, p.pages*4096, shellSingleQuote(id), shellSingleQuote(challenge))
+			command := fmt.Sprintf("set -eu; insmod %s gpa=%#x length=%#x decrypted=%d protected_mode=1 role=%s challenge=%s; dmesg | grep -F 'hcs-shmem-diag:'",
+				shellSingleQuote(module), v.gpn*4096, p.pages*4096, decrypted, shellSingleQuote(id), shellSingleQuote(challenge))
 			output, err := p.guest(ctx, id, command)
 			if err == nil && !bytes.Contains([]byte(output), []byte("protected exchange "+id+" "+challenge+" complete; host sentinel unchanged")) {
 				err = errors.New("missing fresh guest exchange/sentinel receipt")
@@ -771,27 +820,52 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	return out, err
 }
 
-// runProtectedSharedCLI accepts only m1 in the isolated lab mode, then executes one fresh
-// lifetime with bounded operation and cleanup contexts. It never uses runMany or
-// existing VM IDs and never treats marker output as overriding lifecycle errors.
+// runProtectedSharedCLI validates raw M1 CLI mode/boot/override combinations
+// before native acquisition. Omitted/false hardware security selects plain
+// direct-kernel/vhd boot with virtual backing; true selects SNP state-file/none
+// boot. Incompatible explicit inputs fail rather than being silently ignored.
+// Size is page-aligned bytes (4096..16 MiB); forward/independent cleanup budgets
+// are positive and at most ten minutes, not VM lifetime or forced-release timers.
+// It then owns one fresh lifetime and evidence stream through conservative
+// cleanup, returning validation, operation, cleanup or evidence errors. It never
+// uses runMany/existing VM IDs or lets markers override lifecycle errors.
+// CLI/global settings remain serialized and immutable during the proof.
 func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
 	if mode != "m1" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
 	}
-	if !useGCS || !c.Bool(securityHardwareFlag) || c.String(rootFSTypeArgName) != "none" ||
+	snp := c.Bool(securityHardwareFlag)
+	if !useGCS ||
 		c.String(sharedMemoryGuestModuleArgName) == "" || lcowUseTerminal ||
 		c.Bool(sharedMemoryTwoUVMArgName) || c.Bool(sharedMemoryMappingOnlyArgName) ||
 		c.Bool(sharedMemoryGuestInventoryArgName) || c.IsSet(execCommandLineArgName) ||
 		c.IsSet(execFileArgName) || c.IsSet(sharedMemoryNameArgName) ||
 		len(c.StringSlice(scsiMountsArgName)) != 0 || len(c.StringSlice(vpmemMountsArgName)) != 0 ||
 		len(c.StringSlice(shareFilesArgName)) != 0 || len(c.StringSlice(annotationsArgName)) != 0 {
-		return errors.New("protected proof requires GCS, SNP, root-fs-type none, module; no ordinary proof/exec/mount/annotation options")
+		return errors.New("protected proof requires GCS and module; no ordinary proof/exec/mount/annotation options")
 	}
 	if c.GlobalInt(countArgName) != 1 || c.GlobalInt(parallelArgName) != 1 ||
-		c.GlobalIsSet(resourcePartitionArgName) || c.GlobalBool(enableDeferredCommitArgName) ||
-		c.GlobalBool(allowOvercommitArgName) {
-		return errors.New("protected proof owns its VM count/identities; no resource partition, overcommit or deferred commit")
+		c.GlobalIsSet(resourcePartitionArgName) || c.GlobalBool(enableDeferredCommitArgName) {
+		return errors.New("protected proof owns its VM count/identities; no resource partition or deferred commit")
+	}
+	// Check explicit overrides before opening a controller/section. SNP keeps
+	// its existing policy/verity inputs and forced non-overcommit behavior;
+	// plain must not inherit those settings or acquire a temporary SNP bundle.
+	if snp {
+		if c.String(rootFSTypeArgName) != "none" || c.GlobalBool(allowOvercommitArgName) {
+			return errors.New("SNP proof requires root-fs-type none and no overcommit")
+		}
+	} else {
+		if !strings.EqualFold(c.String(rootFSTypeArgName), "vhd") ||
+			(c.IsSet(kernelDirectArgName) && !c.Bool(kernelDirectArgName)) ||
+			(c.IsSet(kernelFileArgName) && !strings.EqualFold(c.String(kernelFileArgName), vmutils.UncompressedKernelFile)) ||
+			c.IsSet(securityPolicyArgName) || c.IsSet(securityPolicyEnforcerArgName) || c.IsSet(noVerityBoot) {
+			return errors.New("plain proof requires direct vmlinux boot and root-fs-type vhd; no SNP policy/enforcer/verity inputs")
+		}
+		if c.GlobalIsSet(allowOvercommitArgName) && !c.GlobalBool(allowOvercommitArgName) {
+			return errors.New("plain proof requires virtual backing; allow-overcommit=false is incompatible")
+		}
 	}
 	size := c.Uint64(sharedMemorySizeArgName)
 	if size == 0 || size%4096 != 0 || size > 16*1024*1024 || size > math.MaxInt32 {
@@ -808,11 +882,12 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	if _, err := rand.Read(id[:]); err != nil {
 		return err
 	}
-	p := &realProof{cli: c, pages: size / 4096, runID: hex.EncodeToString(id[:]), vms: make(map[string]*proofVM)}
+	p := &realProof{cli: c, snp: snp, pages: size / 4096, runID: hex.EncodeToString(id[:]), vms: make(map[string]*proofVM)}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	p.evidence = &proofEvidence{writer: os.Stdout, runID: p.runID}
-	p.evidence.record("run", map[string]any{"Mode": mode, "Pages": p.pages, "Claim": "CPU-ONLY-NOT-ATTESTATION"})
+	p.evidence.record("run", map[string]any{"Mode": mode, "GuestMode": p.guestMode(),
+		"Pages": p.pages, "Claim": "CPU-ONLY-NOT-ATTESTATION"})
 	if err := p.evidence.failure(); err != nil {
 		return err
 	}

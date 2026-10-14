@@ -70,7 +70,8 @@ var lcowCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  protectedModeFlag,
-			Usage: "Private CPU-only SNP manual lifecycle: m1 only. Creates two fresh owned VMs.",
+			Usage: "Private CPU-only manual lifecycle: m1 only. Creates two fresh owned VMs; " +
+				"plain direct-kernel/vhd boot by default, SNP VMGS/none boot with --security-hardware=true.",
 		},
 		cli.DurationFlag{
 			Name:  protectedTimeoutFlag,
@@ -134,7 +135,8 @@ var lcowCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  securityHardwareFlag,
-			Usage: "Use VMGS file to run on secure hardware. ('root-fs-type' must be set to 'none')",
+			Usage: "Use VMGS file to run on SNP secure hardware when true; omitted or false uses plain boot. " +
+				"('root-fs-type' must be set to 'none' when true)",
 		},
 		cli.BoolFlag{
 			Name:  noVerityBoot,
@@ -590,6 +592,16 @@ func init() {
 		`-root-fs-type vhd -shared-memory-size 1048576 -exec "sleep 300"`
 }
 
+// createLCOWOptions derives owned LCOW options for id from defaults, annotations
+// and c's CLI overrides, using ctx for option derivation and boot-path updates.
+// Memory/VPMem CLI sizes are in MiB; shared-region size is in bytes and must fit
+// the signed HCS schema. It creates no VM. Only a true security-hardware value
+// selects SNP state-file boot, disabled HCL, enabled security policy, verity
+// defaults and physical primary backing; omitted/false keeps ordinary boot.
+// Errors return no usable options. On success the caller owns any temporary SNP
+// BundleDirectory and must retain it through VM use, then remove it after safe
+// cleanup. CLI/global settings must remain unchanged during construction;
+// concurrent callers must first initialize CLI IsSet state, as runMany does.
 func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.OptionsLCOW, error) {
 	opt, err := oci.SpecToUVMCreateOpts(ctx,
 		&specs.Spec{
@@ -716,7 +728,7 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	if c.IsSet(securityPolicyEnforcerArgName) {
 		options.SecurityPolicyEnforcer = c.String(securityPolicyEnforcerArgName)
 	}
-	if c.IsSet(securityHardwareFlag) {
+	if c.Bool(securityHardwareFlag) {
 		options.GuestStateFilePath = vmutils.DefaultGuestStateFile
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
