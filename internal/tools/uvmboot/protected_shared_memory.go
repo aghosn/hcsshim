@@ -14,9 +14,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,45 +34,30 @@ const (
 	protectedTimeoutFlag      = "protected-shared-timeout"
 	protectedCleanupFlag      = "protected-shared-cleanup-timeout"
 	proofCopyAfterExitTimeout = 5 * time.Second
-	// Private VID v1 lifecycle opcodes, not trusted HV completion operations.
+	// Private VID v2 lifecycle opcodes; trusted HV lifecycle stays v1.
 	psInitialize = 1
 	psSeal       = 2
 	psTeardown   = 3
 	psReclaim    = 4
-	psQuery      = 5
-	// HVSTATUS_TO_NTSTATUS(HV_STATUS_OPERATION_DENIED).
-	psAdmissionDenied uint32 = 0xc0350008
+	// Native preflight contention only; neither status authorizes release.
+	psDeviceBusy  uint32 = 0x80000011
+	psObjectInUse uint32 = 0xc0350019
 )
 
-// psRequest mirrors VID_PROTECTED_SHARED_REQUEST (80 bytes). The test selector
-// tail is always zero: this launcher cannot assert trusted completion or use
-// component-test controls.
+// psRequest mirrors the exact 48-byte private VID v2 request. LifetimeId stays
+// zero: VID resolves trusted exact descriptors from its retained backing list.
 type psRequest struct {
 	Version, Flags                 uint32
 	LeaseId, PageIndex, LifetimeId uint64
 	PageCount, Operation           uint32
 	Reserved                       uint64
-	Test                           [32]byte
 }
 
-// psSnapshot is the complete fixed 2632-byte HV v1 metadata snapshot.
-type psSnapshot struct {
-	SpaPage, LifetimeId, MutationSequence, ShareCount             uint64
-	Size, Version, State, Initialization, RootProtection, Reclaim uint32
-	RegistrationCount, Complete, PageType, PageOwnership          uint32
-	Registrations                                                 [64]hcsschema.ProtectedSharedRegistrationInfo
-}
-
-// psResult mirrors VID_PROTECTED_SHARED_RESULT including the unused test tail.
+// psResult mirrors the exact 40-byte private VID v2 operation receipt.
 // Version zero is unframed failure, never proof of zero work.
 type psResult struct {
-	Version, Size, Status, PagesProcessed                      uint32
-	LeaseId, PageCount, InitializedPages, PreparedParticipants uint64
-	SnapshotValid, Reserved                                    uint32
-	MapSequence, LastMapPagesProcessed                         uint64
-	LastMapStatus, ReservedMap                                 uint32
-	Snapshot                                                   psSnapshot
-	TestObservation                                            [80]byte
+	Version, Size, Status, PagesProcessed uint32
+	LeaseId, PageCount, InitializedPages  uint64
 }
 
 // proofStep is a launcher-only operation description. Page units are 4 KiB.
@@ -87,23 +70,15 @@ type proofStep struct {
 }
 
 // proofResult preserves native control prefixes/status on failure. Framed=false
-// means no valid native control receipt; other phases use the independent query
-// validity in Snapshots. Present snapshots are complete individual pages.
+// means no valid native control receipt; Install/Remove use actual HRESULT and
+// local ownership instead. No page state or inventory is exported.
 type proofResult struct {
-	Framed               bool
-	Initialized          uint64
-	Processed            uint32
-	Status               uint32
-	LeaseId              uint64
-	PreparedParticipants uint64
-	ZeroVerifiedBytes    uint64
-	Snapshots            []hcsschema.ProtectedSharedRegionInfo
-}
-
-// proofOperations is the approved launcher-only injection boundary. Tests check
-// sequencing/ownership through this interface, never claim MM/HV protection.
-type proofOperations interface {
-	Run(context.Context, proofStep) (proofResult, error)
+	Framed            bool
+	Initialized       uint64
+	Processed         uint32
+	Status            uint32
+	LeaseId           uint64
+	ZeroVerifiedBytes uint64
 }
 
 // proofEvidence serializes complete JSON-line records from concurrent guest
@@ -153,48 +128,13 @@ func (e *proofEvidence) failure() error {
 
 // finish emits a final receipt only after successful forward work and cleanup
 // with no earlier missing record. Failure of this final write also fails the run.
+// Completion text is diagnostic, not operator acceptance or logger coverage.
 func (e *proofEvidence) finish(mode string, err error) error {
 	if err = errors.Join(err, e.failure()); err != nil {
 		return err
 	}
-	e.record("pass", map[string]any{"Mode": mode, "Cleanup": "complete"})
+	e.record("complete", map[string]any{"Mode": mode, "Cleanup": "complete"})
 	return e.failure()
-}
-
-// recordedProof adds checked evidence to the existing launcher-only interface.
-// Native errors and progress remain separate from logging errors so cleanup can
-// continue reclaiming known-safe backing even when the evidence sink has failed.
-type recordedProof struct {
-	operations proofOperations
-	evidence   *proofEvidence
-}
-
-// Run records the completed native operation and its context state, returning
-// the original native result/error. Forward dispatch separately observes sticky
-// evidence errors; deferred cleanup aggregates them only after safe cleanup.
-func (p *recordedProof) Run(ctx context.Context, step proofStep) (proofResult, error) {
-	result, err := p.operations.Run(ctx, step)
-	p.evidence.record("phase", struct {
-		Step         proofStep
-		Result       proofResult
-		Error        string
-		ContextError string
-	}{step, result, proofErrorText(err), proofErrorText(ctx.Err())})
-	return result, err
-}
-
-// EvidenceError exposes sticky writer failures without changing native progress.
-func (p *recordedProof) EvidenceError() error {
-	return p.evidence.failure()
-}
-
-// proofEvidenceError reads optional launcher evidence state. Plain U2 operation
-// fixtures need no writer and remain independent of the native memory subsystem.
-func proofEvidenceError(ops proofOperations) error {
-	if recorded, ok := ops.(interface{ EvidenceError() error }); ok {
-		return recorded.EvidenceError()
-	}
-	return nil
 }
 
 // proofErrorText supplies an explicit empty success/error string in JSON records.
@@ -205,30 +145,24 @@ func proofErrorText(err error) string {
 	return err.Error()
 }
 
-// executeProtectedProof runs a fresh M1, M2/control or one M3 lifetime. Every
-// successfully initialized prefix is reclaimed only after participant cleanup.
+// executeProtectedProof runs one fresh M1 lifetime through its concrete owner.
+// pages is the section's 4-KiB page count; cleanupTimeout is a separate budget.
+// Every successfully initialized prefix is reclaimed only after participant cleanup.
 // Cleanup uses its own uncancelled deadline. Unknown progress or failed cleanup
 // prevents final resource release and is returned as failure, not a lab pass.
 // Valid forward progress/ownership is recorded before observing cancellation.
 // The original context is never rechecked after entering the cleanup budget.
-func executeProtectedProof(ctx context.Context, ops proofOperations, mode string, pages uint64, cleanupTimeout time.Duration) (err error) {
+func executeProtectedProof(ctx context.Context, p *realProof, pages uint64, cleanupTimeout time.Duration) (err error) {
 	if pages == 0 || cleanupTimeout <= 0 {
 		return errors.New("invalid protected proof bounds")
 	}
-	switch mode {
-	case "m1", "m2", "m2-control", "m3-a", "m3-b":
-	default:
-		return errors.New("invalid protected proof mode")
-	}
 	participants := []string{"a", "b"}
-	if mode == "m2" || mode == "m2-control" {
-		participants = append(participants, "c")
-	}
 	var initialized uint64
 	var uncertain bool
 	var attempted []string
 	opened := false
-	// Resources stay owned on every failure, including partial prepare/start.
+	// Keep resources owned until cleanup proves voluntary release is safe,
+	// including failures during partial prepare/start.
 	defer func() {
 		if !opened {
 			return
@@ -239,7 +173,7 @@ func executeProtectedProof(ctx context.Context, ops proofOperations, mode string
 		safe := true
 		// Accumulate every cleanup error without skipping other owned VMs.
 		call := func(step proofStep) error {
-			_, e := ops.Run(cleanupCtx, step)
+			_, e := p.Run(cleanupCtx, step)
 			// This is the cleanup budget, not the original forward deadline.
 			// A native success after this independent budget expires still
 			// cannot produce a successful bounded-cleanup receipt.
@@ -253,16 +187,17 @@ func executeProtectedProof(ctx context.Context, ops proofOperations, mode string
 			}
 		}
 		for _, id := range attempted {
-			_ = call(proofStep{Kind: "remove", Participant: id})
+			if call(proofStep{Kind: "remove", Participant: id}) != nil {
+				safe = false
+			}
 			if call(proofStep{Kind: "terminate", Participant: id}) != nil {
 				safe = false
 			}
 		}
-		// A failed explicit removal is still reported, but successful target
-		// termination plus controller-observed retirement can safely finish
-		// reclamation. Do not strand known backing merely because a worker's
-		// hidden/install state was uncertain after a failed response.
-		if call(proofStep{Kind: "removed"}) != nil {
+		// Local cleanup outcomes are not drain proof. Failure retains resources;
+		// even successful removal/termination requires actual reclaim receipts.
+		if p.prepareUncertain {
+			cleanupErr = errors.Join(cleanupErr, errors.New("failed create left preparation unobservable; retain backing"))
 			safe = false
 		}
 		if uncertain {
@@ -285,19 +220,19 @@ func executeProtectedProof(ctx context.Context, ops proofOperations, mode string
 		if safe {
 			_ = call(proofStep{Kind: "release"})
 		}
-		err = errors.Join(err, cleanupErr, proofEvidenceError(ops))
+		err = errors.Join(err, cleanupErr, p.evidence.failure())
 	}()
 	// Ordinary phase calls stop at the first failure; only the deferred cleanup
 	// dispatcher continues after errors using its independent deadline.
 	call := func(step proofStep) error {
-		_, e := ops.Run(ctx, step)
-		return errors.Join(e, ctx.Err(), proofEvidenceError(ops))
+		_, e := p.Run(ctx, step)
+		return errors.Join(e, ctx.Err(), p.evidence.failure())
 	}
 	// Opening can acquire resources while cancellation/evidence failure arrives.
 	// Record successful ownership before observing either completion condition.
-	_, err = ops.Run(ctx, proofStep{Kind: "open"})
+	_, err = p.Run(ctx, proofStep{Kind: "open"})
 	opened = err == nil
-	if err = errors.Join(err, ctx.Err(), proofEvidenceError(ops)); err != nil {
+	if err = errors.Join(err, ctx.Err(), p.evidence.failure()); err != nil {
 		return err
 	}
 	if err = call(proofStep{Kind: "positive"}); err != nil {
@@ -314,15 +249,15 @@ func executeProtectedProof(ctx context.Context, ops proofOperations, mode string
 	}
 	for initialized < pages {
 		count := uint32(min(uint64(4), pages-initialized))
-		r, e := ops.Run(ctx, proofStep{Kind: "initialize", Index: initialized, Count: count})
+		r, e := p.Run(ctx, proofStep{Kind: "initialize", Index: initialized, Count: count})
 		// Consume framed progress BEFORE examining the status. The cumulative
 		// prefix must agree exactly; never infer zero work from an HRESULT.
 		if !r.Framed || r.Processed > count || r.Initialized != initialized+uint64(r.Processed) {
 			uncertain = true
-			return errors.Join(e, ctx.Err(), proofEvidenceError(ops), errors.New("invalid initialization prefix"))
+			return errors.Join(e, ctx.Err(), p.evidence.failure(), errors.New("invalid initialization prefix"))
 		}
 		initialized = r.Initialized
-		e = errors.Join(e, ctx.Err(), proofEvidenceError(ops))
+		e = errors.Join(e, ctx.Err(), p.evidence.failure())
 		if e != nil {
 			return e
 		}
@@ -330,46 +265,21 @@ func executeProtectedProof(ctx context.Context, ops proofOperations, mode string
 			return errors.New("incomplete successful initialization")
 		}
 	}
-	for _, kind := range []string{"ready", "negative-ready"} {
-		if err = call(proofStep{Kind: kind}); err != nil {
-			return err
-		}
+	if err = call(proofStep{Kind: "negative-ready"}); err != nil {
+		return err
 	}
 	for _, id := range []string{"a", "b"} {
 		if err = call(proofStep{Kind: "install", Participant: id}); err != nil {
 			return err
 		}
 	}
-	if err = call(proofStep{Kind: "two"}); err != nil {
-		return err
-	}
-	if mode == "m2-control" {
-		// Fresh lifetime, identical C preparation/request, but admission is
-		// still open. No retired registration is reused to bypass the seal.
-		return call(proofStep{Kind: "install", Participant: "c"})
-	}
 	for i := uint64(0); i < pages; i += 4 {
 		if err = call(proofStep{Kind: "seal", Index: i, Count: uint32(min(uint64(4), pages-i))}); err != nil {
 			return err
 		}
 	}
-	for _, kind := range []string{"locked", "negative-sealed", "exchange"} {
+	for _, kind := range []string{"negative-sealed", "exchange"} {
 		if err = call(proofStep{Kind: kind}); err != nil {
-			return err
-		}
-	}
-	if mode == "m2" {
-		return call(proofStep{Kind: "deny", Participant: "c"})
-	}
-	if mode == "m3-a" || mode == "m3-b" {
-		first, survivor := "a", "b"
-		if mode == "m3-b" {
-			first, survivor = survivor, first
-		}
-		if err = call(proofStep{Kind: "terminate", Participant: first}); err != nil {
-			return err
-		}
-		if err = call(proofStep{Kind: "survivor", Participant: survivor}); err != nil {
 			return err
 		}
 	}
@@ -383,21 +293,21 @@ type proofVM struct {
 	options    *uvm.OptionsLCOW
 	region     hcsschema.SharedMemoryRegion
 	gpn        uint64
-	bindings   []hcsschema.ProtectedSharedRegistrationInfo
 	terminated bool
 	removed    bool
 }
 
-// acceptRemoval preserves a failed action or nested query as failure. Removal's
-// OS action has no native result frame; its owner flags and independent query
-// must nevertheless be valid before this launcher records successful removal.
+// acceptRemoval checks the real action HRESULT and cached local owner flags.
+// Removal has no native lifecycle frame; a failed action/read remains failure
+// and cannot authorize releasing controller/backing. Calls are serialized.
 func (v *proofVM) acceptRemoval(info *hcsschema.ProtectedSharedRegionInfo, actionErr error) error {
-	err := errors.Join(actionErr, uvm.ValidateProtectedSharedInfo(info,
-		v.region.ProtectedSharedLeaseId, uint64(v.region.Length)/4096, 0, 0, false))
+	err := errors.Join(actionErr, uvm.ValidateProtectedSharedOperationResult(info,
+		v.region.ProtectedSharedLeaseId, uint64(v.region.Length)/4096))
 	if err != nil {
 		return err
 	}
-	if !info.Removed || info.OperationHresult != 0 {
+	if !info.Removed || info.Prepared || info.Installed ||
+		info.OperationResultValid || info.OperationHresult != 0 {
 		return errors.New("missing successful protected removal receipt")
 	}
 	v.removed = true
@@ -417,181 +327,52 @@ type realProof struct {
 	resource         hcsv2.OperationResource
 	lease            uint64
 	initialized      uint64
+	reclaimed        uint64
 	prepareUncertain bool
-	lifetimes        []uint64
-	spas             []uint64
 	vms              map[string]*proofVM
 }
 
 // controlPages calls the actual private vid.dll wrapper. All output is retained
-// on failure after strict fixed-size framing checks; no test flags are forwarded.
+// on failure after strict v2 size/version/identity/count/prefix checks. Optional
+// lifetime remains zero; no identity discovery or synthetic progress is used.
+// Even a short success-shaped batch returns its validated prefix with an error;
+// only invalid framing discards output and makes progress uncertain.
+// DLL FALSE with a nonnegative native Status is accepted only for this intact
+// bounded short batch, not a full-success/Boolean contradiction. Native Status
+// is never rewritten; Run consumes the prefix before error/cancellation/evidence.
 // The synchronous kernel call cannot be abandoned while buffers/handles are in use.
 func (p *realProof) controlPages(operation uint32, index uint64, count uint32) (psResult, error) {
 	var result psResult
-	request := psRequest{Version: 1, Flags: 1, LeaseId: p.lease, PageIndex: index, PageCount: count, Operation: operation}
-	if operation != psInitialize && index < uint64(len(p.lifetimes)) {
-		request.LifetimeId = p.lifetimes[index]
+	if operation < psInitialize || operation > psReclaim || p.lease == 0 ||
+		count == 0 || count > 4 || index >= p.pages || uint64(count) > p.pages-index {
+		return result, errors.New("invalid VID operation range/identity")
 	}
+	request := psRequest{Version: 2, Flags: 1, LeaseId: p.lease, PageIndex: index, PageCount: count, Operation: operation}
 	ok, _, callErr := p.control.Call(uintptr(p.controller), uintptr(unsafe.Pointer(&request)), uintptr(unsafe.Pointer(&result)))
 	runtime.KeepAlive(p)
-	if result.Version != 1 || result.Size != uint32(unsafe.Sizeof(result)) ||
+	// The matched DLL reports an intact short-success receipt through FALSE
+	// and a separate operation error. Counts/identity/prefix must still pass
+	// every framing guard below before that receipt can establish ownership.
+	shortSuccess := result.Status&0x80000000 == 0 && result.PagesProcessed < count
+	if result.Version != 2 || result.Size != uint32(unsafe.Sizeof(result)) ||
 		result.LeaseId != p.lease || result.PageCount != p.pages ||
 		result.InitializedPages > p.pages || result.PagesProcessed > count ||
-		result.Reserved != 0 || result.ReservedMap != 0 || result.SnapshotValid > 1 ||
-		result.LastMapPagesProcessed > p.pages {
+		(operation == psInitialize && result.InitializedPages != index+uint64(result.PagesProcessed)) ||
+		(operation != psInitialize && result.InitializedPages != p.initialized) ||
+		(ok != 0 && ok != 1) ||
+		(((ok == 0) != (result.Status&0x80000000 != 0)) &&
+			!(ok == 0 && shortSuccess)) {
 		return psResult{}, fmt.Errorf("invalid VID result frame (API=%d error=%v)", ok, callErr)
+	}
+	if shortSuccess {
+		return result, fmt.Errorf("incomplete VID lifecycle batch: operation=%d status=%#08x processed=%d requested=%d API=%d: %v",
+			operation, result.Status, result.PagesProcessed, count, ok, callErr)
 	}
 	if ok == 0 || result.Status != 0 {
 		return result, fmt.Errorf("VID operation %d: status=%#08x processed=%d API=%d: %v",
 			operation, result.Status, result.PagesProcessed, ok, callErr)
 	}
-	if operation != psQuery && result.PagesProcessed != count {
-		return result, errors.New("short successful VID lifecycle batch")
-	}
 	return result, nil
-}
-
-// snapshots queries every initialized page through the independent controller.
-// Lifetimes and SPAs are fixed on first observation, rejected on later mismatch.
-// This is a bounded collection of per-page snapshots, not an atomic region view.
-func (p *realProof) snapshots(ctx context.Context) ([]hcsschema.ProtectedSharedRegionInfo, error) {
-	var pages []hcsschema.ProtectedSharedRegionInfo
-	seenSPAs := make(map[uint64]bool)
-	seenLifetimes := make(map[uint64]bool)
-	for i := uint64(0); i < p.initialized; i++ {
-		if err := ctx.Err(); err != nil {
-			return pages, err
-		}
-		r, err := p.controlPages(psQuery, i, 1)
-		if err != nil {
-			return pages, err
-		}
-		s := r.Snapshot
-		if s.Size != 2632 || s.Version != 1 || s.RegistrationCount > 64 || s.Complete != 1 || r.SnapshotValid != 1 {
-			return pages, errors.New("missing complete native page snapshot")
-		}
-		info := hcsschema.ProtectedSharedRegionInfo{
-			Version: 1, LeaseId: r.LeaseId, PageCount: r.PageCount,
-			InitializedPages: r.InitializedPages, PreparedParticipants: r.PreparedParticipants,
-			QueryResultValid: true, SnapshotValid: true, Complete: true,
-			PageIndex: i, NextPageIndex: i + 1, RegionComplete: p.pages == 1,
-			MapSequence: r.MapSequence, LastMapPagesProcessed: r.LastMapPagesProcessed, LastMapStatus: r.LastMapStatus,
-			SpaPage: s.SpaPage, LifetimeId: s.LifetimeId, MutationSequence: s.MutationSequence, ShareCount: s.ShareCount,
-			State: s.State, Initialization: s.Initialization, RootProtection: s.RootProtection,
-			Reclaim: s.Reclaim, PageType: s.PageType, PageOwnership: s.PageOwnership,
-			Registrations: append([]hcsschema.ProtectedSharedRegistrationInfo(nil), s.Registrations[:s.RegistrationCount]...),
-		}
-		if err := uvm.ValidateProtectedSharedInfo(&info, p.lease, p.pages, i, p.lifetimes[i], true); err != nil {
-			return pages, err
-		}
-		if p.lifetimes[i] != 0 && p.spas[i] != s.SpaPage {
-			return pages, errors.New("protected backing identity changed")
-		}
-		if seenSPAs[s.SpaPage] || seenLifetimes[s.LifetimeId] {
-			return pages, errors.New("duplicate protected page identity")
-		}
-		seenSPAs[s.SpaPage], seenLifetimes[s.LifetimeId] = true, true
-		p.lifetimes[i], p.spas[i] = s.LifetimeId, s.SpaPage
-		pages = append(pages, info)
-	}
-	return pages, nil
-}
-
-// inventory requires exactly the known bindings, with terminal history retained.
-// Only quiescent snapshots are accepted; pending/removing is a retryable error
-// for the caller's bounded wait, never silently counted as installed.
-func (p *realProof) inventory(pages []hcsschema.ProtectedSharedRegionInfo) error {
-	for i, page := range pages {
-		var expected []hcsschema.ProtectedSharedRegistrationInfo
-		var count uint64
-		for _, v := range p.vms {
-			if len(v.bindings) == 0 {
-				continue
-			}
-			b := v.bindings[i]
-			wantState := uint32(1)
-			if v.removed || v.terminated {
-				wantState = 3
-			} else {
-				count++
-			}
-			found := false
-			for _, r := range page.Registrations {
-				if r.RegistrationId == b.RegistrationId && r.PartitionId == b.PartitionId &&
-					r.GpaPage == b.GpaPage && r.SharePermission == b.SharePermission && r.State == wantState {
-					found = true
-				}
-			}
-			if !found {
-				return fmt.Errorf("page %d missing expected binding/state", i)
-			}
-			expected = append(expected, b)
-		}
-		if len(page.Registrations) != len(expected) || page.ShareCount != count {
-			return fmt.Errorf("page %d inventory/count mismatch", i)
-		}
-	}
-	return nil
-}
-
-// removedSnapshots waits for partition cleanup to retire all prepared attachments
-// and registrations, retaining known successful identities in terminal history.
-// Invalid/stale frames fail immediately; only valid not-yet-drained inventories
-// are retried under ctx's deadline. The returned prefix remains diagnostic on error.
-func (p *realProof) removedSnapshots(ctx context.Context) ([]hcsschema.ProtectedSharedRegionInfo, error) {
-	if p.prepareUncertain {
-		return nil, errors.New("failed create left preparation completion unobservable; retain controller")
-	}
-	for {
-		pages, err := p.snapshots(ctx)
-		if err != nil {
-			return pages, err
-		}
-		drained := true
-		if p.lease != 0 {
-			r, err := p.controlPages(psQuery, 0, 1)
-			if err != nil {
-				return pages, err
-			}
-			drained = r.PreparedParticipants == 0
-		}
-		for i, page := range pages {
-			if page.ShareCount != 0 || page.PreparedParticipants != 0 {
-				drained = false
-			}
-			for _, r := range page.Registrations {
-				if r.State != 3 {
-					drained = false
-				}
-			}
-			// Failed installations can contribute extra terminal history, but
-			// successful bindings must never disappear from this lifetime.
-			for _, v := range p.vms {
-				if len(v.bindings) == 0 {
-					continue
-				}
-				b := v.bindings[i]
-				found := false
-				for _, r := range page.Registrations {
-					if r.RegistrationId == b.RegistrationId && r.PartitionId == b.PartitionId &&
-						r.GpaPage == b.GpaPage && r.SharePermission == b.SharePermission {
-						found = true
-					}
-				}
-				if !found {
-					return pages, errors.New("successful binding missing from terminal history")
-				}
-			}
-		}
-		if drained {
-			return pages, nil
-		}
-		select {
-		case <-ctx.Done():
-			return pages, fmt.Errorf("participant cleanup incomplete: %w", ctx.Err())
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
 }
 
 // guest executes through the existing GCS command transport and captures output.
@@ -618,6 +399,8 @@ func (p *realProof) guest(ctx context.Context, id, command string) (string, erro
 
 // prepare creates/starts one SNP UVM, retaining its owner before any subsequent
 // error. Starting hidden backing prepares it but does not install a GPA mapping.
+// Requires a cached native preparation receipt before accepting the lease/GPA;
+// missing framing or failed creation retains ownership for conservative cleanup.
 func (p *realProof) prepare(ctx context.Context, id string) error {
 	options, err := createLCOWOptions(ctx, p.cli, "protected-"+p.runID+"-"+id)
 	if err != nil {
@@ -629,7 +412,7 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 		len(options.AssignedDevices) != 0 || len(options.SiblingCommunicationEndpoints) != 0 {
 		return errors.New("proof requires independent paravisor-free SNP VMs without assigned backing devices")
 	}
-	v.region = hcsschema.SharedMemoryRegion{SectionName: p.section.hcsName, Length: int32(p.pages*4096),
+	v.region = hcsschema.SharedMemoryRegion{SectionName: p.section.hcsName, Length: int32(p.pages * 4096),
 		AllowGuestWrite: true, HiddenFromGuest: true, ProtectedShared: true, ProtectedSharedControllerUri: p.resource.URI}
 	options.SharedMemoryRegions = []hcsschema.SharedMemoryRegion{v.region}
 	options.ProtectedSharedResources = []hcsv2.OperationResource{p.resource}
@@ -644,14 +427,14 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	if err = v.vm.Start(ctx); err != nil {
 		return err
 	}
-	info, err := v.vm.ProtectedSharedInfo(ctx, v.region, 0, 0, false)
+	info, err := v.vm.ProtectedSharedOperationResult(ctx, v.region)
 	p.evidence.record("prepare", map[string]any{"Participant": id, "Frame": info, "Error": proofErrorText(err)})
 	if err != nil {
 		return err
 	}
 	if !info.Prepared || info.Installed || info.Removed || info.InitializedPages != 0 ||
 		!info.OperationResultValid || info.OperationHresult != 0 || info.OperationStatus != 0 ||
-		!info.QueryResultValid || info.QueryHresult != 0 || info.QueryStatus != 0 || info.SnapshotValid {
+		info.PagesProcessed != 0 {
 		return errors.New("preparation was not a framed unmapped, uninitialized region")
 	}
 	if p.lease != 0 && info.LeaseId != p.lease {
@@ -676,15 +459,12 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	return v.vm.Share(ctx, p.cli.String(sharedMemoryGuestModuleArgName), "/run/protected-module", true)
 }
 
-// install correlates the serialized map attempt with the controller sequence.
-// The designated M2 negative case accepts ONLY actual protected-admission denial,
-// zero prefix and unchanged inventory; earlier VA/setup failures are inconclusive.
-func (p *realProof) install(ctx context.Context, id string, deny bool) error {
+// install consumes the real action HRESULT and cached local installation flag,
+// not a native lifecycle receipt or controller observer. Successful range
+// ownership survives receipt-read errors for cleanup. Calls are serialized;
+// errors do not imply that the native mapping operation made no progress.
+func (p *realProof) install(ctx context.Context, id string) error {
 	v := p.vms[id]
-	before, err := p.snapshots(ctx)
-	if err != nil {
-		return err
-	}
 	request := v.region
 	request.HiddenFromGuest = false
 	request.ProtectedSharedOperation = hcsschema.ProtectedSharedInstall
@@ -693,69 +473,17 @@ func (p *realProof) install(ctx context.Context, id string, deny bool) error {
 	if info != nil && info.Installed {
 		v.region.HiddenFromGuest = false
 	}
-	after, err := p.snapshots(ctx)
-	if err != nil {
+	if err := uvm.ValidateProtectedSharedOperationResult(info, p.lease, p.pages); err != nil {
 		return errors.Join(mapErr, err)
-	}
-	if len(after) != int(p.pages) || len(before) != len(after) ||
-		before[0].MapSequence == math.MaxUint64 ||
-		after[0].MapSequence != before[0].MapSequence+1 {
-		return errors.Join(mapErr, errors.New("uncorrelated controller-wide map attempt"))
-	}
-	if err := uvm.ValidateProtectedSharedInfo(info, p.lease, p.pages, 0, p.lifetimes[0], true); err != nil {
-		return errors.Join(mapErr, err)
-	}
-	p.evidence.record("map", map[string]any{"Participant": id, "Sequence": after[0].MapSequence,
-		"Status": after[0].LastMapStatus, "Processed": after[0].LastMapPagesProcessed, "Error": proofErrorText(mapErr)})
-	if deny {
-		if mapErr == nil || info == nil || !info.OperationResultValid || info.Installed ||
-			info.OperationHresult & 0x80000000 == 0 ||
-			after[0].LastMapStatus != psAdmissionDenied || after[0].LastMapPagesProcessed != 0 {
-			return errors.New("M2 INCONCLUSIVE/FAIL: not a zero-prefix protected-admission denial")
-		}
-		for i := range after {
-			if after[i].ShareCount != before[i].ShareCount ||
-				!reflect.DeepEqual(after[i].Registrations, before[i].Registrations) {
-				return errors.New("M2 denial changed count or registration inventory")
-			}
-		}
-		return nil
 	}
 	if mapErr != nil {
 		return mapErr
 	}
-	if info == nil || !info.Installed || after[0].LastMapStatus != 0 || after[0].LastMapPagesProcessed != p.pages {
+	if info == nil || !info.Installed || !info.Prepared || info.Removed ||
+		info.OperationResultValid || info.OperationHresult != 0 {
 		return errors.New("incomplete protected installation")
 	}
-	var bindings []hcsschema.ProtectedSharedRegistrationInfo
-	for i, page := range after {
-		var added []hcsschema.ProtectedSharedRegistrationInfo
-		for _, r := range page.Registrations {
-			existing := false
-			for _, old := range before[i].Registrations {
-				if old.RegistrationId == r.RegistrationId {
-					existing = true
-				}
-			}
-			if !existing {
-				added = append(added, r)
-			}
-		}
-		if len(added) != 1 || added[0].State != 1 || added[0].GpaPage != v.gpn+uint64(i) {
-			return errors.New("installation did not publish exactly the expected GPA binding")
-		}
-		for _, other := range p.vms {
-			if len(other.bindings) != 0 && other.bindings[i].PartitionId == added[0].PartitionId {
-				return errors.New("participants are not distinct partition incarnations")
-			}
-		}
-		if i != 0 && added[0].PartitionId != bindings[0].PartitionId {
-			return errors.New("participant identity changed across pages")
-		}
-		bindings = append(bindings, added[0])
-	}
-	v.bindings = bindings
-	return p.inventory(after)
+	return nil
 }
 
 // hostProbe tests the existing host mapping with fault-reporting Windows APIs.
@@ -846,17 +574,40 @@ func (p *realProof) exchange(ctx context.Context) error {
 	return errors.Join(<-results, <-results)
 }
 
-// Run performs one real launcher step. recordedProof writes its phase evidence.
+// Run performs and records one real launcher step, returning native progress
+// separately from sticky evidence errors. Missing diagnostic output never blocks
+// known-safe cleanup; missing native framing still prevents release.
 // It is serialized by executeProtectedProof; guest exchange is the sole parallel
-// phase. Returned native prefixes remain valid on failure when Framed is true.
+// phase. Actual v2 prefixes remain valid on failure when Framed is true.
+// Cached worker receipts establish only local ownership; no page state is read.
+// Reclaim retries only known, framed zero-prefix preflight contention inside a
+// required deadline. Actual reclaim completion alone permits restored access.
 func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, err error) {
+	// Record the real dispatch outcome without changing its ownership/prefix.
+	// Forward work observes writer failure only after consuming that outcome.
+	defer func() {
+		p.evidence.record("phase", struct {
+			Step         proofStep
+			Result       proofResult
+			Error        string
+			ContextError string
+		}{step, out, proofErrorText(err), proofErrorText(ctx.Err())})
+	}()
 	if err = ctx.Err(); err != nil {
 		return out, err
 	}
 	switch step.Kind {
 	case "open":
-		if runtime.GOARCH != "amd64" || unsafe.Sizeof(psRequest{}) != 80 || unsafe.Sizeof(psSnapshot{}) != 2632 || unsafe.Sizeof(psResult{}) != 2792 {
-			return out, errors.New("unsupported private VID v1 native layout")
+		if runtime.GOARCH != "amd64" || unsafe.Sizeof(psRequest{}) != 48 || unsafe.Sizeof(psResult{}) != 40 ||
+			unsafe.Offsetof(psRequest{}.Version) != 0 || unsafe.Offsetof(psRequest{}.Flags) != 4 ||
+			unsafe.Offsetof(psRequest{}.LeaseId) != 8 || unsafe.Offsetof(psRequest{}.PageIndex) != 16 ||
+			unsafe.Offsetof(psRequest{}.LifetimeId) != 24 || unsafe.Offsetof(psRequest{}.PageCount) != 32 ||
+			unsafe.Offsetof(psRequest{}.Operation) != 36 || unsafe.Offsetof(psRequest{}.Reserved) != 40 ||
+			unsafe.Offsetof(psResult{}.Version) != 0 || unsafe.Offsetof(psResult{}.Size) != 4 ||
+			unsafe.Offsetof(psResult{}.Status) != 8 || unsafe.Offsetof(psResult{}.PagesProcessed) != 12 ||
+			unsafe.Offsetof(psResult{}.LeaseId) != 16 || unsafe.Offsetof(psResult{}.PageCount) != 24 ||
+			unsafe.Offsetof(psResult{}.InitializedPages) != 32 {
+			return out, errors.New("unsupported private VID v2 native layout")
 		}
 		dll := windows.NewLazySystemDLL("vid.dll")
 		create := dll.NewProc("VidCreateProtectedSharedController")
@@ -883,13 +634,20 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	case "prepare":
 		err = p.prepare(ctx, step.Participant)
 	case "prepared":
-		var r psResult
-		r, err = p.controlPages(psQuery, 0, 1)
-		out = proofResult{Framed: r.Version == 1, Initialized: r.InitializedPages,
-			Processed: r.PagesProcessed, Status: r.Status, LeaseId: r.LeaseId,
-			PreparedParticipants: r.PreparedParticipants}
-		if err == nil && (r.InitializedPages != 0 || r.SnapshotValid != 0 || r.PreparedParticipants != uint64(len(p.vms))) {
-			err = errors.New("preparation barrier not satisfied")
+		// Read cached preparation receipts only. No participant count or HV
+		// snapshot is inferred, and no native control framing is fabricated.
+		for _, v := range p.vms {
+			var info *hcsschema.ProtectedSharedRegionInfo
+			info, err = v.vm.ProtectedSharedOperationResult(ctx, v.region)
+			if err != nil {
+				break
+			}
+			if !info.Prepared || info.Installed || info.Removed ||
+				!info.OperationResultValid || info.InitializedPages != 0 ||
+				info.OperationHresult != 0 || info.OperationStatus != 0 || info.PagesProcessed != 0 {
+				err = errors.New("preparation barrier not satisfied")
+				break
+			}
 		}
 	case "initialize", "seal", "teardown", "reclaim":
 		operation := map[string]uint32{"initialize": psInitialize, "seal": psSeal, "teardown": psTeardown, "reclaim": psReclaim}[step.Kind]
@@ -898,44 +656,47 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 			p.section.protected = true
 		}
 		var r psResult
-		r, err = p.controlPages(operation, step.Index, step.Count)
-		out = proofResult{Framed: r.Version == 1, Initialized: r.InitializedPages,
-			Processed: r.PagesProcessed, Status: r.Status, LeaseId: r.LeaseId,
-			PreparedParticipants: r.PreparedParticipants}
+		if operation == psReclaim {
+			if _, bounded := ctx.Deadline(); !bounded {
+				return out, errors.New("reclaim requires a cleanup deadline")
+			}
+			if step.Index != p.reclaimed {
+				return out, errors.New("reclaim would repeat successful prefix")
+			}
+		}
+		for {
+			if contextErr := ctx.Err(); contextErr != nil {
+				err = errors.Join(err, contextErr)
+				break
+			}
+			r, err = p.controlPages(operation, step.Index, step.Count)
+			if operation != psReclaim || err == nil || r.Version != 2 ||
+				r.PagesProcessed != 0 || (r.Status != psDeviceBusy && r.Status != psObjectInUse) {
+				break
+			}
+			// Preserve backing and retry only rejected, no-progress preflight.
+			// Unknown status, partial success and malformed framing stop here.
+			select {
+			case <-ctx.Done():
+				err = errors.Join(err, ctx.Err())
+				out = proofResult{Framed: true, Initialized: r.InitializedPages,
+					Processed: r.PagesProcessed, Status: r.Status, LeaseId: r.LeaseId}
+				return out, err
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		out = proofResult{Framed: r.Version == 2, Initialized: r.InitializedPages,
+			Processed: r.PagesProcessed, Status: r.Status, LeaseId: r.LeaseId}
 		if out.Framed {
 			p.initialized = r.InitializedPages
-		}
-	case "removed":
-		out.Snapshots, err = p.removedSnapshots(ctx)
-	case "ready", "two", "locked":
-		out.Snapshots, err = p.snapshots(ctx)
-		if err != nil {
-			break
-		}
-		err = p.inventory(out.Snapshots)
-		for _, page := range out.Snapshots {
-			switch step.Kind {
-			case "ready":
-				if page.State != 1 || page.Initialization != 2 || page.RootProtection != 1 || page.ShareCount != 0 || len(page.Registrations) != 0 {
-					err = errors.Join(err, errors.New("root denial/readiness barrier failed"))
-				}
-			case "two", "locked":
-				state := uint32(1)
-				if step.Kind == "locked" {
-					state = 2
-				}
-				if page.State != state || page.RootProtection != 1 || page.ShareCount != 2 || len(page.Registrations) != 2 {
-					err = errors.Join(err, errors.New("two-participant explicit-seal inventory failed"))
-				}
+			if operation == psReclaim {
+				p.reclaimed += uint64(r.PagesProcessed)
 			}
 		}
 	case "negative-ready", "negative-sealed":
 		err = p.hostProbe(true)
-	case "install", "deny":
-		err = p.install(ctx, step.Participant, step.Kind == "deny")
-		var snapshotErr error
-		out.Snapshots, snapshotErr = p.snapshots(ctx)
-		err = errors.Join(err, snapshotErr)
+	case "install":
+		err = p.install(ctx, step.Participant)
 	case "exchange":
 		err = p.exchange(ctx)
 	case "remove":
@@ -962,48 +723,12 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 		}
 		v.terminated = true
 		err = v.vm.CloseCtx(ctx)
-	case "survivor":
-		// Partition destruction can finish asynchronously. Wait for the exact
-		// departed binding's terminal history without waiting under kernel locks.
-		for {
-			out.Snapshots, err = p.snapshots(ctx)
-			if err == nil {
-				err = p.inventory(out.Snapshots)
-			}
-			if err == nil {
-				for _, page := range out.Snapshots {
-					if page.State != 2 || page.RootProtection != 1 || page.ShareCount != 1 {
-						err = errors.New("survivor must remain installed in the locked lifetime")
-					}
-				}
-			}
-			if err == nil {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return out, errors.Join(err, ctx.Err())
-			case <-time.After(50 * time.Millisecond):
-			}
-		}
-		var nonce [16]byte
-		if _, err = rand.Read(nonce[:]); err != nil {
-			break
-		}
-		token := hex.EncodeToString(nonce[:])
-		p.evidence.record("survivor-challenge", map[string]any{"Participant": step.Participant, "Token": token})
-		command := "set -eu; printf '%s' " + shellSingleQuote(token) + " > /sys/module/hcs_shmem_diag/parameters/local_probe; dmesg | grep -F 'protected local " + token + " complete'"
-		var output string
-		output, err = p.guest(ctx, step.Participant, command)
-		if err == nil && !strings.Contains(output, "protected local "+token+" complete") {
-			err = errors.New("missing fresh survivor receipt")
-		}
-		if err == nil {
-			p.evidence.record("survivor-receipt", map[string]any{"Participant": step.Participant, "Token": token})
-		}
 	case "restored":
 		// Every reclaim batch succeeded and participants are gone. Only now
 		// reopen ordinary host reads and verify EVERY byte, not just the seed.
+		if p.reclaimed != p.initialized {
+			return out, errors.New("backing not authorized for host reuse")
+		}
 		p.section.protected = false
 		for offset := uint64(0); offset < p.pages*4096; offset += 4096 {
 			var data []byte
@@ -1024,6 +749,9 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 		// A never-initialized section requires no scrub. After explicit reclaim,
 		// close the controller before the host view. Kernel-owned references keep
 		// pins/backing alive until asynchronous final lease cleanup completes.
+		if p.prepareUncertain || p.reclaimed != p.initialized {
+			return out, errors.New("backing release not authorized")
+		}
 		p.section.protected = false
 		err = windows.CloseHandle(p.controller)
 		if err == nil {
@@ -1043,14 +771,12 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	return out, err
 }
 
-// runProtectedSharedCLI validates the isolated lab mode, then executes one fresh
+// runProtectedSharedCLI accepts only m1 in the isolated lab mode, then executes one fresh
 // lifetime with bounded operation and cleanup contexts. It never uses runMany or
 // existing VM IDs and never treats marker output as overriding lifecycle errors.
 func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
-	switch mode {
-	case "m1", "m2", "m2-control", "m3-a", "m3-b":
-	default:
+	if mode != "m1" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
 	}
 	if !useGCS || !c.Bool(securityHardwareFlag) || c.String(rootFSTypeArgName) != "none" ||
@@ -1082,8 +808,7 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	if _, err := rand.Read(id[:]); err != nil {
 		return err
 	}
-	p := &realProof{cli: c, pages: size / 4096, runID: hex.EncodeToString(id[:]), vms: make(map[string]*proofVM),
-		lifetimes: make([]uint64, size/4096), spas: make([]uint64, size/4096)}
+	p := &realProof{cli: c, pages: size / 4096, runID: hex.EncodeToString(id[:]), vms: make(map[string]*proofVM)}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	p.evidence = &proofEvidence{writer: os.Stdout, runID: p.runID}
@@ -1091,6 +816,6 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	if err := p.evidence.failure(); err != nil {
 		return err
 	}
-	err := executeProtectedProof(ctx, &recordedProof{operations: p, evidence: p.evidence}, mode, p.pages, cleanup)
+	err := executeProtectedProof(ctx, p, p.pages, cleanup)
 	return p.evidence.finish(mode, err)
 }

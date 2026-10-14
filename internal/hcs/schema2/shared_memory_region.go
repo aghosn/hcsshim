@@ -18,7 +18,6 @@ const (
 	ProtectedSharedInitialize    ProtectedSharedAction = "Initialize"
 	ProtectedSharedInstall       ProtectedSharedAction = "Install"
 	ProtectedSharedSeal          ProtectedSharedAction = "Seal"
-	ProtectedSharedQuery         ProtectedSharedAction = "Query"
 	ProtectedSharedBeginTeardown ProtectedSharedAction = "BeginTeardown"
 	ProtectedSharedRemove        ProtectedSharedAction = "Remove"
 	ProtectedSharedReclaim       ProtectedSharedAction = "Reclaim"

@@ -170,77 +170,36 @@ func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 	return nil
 }
 
-// ErrProtectedSharedPageUnavailable classifies a framed STATUS_NOT_FOUND query.
-// Explicit reclaim produces this result, but a stale lease/lifetime can too.
-// It is not success or proof of reclamation without a separately validated action
-// receipt. The caller retains the raw response and its independent action prefix.
-var ErrProtectedSharedPageUnavailable = errors.New("protected page unavailable (reclaimed or stale identity)")
-
-// ValidateProtectedSharedInfo checks framing and bounded per-page identities.
-// Failed operations retain unsigned status/prefix fields. requireSnapshot rejects
-// prepared-only, stale and incomplete output rather than falling back to legacy.
-// A missing snapshot is valid only for a successfully queried, uninitialized
-// cursor. Nested query failures propagate even if the outer properties call and
-// preceding action succeeded; action failures do not invalidate a good snapshot.
-func ValidateProtectedSharedInfo(p *hcsschema.ProtectedSharedRegionInfo, lease, pages, index, lifetime uint64, requireSnapshot bool) error {
-	if p == nil || p.Version != 1 || p.LeaseId == 0 || p.PageCount == 0 ||
+// ValidateProtectedSharedOperationResult checks a compact cached v2 receipt,
+// local owner flags and retained lease/page identity. It never queries native
+// state. A failed HRESULT/status is an error alongside the preserved receipt;
+// missing native validity is not zero progress or release authorization.
+// Install/Remove legitimately have only HRESULT/local ownership outcomes.
+func ValidateProtectedSharedOperationResult(p *hcsschema.ProtectedSharedRegionInfo, lease, pages uint64) error {
+	if p == nil || p.Version != 2 || p.LeaseId == 0 || p.PageCount == 0 ||
 		(lease != 0 && p.LeaseId != lease) || p.PageCount != pages ||
-		p.PageIndex != index || index >= pages || p.InitializedPages > pages ||
+		p.InitializedPages > pages ||
 		p.PagesProcessed > 4 || uint64(p.PagesProcessed) > pages ||
-		(!p.OperationResultValid && p.PagesProcessed != 0) ||
-		p.LastMapPagesProcessed > pages || (p.Removed && (p.Prepared || p.Installed)) {
-		return fmt.Errorf("malformed or stale protected region metadata")
+		(!p.OperationResultValid && (p.PagesProcessed != 0 || p.OperationStatus != 0)) ||
+		(p.Removed && (p.Prepared || p.Installed)) || (p.Installed && !p.Prepared) {
+		return fmt.Errorf("malformed or mismatched protected operation receipt")
 	}
-	if !p.SnapshotValid {
-		if !p.QueryResultValid {
-			return fmt.Errorf("unframed protected metadata query")
-		}
-		if p.QueryHresult != 0 || p.QueryStatus != 0 {
-			// VsmmProtectedSharedControlIoctl returns STATUS_NOT_FOUND for a
-			// reclaimed page or stale identity. Never conflate it with the
-			// successful, snapshot-free query of an uninitialized page.
-			if p.QueryStatus == 0xc0000225 && p.QueryHresult&0x80000000 != 0 {
-				return ErrProtectedSharedPageUnavailable
-			}
-			return fmt.Errorf("protected metadata query failed: HRESULT=%#08x status=%#08x", p.QueryHresult, p.QueryStatus)
-		}
-		if requireSnapshot || p.Complete || p.RegionComplete {
-			return fmt.Errorf("incomplete protected page snapshot")
-		}
-		if index < p.InitializedPages || p.Installed || p.LifetimeId != 0 ||
-			len(p.Registrations) != 0 || p.NextPageIndex != 0 {
-			return fmt.Errorf("missing snapshot for an initialized protected page")
-		}
-		return nil
-	}
-	if !p.QueryResultValid || p.QueryHresult != 0 || p.QueryStatus != 0 ||
-		!p.Complete || p.NextPageIndex != index+1 ||
-		p.RegionComplete != (pages == 1 && index == 0) ||
-		p.LifetimeId == 0 || p.LifetimeId >= math.MaxInt64 ||
-		(lifetime != 0 && lifetime != p.LifetimeId) || p.SpaPage > math.MaxUint64>>12 ||
-		p.State > 3 || p.Initialization > 2 || p.RootProtection > 2 || p.Reclaim > 4 ||
-		p.PageType != 1 || p.PageOwnership != 0 || len(p.Registrations) > 64 {
-		return fmt.Errorf("invalid protected snapshot frame/state/identity")
-	}
-	seen := make(map[uint64]bool)
-	for _, r := range p.Registrations {
-		if r.RegistrationId == 0 || r.RegistrationId >= math.MaxInt64 ||
-			r.PartitionId == 0 || r.PartitionId >= math.MaxInt64 || r.GpaPage >= 1<<40 ||
-			r.Vtl != 0 || r.SharePermission & ^uint32(7) != 0 ||
-			r.State > 3 || r.RemovalReason > 4 ||
-			((r.State < 2) != (r.RemovalReason == 0)) || seen[r.RegistrationId] {
-			return fmt.Errorf("invalid or duplicate protected registration")
-		}
-		seen[r.RegistrationId] = true
+	if p.OperationHresult&0x80000000 != 0 ||
+		(p.OperationResultValid && p.OperationStatus&0x80000000 != 0) {
+		return fmt.Errorf("protected action failed: HRESULT=%#08x native-valid=%t status=%#08x processed=%d",
+			p.OperationHresult, p.OperationResultValid, p.OperationStatus, p.PagesProcessed)
 	}
 	return nil
 }
 
-// ProtectedSharedInfo reads exactly the configured private region, failing if
-// only a legacy response is available. Callers serialize cursor/lifecycle updates;
-// peers may still advance controller-wide LastMap. Invalid metadata returns an
-// error alongside the untrusted frame for diagnosis, not permission to use it.
-func (uvm *UtilityVM) ProtectedSharedInfo(ctx context.Context, region hcsschema.SharedMemoryRegion, index, lifetime uint64, requireSnapshot bool) (*hcsschema.ProtectedSharedRegionInfo, error) {
+// ProtectedSharedOperationResult reads only the worker's cached last receipt,
+// with ordinary SectionName/GPA properties. No native lifecycle/query occurs.
+// Callers serialize actions and receipt reads; this is not live page state.
+// Missing, mismatched or failed receipts return errors, never zero progress.
+func (uvm *UtilityVM) ProtectedSharedOperationResult(ctx context.Context, region hcsschema.SharedMemoryRegion) (*hcsschema.ProtectedSharedRegionInfo, error) {
+	if err := ValidateProtectedSharedRegion(region); err != nil {
+		return nil, err
+	}
 	regions, err := uvm.SharedMemoryRegions(ctx)
 	if err != nil {
 		return nil, err
@@ -261,13 +220,14 @@ func (uvm *UtilityVM) ProtectedSharedInfo(ctx context.Context, region hcsschema.
 		return nil, err
 	}
 	p := found.ProtectedShared
-	return p, ValidateProtectedSharedInfo(p, region.ProtectedSharedLeaseId, uint64(region.Length)/4096, index, lifetime, requireSnapshot)
+	return p, ValidateProtectedSharedOperationResult(p, region.ProtectedSharedLeaseId, uint64(region.Length)/4096)
 }
 
 // ModifyProtectedShared checks a private action and borrows the controller
-// capability through HCS completion. It returns subsequent diagnostics even on
-// failure. Unframed/invalid output is unknown work, never zero progress. After
-// cancellation a separate five-second query budget preserves failure evidence.
+// capability through HCS completion. Returns the cached receipt even on action
+// failure, joining real action failure with independent read/validation errors.
+// Unframed work is never zero progress. After cancellation, receipt reading has
+// a separate five-second budget; it dispatches no further lifecycle operation.
 func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource) (*hcsschema.ProtectedSharedRegionInfo, error) {
 	if err := ValidateProtectedSharedRegion(region); err != nil {
 		return nil, err
@@ -289,12 +249,11 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 			(region.ProtectedSharedOperation == hcsschema.ProtectedSharedInstall && region.HiddenFromGuest) {
 			return nil, fmt.Errorf("invalid protected installation/removal request")
 		}
-	case hcsschema.ProtectedSharedInitialize, hcsschema.ProtectedSharedSeal, hcsschema.ProtectedSharedQuery,
+	case hcsschema.ProtectedSharedInitialize, hcsschema.ProtectedSharedSeal,
 		hcsschema.ProtectedSharedBeginTeardown, hcsschema.ProtectedSharedReclaim:
 		if region.ProtectedSharedLeaseId == 0 || region.ProtectedSharedPageCount == 0 ||
 			region.ProtectedSharedPageCount > 4 || region.ProtectedSharedPageIndex >= pages ||
 			uint64(region.ProtectedSharedPageCount) > pages-region.ProtectedSharedPageIndex ||
-			(region.ProtectedSharedOperation == hcsschema.ProtectedSharedQuery && region.ProtectedSharedPageCount != 1) ||
 			(region.ProtectedSharedOperation == hcsschema.ProtectedSharedInitialize && region.ProtectedSharedLifetimeId != 0) {
 			return nil, fmt.Errorf("invalid protected control range/identity")
 		}
@@ -310,54 +269,34 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 		Settings:     region,
 	}, []hcsv2.OperationResource{resource})
 	// Preserve diagnostics after a cancelled action without using an unbounded
-	// background query or turning an invalid frame into a success receipt.
+	// properties read or turning an invalid frame into a success receipt.
 	queryCtx := ctx
 	if ctx.Err() != nil {
 		var cancel context.CancelFunc
 		queryCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 	}
-	p, queryErr := uvm.ProtectedSharedInfo(queryCtx, region, region.ProtectedSharedPageIndex, region.ProtectedSharedLifetimeId, false)
+	p, queryErr := uvm.ProtectedSharedOperationResult(queryCtx, region)
+	if queryErr == nil {
+		switch region.ProtectedSharedOperation {
+		case hcsschema.ProtectedSharedInstall:
+			if p.OperationResultValid || !p.Installed || !p.Prepared || p.Removed {
+				queryErr = errors.New("missing actual installation ownership receipt")
+			}
+		case hcsschema.ProtectedSharedRemove:
+			if p.OperationResultValid || !p.Removed {
+				queryErr = errors.New("missing actual removal ownership receipt")
+			}
+		case "", hcsschema.ProtectedSharedNone:
+			if !p.OperationResultValid || !p.Prepared || p.Installed || p.Removed ||
+				p.PagesProcessed != 0 || p.InitializedPages != 0 {
+				queryErr = errors.New("missing native preparation receipt")
+			}
+		default:
+			if !p.OperationResultValid || p.PagesProcessed != region.ProtectedSharedPageCount {
+				queryErr = errors.New("missing complete native operation receipt")
+			}
+		}
+	}
 	return p, errors.Join(err, queryErr)
-}
-
-// CollectProtectedShared returns independently coherent page snapshots within
-// a required deadline. Failure returns only the collected prefix; nil error
-// means all pages, never region atomicity. Duplicate or stale identities fail.
-func (uvm *UtilityVM) CollectProtectedShared(ctx context.Context, region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource, lifetimes []uint64) ([]hcsschema.ProtectedSharedRegionInfo, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		return nil, fmt.Errorf("protected collection requires a deadline")
-	}
-	if err := ValidateProtectedSharedRegion(region); err != nil {
-		return nil, err
-	}
-	pages := uint64(region.Length) / 4096
-	if uint64(len(lifetimes)) != pages {
-		return nil, fmt.Errorf("protected collection identity count mismatch")
-	}
-	var result []hcsschema.ProtectedSharedRegionInfo
-	seenSPAs := make(map[uint64]bool)
-	seenLifetimes := make(map[uint64]bool)
-	for index, lifetime := range lifetimes {
-		if err := ctx.Err(); err != nil {
-			return result, err
-		}
-		region.ProtectedSharedOperation = hcsschema.ProtectedSharedQuery
-		region.ProtectedSharedPageIndex = uint64(index)
-		region.ProtectedSharedPageCount = 1
-		region.ProtectedSharedLifetimeId = lifetime
-		p, err := uvm.ModifyProtectedShared(ctx, region, resource)
-		if err == nil {
-			err = ValidateProtectedSharedInfo(p, region.ProtectedSharedLeaseId, pages, uint64(index), lifetime, true)
-		}
-		if err != nil {
-			return result, err
-		}
-		if seenSPAs[p.SpaPage] || seenLifetimes[p.LifetimeId] {
-			return result, fmt.Errorf("duplicate page identity in protected collection")
-		}
-		seenSPAs[p.SpaPage], seenLifetimes[p.LifetimeId] = true, true
-		result = append(result, *p)
-	}
-	return result, nil
 }

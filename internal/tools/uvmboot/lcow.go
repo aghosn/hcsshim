@@ -70,7 +70,7 @@ var lcowCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  protectedModeFlag,
-			Usage: "Private CPU-only SNP proof: m1, m2-control, m2, m3-a or m3-b. Creates fresh owned VMs.",
+			Usage: "Private CPU-only SNP manual lifecycle: m1 only. Creates two fresh owned VMs.",
 		},
 		cli.DurationFlag{
 			Name:  protectedTimeoutFlag,

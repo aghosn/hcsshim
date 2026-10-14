@@ -969,7 +969,8 @@ func (computeSystem *System) Modify(ctx context.Context, config interface{}) err
 
 // ModifyWithResources borrows capabilities through completion and attaches them
 // before dispatch. It retains the system read lock and the ordinary Modify error
-// contract; callers query protected progress even when this returns an error.
+// contract; callers may read the cached last-operation receipt even on failure.
+// That properties read is not a native query and cannot prove reference drainage.
 func (computeSystem *System) ModifyWithResources(ctx context.Context, config interface{}, resources []OperationResource) error {
 	computeSystem.handleLock.RLock()
 	defer computeSystem.handleLock.RUnlock()
