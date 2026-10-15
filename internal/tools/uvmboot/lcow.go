@@ -59,6 +59,7 @@ const (
 	sharedMemoryGuestModuleArgName    = "shared-memory-guest-module"
 	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
 	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
+	siblingOpenShellBundleArgName     = "sibling-openshell-bundle"
 )
 
 var (
@@ -218,6 +219,12 @@ var lcowCommand = cli.Command{
 				"through it and route the workload's default traffic via the diode.",
 		},
 		cli.StringFlag{
+			Name: siblingOpenShellBundleArgName,
+			Usage: "Optional OpenShell tar bundle for an interactive sibling pair. " +
+				"Run gateway/supervisor on the diode and a network-isolated sandbox " +
+				"on the workload; do not load either sibling IP driver.",
+		},
+		cli.StringFlag{
 			Name: baselineNICArgName,
 			Usage: "Baseline without the diode: give one UVM a NIC on the " +
 				diodeUplinkNetworkName + " HNS NAT network and measure the host " +
@@ -372,7 +379,20 @@ var lcowCommand = cli.Command{
 				return fmt.Errorf("inspect diode_tcpbulk: %w", err)
 			}
 		}
-		if c.IsSet(baselineNICArgName) || c.Bool(siblingDiodeUplinkArgName) {
+		if bundle := c.String(siblingOpenShellBundleArgName); bundle != "" {
+			if !siblingInteractive || !c.IsSet(siblingBusGuestModuleArgName) ||
+				!c.Bool(siblingDiodeUplinkArgName) {
+				return fmt.Errorf("--%s requires the interactive sibling pair and diode uplink",
+					siblingOpenShellBundleArgName)
+			}
+			if info, err := os.Stat(bundle); err != nil {
+				return fmt.Errorf("inspect OpenShell bundle: %w", err)
+			} else if !info.Mode().IsRegular() {
+				return fmt.Errorf("OpenShell bundle is not a regular file: %s", bundle)
+			}
+		}
+		if c.IsSet(baselineNICArgName) ||
+			(c.Bool(siblingDiodeUplinkArgName) && c.String(siblingOpenShellBundleArgName) == "") {
 			stop, err := startHostEndpoint()
 			if err != nil {
 				return err
@@ -1005,65 +1025,107 @@ func runLCOW(
 			if err := vm.Share(ctx, busModulePath, busModuleRoot, true); err != nil {
 				return fmt.Errorf("share sibling-bus module: %w", err)
 			}
-			// Plan9 file shares expose only the named file, so the role's
-			// net module (next to sibling_bus.ko on the host) is shared too.
-			const netModuleRoot = "/run/diode-net-module"
-			netModuleName := siblingNetModuleName(role)
-			netModulePath := filepath.Join(filepath.Dir(busModulePath), netModuleName)
-			if err := vm.Share(ctx, netModulePath, netModuleRoot, true); err != nil {
-				return fmt.Errorf("share diode net module: %w", err)
-			}
-			tcpBulkPath := filepath.Join(filepath.Dir(busModulePath), "diode_tcpbulk")
-			if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
-				return fmt.Errorf("share diode_tcpbulk: %w", err)
-			}
-			// Interactive demo helpers, staged on both roles (the diode runs
-			// capture/filter/smooth, the workload runs the covert client).
-			for shareName, guestDir := range map[string]string{
-				"demo.sh":       "/run/diode-demo",
-				"covert_udp":    "/run/diode-covert",
-				"diode_tcpdump": "/run/diode-tcpdump",
-				"diode_tc":      "/run/diode-tc",
-			} {
-				hostPath := filepath.Join(filepath.Dir(busModulePath), shareName)
-				if _, statErr := os.Stat(hostPath); statErr != nil {
-					continue
+			if bundle := c.String(siblingOpenShellBundleArgName); bundle != "" {
+				if err := vm.Share(ctx, bundle, "/run/openshell-bundle", true); err != nil {
+					return fmt.Errorf("share OpenShell bundle: %w", err)
 				}
-				if err := vm.Share(ctx, hostPath, guestDir, true); err != nil {
-					return fmt.Errorf("share %s: %w", shareName, err)
+				vsockModulePath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock.ko")
+				if err := vm.Share(ctx, vsockModulePath, "/run/diode-vsock-module", true); err != nil {
+					return fmt.Errorf("share diode vsock module: %w", err)
 				}
-			}
-			iperfPath := filepath.Join(filepath.Dir(busModulePath), iperfGuestName)
-			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
-				return fmt.Errorf("share %s: %w", iperfGuestName, err)
-			}
-			egress := c.Bool(siblingDiodeUplinkArgName)
-			netCfg, err := siblingNetConfigFor(role, egress)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("sibling net: role=%s if=%s addr=%s gw=%s dns=%s\n", role,
-				netCfg.ifName, netCfg.address, netCfg.gateway, strings.Join(netCfg.dns, ","))
-			var uplink *diodeUplink
-			if egress && role == diodeRole {
-				iptablesPath := filepath.Join(filepath.Dir(busModulePath), "diode_iptables")
-				if err := vm.Share(ctx, iptablesPath, "/run/diode-iptables", true); err != nil {
-					return fmt.Errorf("share diode_iptables: %w", err)
+				var uplink *diodeUplink
+				var dns []string
+				if role == diodeRole {
+					var cleanup func()
+					uplink, cleanup, err = attachDiodeUplink(ctx, vm)
+					if err != nil {
+						return err
+					}
+					defer cleanup()
+					dns, err = hostDNSServers()
+					if err != nil {
+						return fmt.Errorf("OpenShell diode DNS: %w", err)
+					}
 				}
-				var cleanup func()
-				uplink, cleanup, err = attachDiodeUplink(ctx, vm)
+				openShellCommand, commandErr := siblingOpenShellGuestCommand(
+					busModuleRoot+"/"+filepath.Base(busModulePath),
+					"/run/diode-vsock-module/diode_vsock.ko",
+					"/run/openshell-bundle/"+filepath.Base(bundle), role, uplink, dns)
+				if commandErr != nil {
+					return commandErr
+				}
+				execCommand += "; " + openShellCommand
+			} else {
+				// Plan9 file shares expose only the named file, so the role's
+				// net module (next to sibling_bus.ko on the host) is shared too.
+				const netModuleRoot = "/run/diode-net-module"
+				netModuleName := siblingNetModuleName(role)
+				netModulePath := filepath.Join(filepath.Dir(busModulePath), netModuleName)
+				if err := vm.Share(ctx, netModulePath, netModuleRoot, true); err != nil {
+					return fmt.Errorf("share diode net module: %w", err)
+				}
+				const vsockModuleRoot = "/run/diode-vsock-module"
+				vsockModulePath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock.ko")
+				if err := vm.Share(ctx, vsockModulePath, vsockModuleRoot, true); err != nil {
+					return fmt.Errorf("share diode vsock module: %w", err)
+				}
+				vsockTestPath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock_test")
+				if err := vm.Share(ctx, vsockTestPath, "/run/diode-vsock-test", true); err != nil {
+					return fmt.Errorf("share diode_vsock_test: %w", err)
+				}
+				tcpBulkPath := filepath.Join(filepath.Dir(busModulePath), "diode_tcpbulk")
+				if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
+					return fmt.Errorf("share diode_tcpbulk: %w", err)
+				}
+				// Interactive demo helpers, staged on both roles (the diode runs
+				// capture/filter/smooth, the workload runs the covert client).
+				for shareName, guestDir := range map[string]string{
+					"demo.sh":       "/run/diode-demo",
+					"covert_udp":    "/run/diode-covert",
+					"diode_tcpdump": "/run/diode-tcpdump",
+					"diode_tc":      "/run/diode-tc",
+				} {
+					hostPath := filepath.Join(filepath.Dir(busModulePath), shareName)
+					if _, statErr := os.Stat(hostPath); statErr != nil {
+						continue
+					}
+					if err := vm.Share(ctx, hostPath, guestDir, true); err != nil {
+						return fmt.Errorf("share %s: %w", shareName, err)
+					}
+				}
+				iperfPath := filepath.Join(filepath.Dir(busModulePath), iperfGuestName)
+				if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
+					return fmt.Errorf("share %s: %w", iperfGuestName, err)
+				}
+				egress := c.Bool(siblingDiodeUplinkArgName)
+				netCfg, err := siblingNetConfigFor(role, egress)
 				if err != nil {
 					return err
 				}
-				defer cleanup()
+				fmt.Printf("sibling net: role=%s if=%s addr=%s gw=%s dns=%s\n", role,
+					netCfg.ifName, netCfg.address, netCfg.gateway, strings.Join(netCfg.dns, ","))
+				var uplink *diodeUplink
+				if egress && role == diodeRole {
+					iptablesPath := filepath.Join(filepath.Dir(busModulePath), "diode_iptables")
+					if err := vm.Share(ctx, iptablesPath, "/run/diode-iptables", true); err != nil {
+						return fmt.Errorf("share diode_iptables: %w", err)
+					}
+					var cleanup func()
+					uplink, cleanup, err = attachDiodeUplink(ctx, vm)
+					if err != nil {
+						return err
+					}
+					defer cleanup()
+				}
+				execCommand += "; " + siblingBusGuestModuleCommand(
+					busModuleRoot+"/"+filepath.Base(busModulePath),
+					netModuleRoot+"/"+netModuleName,
+					vsockModuleRoot+"/diode_vsock.ko",
+					role,
+					netCfg,
+					uplink,
+				)
 			}
-			execCommand += "; " + siblingBusGuestModuleCommand(
-				busModuleRoot+"/"+filepath.Base(busModulePath),
-				netModuleRoot+"/"+netModuleName,
-				role,
-				netCfg,
-				uplink,
-			)
 		}
 	}
 
@@ -1288,10 +1350,13 @@ const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run
 	`if [ -f "$s" ]; then cp "$s" /run/dtb-exec/$d && chmod 755 /run/dtb-exec/$d; fi; done; ` +
 	iperfStage
 
+const siblingVsockStage = `cp /run/diode-vsock-test/diode_vsock_test /run/dtb-exec/vsock-test && ` +
+	`chmod 755 /run/dtb-exec/vsock-test || { echo 'diode_vsock: tool staging failed' >&2; exit 1; }; `
+
 // siblingWorkloadStage stages $dtb and $ipf and defines snap, which reads
 // the root VMBus channel interrupts, the sibling bus counters, uptime and
 // dvsc0's byte counters.
-const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
+const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + siblingVsockStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
 	`for f in /sys/bus/vmbus/devices/*/channels/*/interrupts; do [ -r $f ] && c=$((c+$(cat $f))); done; ` +
 	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
@@ -1374,18 +1439,21 @@ func (cfg siblingNetConfig) command() string {
 		cmd += "ip route replace default via " + cfg.gateway + " dev " + cfg.ifName + "; "
 	}
 	if len(cfg.dns) > 0 {
-		// The rootfs is read-only and may lack /etc/resolv.conf, so bind over
-		// an existing file or overlay /etc with a tmpfs upper layer.
-		cmd += "printf 'nameserver %s\\n' " + strings.Join(cfg.dns, " ") + " >/run/resolv.conf; " +
-			"if cp /run/resolv.conf /etc/resolv.conf 2>/dev/null; then :; " +
-			"elif [ -e /etc/resolv.conf ]; then mount --bind /run/resolv.conf /etc/resolv.conf; " +
-			"else o=/run/etc-overlay; mkdir -p $o && mount -t tmpfs tmpfs $o && " +
-			"mkdir $o/up $o/work && mount -t overlay overlay " +
-			"-o lowerdir=/etc,upperdir=$o/up,workdir=$o/work /etc && " +
-			"cp /run/resolv.conf /etc/resolv.conf; fi || " +
-			"echo 'diode_net: resolv.conf not writable' >&2; "
+		cmd += cfg.commandDNS() + " || echo 'diode_net: resolv.conf not writable' >&2; "
 	}
 	return cmd
+}
+
+func (cfg siblingNetConfig) commandDNS() string {
+	// The rootfs is read-only and may lack /etc/resolv.conf, so bind over
+	// an existing file or overlay /etc with a tmpfs upper layer.
+	return "printf 'nameserver %s\\n' " + strings.Join(cfg.dns, " ") + " >/run/resolv.conf; " +
+		"if cp /run/resolv.conf /etc/resolv.conf 2>/dev/null; then :; " +
+		"elif [ -e /etc/resolv.conf ]; then mount --bind /run/resolv.conf /etc/resolv.conf; " +
+		"else o=/run/etc-overlay; mkdir -p $o && mount -t tmpfs tmpfs $o && " +
+		"mkdir $o/up $o/work && mount -t overlay overlay " +
+		"-o lowerdir=/etc,upperdir=$o/up,workdir=$o/work /etc && " +
+		"cp /run/resolv.conf /etc/resolv.conf; fi"
 }
 
 // siblingWorkloadEgressCommand checks that the workload's only NIC is dvsc0
@@ -1411,11 +1479,23 @@ func siblingWorkloadEgressCommand(dnsServers []string) string {
 func guestWaitFor(cond, what string) string {
 	return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
 		"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
-		"dmesg | grep -E 'sibling_bus:|diode_net' >&2 || true; exit 1; }; " +
+		"dmesg | grep -E 'sibling_bus:|diode_net|diode_vsock:' >&2 || true; exit 1; }; " +
 		"sleep 1; done; "
 }
 
-func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
+func siblingVsockGuestModuleCommand(modulePath, role string) string {
+	cid, transportRole := 4, "diode"
+	if role == workloadRole {
+		cid, transportRole = 3, "workload"
+	}
+	ready := fmt.Sprintf("diode_vsock: vsock up: role=%s local_cid=%d", transportRole, cid)
+	return "insmod " + shellSingleQuote(modulePath) + " diode_cid=4 workload_cid=3 || " +
+		"{ dmesg | grep -F 'diode_vsock:' >&2; exit 1; }; " +
+		guestWaitFor("dmesg | grep -qF "+shellSingleQuote(ready), "vsock channel") +
+		"echo " + shellSingleQuote(ready) + "; "
+}
+
+func siblingBusGuestModuleCommand(modulePath, netModulePath, vsockModulePath, role string,
 	net siblingNetConfig, uplink *diodeUplink) string {
 	ifName := net.ifName
 	waitFor := guestWaitFor
@@ -1426,7 +1506,8 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 			"echo") +
 		"dmesg | grep -F 'sibling_bus:'; " +
 		"echo \"diode_net: tools $(command -v ip ifconfig ping | tr '\\n' ' ')\"; " +
-		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command()
+		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command() +
+		siblingVsockGuestModuleCommand(vsockModulePath, role)
 	if role == workloadRole {
 		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter")
 		if !siblingInteractive {
@@ -1461,7 +1542,7 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 			}
 		}
 	} else {
-		cmd += siblingTCPBulkStage +
+		cmd += siblingTCPBulkStage + siblingVsockStage +
 			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
 			fmt.Sprintf("(\"$ipf\" -s -p %d >/dev/null 2>&1 &); ", iperfLinkPort)
 		if uplink != nil {

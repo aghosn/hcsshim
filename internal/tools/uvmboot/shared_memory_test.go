@@ -41,6 +41,54 @@ func TestShellSingleQuote(t *testing.T) {
 	}
 }
 
+func TestSiblingVsockGuestModuleCommand(t *testing.T) {
+	for _, test := range []struct {
+		role  string
+		ready string
+	}{
+		{diodeRole, "diode_vsock: vsock up: role=diode local_cid=4"},
+		{workloadRole, "diode_vsock: vsock up: role=workload local_cid=3"},
+	} {
+		t.Run(test.role, func(t *testing.T) {
+			command := siblingVsockGuestModuleCommand("/run/module's/diode_vsock.ko", test.role)
+			for _, expected := range []string{
+				`insmod '/run/module'"'"'s/diode_vsock.ko' diode_cid=4 workload_cid=3 ||`,
+				"exit 1",
+				"until dmesg | grep -qF '" + test.ready + "'",
+				"[ $i -le 30 ]",
+				"echo '" + test.ready + "'",
+			} {
+				if !strings.Contains(command, expected) {
+					t.Fatalf("command %q does not contain %q", command, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestSiblingVsockToolStagedOnExecFilesystem(t *testing.T) {
+	for _, expected := range []string{
+		"mount -t tmpfs -o exec",
+		"cp /run/diode-vsock-test/diode_vsock_test /run/dtb-exec/vsock-test",
+		"chmod 755 /run/dtb-exec/vsock-test ||",
+		"diode_vsock: tool staging failed",
+	} {
+		if !strings.Contains(siblingWorkloadStage, expected) {
+			t.Fatalf("tool staging command does not contain %q", expected)
+		}
+	}
+}
+
+func TestBaselineNICDoesNotRequireSiblingVsock(t *testing.T) {
+	command := baselineNICUp(&diodeUplink{
+		address: "172.31.250.2/24",
+		gateway: "172.31.250.1",
+	})
+	if strings.Contains(command, "diode-vsock") || strings.Contains(command, "vsock-test") {
+		t.Fatal("baseline NIC setup must not require sibling vsock tools")
+	}
+}
+
 func TestSharedMemoryGuestModuleCommandConvertsGPN(t *testing.T) {
 	command, err := sharedMemoryGuestModuleCommand(
 		"/run/hcs_shmem_diag.ko",
