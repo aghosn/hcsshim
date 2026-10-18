@@ -27,6 +27,7 @@ import (
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/windows"
 )
@@ -423,6 +424,8 @@ func (p *realProof) guest(ctx context.Context, id, command string) (string, erro
 // GPA is checked in bytes before retaining a 4-KiB page index. Missing framing
 // or failed creation returns an error with ownership/uncertainty preserved.
 // Both modes borrow the same retained controller and share the module via GCS.
+// An early receipt query is diagnostic only, bounded to five seconds within
+// startup, and never substitutes for post-Start receipt validation.
 func (p *realProof) prepare(ctx context.Context, id string) error {
 	options, err := createLCOWOptions(ctx, p.cli, "protected-"+p.runID+"-"+id)
 	if err != nil {
@@ -460,7 +463,27 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 		p.prepareUncertain = true
 		return err
 	}
-	if err = v.vm.Start(ctx); err != nil {
+	p.evidence.record("startup", map[string]any{
+		"Participant": id, "ID": v.vm.ID(), "Runtime": fmt.Sprint(v.vm.RuntimeID()),
+		"BootFilesPath": options.BootFilesPath, "KernelFile": options.KernelFile,
+		"RootFSFile": options.RootFSFile, "ConsolePipe": options.ConsolePipe,
+		"Stage": "before-start",
+	})
+	if err = v.vm.StartWithHCSStartObserver(ctx, func(startCtx context.Context) {
+		p.evidence.record("prepare-observation", map[string]any{
+			"Participant": id, "Stage": "after-hcs-start-query-begin",
+		})
+		queryCtx, cancel := context.WithTimeout(startCtx, 5*time.Second)
+		defer cancel()
+		started := time.Now()
+		info, queryErr := v.vm.ProtectedSharedOperationResult(queryCtx, v.region)
+		p.evidence.record("prepare-observation", map[string]any{
+			"Participant": id, "Stage": "after-hcs-start-query-end",
+			"Frame": info, "Error": proofErrorText(queryErr),
+			"ContextError": proofErrorText(queryCtx.Err()),
+			"Elapsed": time.Since(started).String(), "DiagnosticOnly": true,
+		})
+	}); err != nil {
 		return err
 	}
 	info, err := v.vm.ProtectedSharedOperationResult(ctx, v.region)
@@ -834,6 +857,13 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
 	if mode != "m1" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
+	}
+	// The command defaults to warning-only logs; retain startup progress without
+	// requiring -debug or reducing an explicitly enabled trace level.
+	previousLevel := logrus.GetLevel()
+	if previousLevel < logrus.InfoLevel {
+		logrus.SetLevel(logrus.InfoLevel)
+		defer logrus.SetLevel(previousLevel)
 	}
 	snp := c.Bool(securityHardwareFlag)
 	if !useGCS ||

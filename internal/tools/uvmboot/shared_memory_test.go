@@ -9,20 +9,29 @@ import (
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 )
 
+// TestSharedMemorySectionNames covers SSH/service session zero and interactive
+// sessions without changing the simple name passed to CreateFileMapping.
 func TestSharedMemorySectionNames(t *testing.T) {
-	win32Name, hcsName, err := sharedMemorySectionNames("hcsshim-test", 3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if win32Name != "hcsshim-test" {
-		t.Fatalf("Win32 section name = %q, want %q", win32Name, "hcsshim-test")
-	}
-	if hcsName != `\Sessions\3\BaseNamedObjects\hcsshim-test` {
-		t.Fatalf(
-			"HCS section name = %q, want %q",
-			hcsName,
-			`\Sessions\3\BaseNamedObjects\hcsshim-test`,
-		)
+	for _, test := range []struct {
+		name      string
+		sessionID uint32
+		hcsName   string
+	}{
+		{"session-zero", 0, `\BaseNamedObjects\hcsshim-test`},
+		{"interactive", 3, `\Sessions\3\BaseNamedObjects\hcsshim-test`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			win32Name, hcsName, err := sharedMemorySectionNames("hcsshim-test", test.sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if win32Name != "hcsshim-test" {
+				t.Fatalf("Win32 section name = %q, want %q", win32Name, "hcsshim-test")
+			}
+			if hcsName != test.hcsName {
+				t.Fatalf("HCS section name = %q, want %q", hcsName, test.hcsName)
+			}
+		})
 	}
 }
 

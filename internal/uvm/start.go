@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
@@ -60,6 +61,22 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
+	return uvm.start(ctx, nil)
+}
+
+// StartWithHCSStartObserver starts the VM with a synchronous diagnostic callback
+// after successful HCS start and before waiting for guest connections. The
+// observer borrows the startup context, must bound its work and must not mutate
+// VM lifecycle state. It does not supply a start result or cleanup authority.
+func (uvm *UtilityVM) StartWithHCSStartObserver(ctx context.Context, observer func(context.Context)) error {
+	return uvm.start(ctx, observer)
+}
+
+// start owns the startup deadline and existing error cleanup. An optional
+// observer runs while the VM is available, before timeout cleanup can remove
+// cached diagnostic state. Ordinary Start callers do not install an observer.
+func (uvm *UtilityVM) start(ctx context.Context, observer func(context.Context)) (err error) {
+	started := time.Now()
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
 	ctx, cancel := context.WithTimeout(pCtx, timeout.GCSConnectionTimeout)
@@ -76,6 +93,20 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	uvm.exitCh = make(chan struct{})
 
 	e := log.G(ctx).WithField(logfields.UVMID, uvm.id)
+	// Keep additional progress logging opt-in for diagnostic callers.
+	progress := func(stage string, stageErr error) {
+		if observer != nil {
+			e.WithField("elapsed", time.Since(started).String()).
+				WithError(stageErr).Info(stage)
+		}
+	}
+	if observer != nil {
+		deadline, _ := ctx.Deadline()
+		e.WithField("connection-timeout", timeout.GCSConnectionTimeout.String()).
+			WithField("deadline", deadline.Format(time.RFC3339Nano)).
+			WithField("runtime-id", uvm.runtimeID.String()).
+			Info("uvm startup beginning")
+	}
 
 	// log errors in the the wait groups, since if multiple go routines return an error,
 	// theres no guarantee on which will be returned.
@@ -88,12 +119,14 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		g.Go(func() error {
 			conn, err := uvm.accept(gctx, uvm.entropyListener, true)
 			uvm.entropyListener = nil
+			progress("entropy socket accept completed", err)
 			if err != nil {
 				e.WithError(err).Error("failed to connect to entropy socket")
 				return fmt.Errorf("failed to connect to entropy socket: %w", err)
 			}
 			defer conn.Close()
 			_, err = io.CopyN(conn, rand.Reader, vmutils.LinuxEntropyBytes)
+			progress("entropy transfer completed", err)
 			if err != nil {
 				e.WithError(err).Error("failed to write entropy")
 				return fmt.Errorf("failed to write entropy: %w", err)
@@ -139,6 +172,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 			g.Go(func() error {
 				conn, err := uvm.accept(gctx, uvm.outputListener, true)
 				uvm.outputListener = nil
+				progress("log socket accept completed", err)
 				if err != nil {
 					e.WithError(err).Error("failed to connect to log socket")
 					close(uvm.outputProcessingDone)
@@ -155,7 +189,9 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		}
 	}
 
+	progress("HCS start beginning", nil)
 	err = uvm.hcsSystem.Start(ctx)
+	progress("HCS start completed", err)
 	if err != nil {
 		return err
 	}
@@ -163,8 +199,11 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		if err != nil {
 			// use parent context, to prevent 2 minute timout (set above) from overridding terminate operation's
 			// timeout and erroring out prematurely
-			_ = uvm.hcsSystem.Terminate(pCtx)
-			_ = uvm.hcsSystem.WaitCtx(pCtx)
+			progress("startup failure cleanup beginning", err)
+			terminateErr := uvm.hcsSystem.Terminate(pCtx)
+			progress("startup cleanup terminate completed", terminateErr)
+			waitErr := uvm.hcsSystem.WaitCtx(pCtx)
+			progress("startup cleanup wait completed", waitErr)
 		}
 	}()
 
@@ -179,7 +218,12 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 		}
 		uvm.exitErr = err
 		close(uvm.exitCh)
+		progress("HCS VM wait completed", err)
 	}()
+
+	if observer != nil {
+		observer(ctx)
+	}
 
 	// Collect any errors from writing entropy or establishing the log
 	// connection.
@@ -189,8 +233,10 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 
 	if uvm.gcListener != nil {
 		// Accept the GCS connection.
+		progress("GCS socket accept beginning", nil)
 		conn, err := uvm.accept(ctx, uvm.gcListener, true)
 		uvm.gcListener = nil
+		progress("GCS socket accept completed", err)
 		if err != nil {
 			return fmt.Errorf("failed to connect to GCS: %w", err)
 		}

@@ -585,6 +585,8 @@ Example JSON document produced once the hcsschema.ComputeSytem returned by makeL
 */
 
 // Make the ComputeSystem document object that will be serialized to json to be presented to the HCS api.
+// Debug logging records the constructed kernel command line and init arguments
+// without changing them; callers should treat those diagnostics as configuration data.
 func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcsschema.ComputeSystem, err error) {
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {
 		log.G(ctx).WithField("options", log.Format(ctx, opts)).Trace("makeLCOWDoc")
@@ -910,6 +912,12 @@ func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 
 	kernelArgs += fmt.Sprintf(" nr_cpus=%d", opts.ProcessorCount)
 	kernelArgs += ` brd.rd_nr=0 pmtmr=0 -- ` + initArgs
+
+	log.G(ctx).WithField("uvm-id", uvm.id).
+		WithField("kernel-command-line", kernelArgs).
+		WithField("init-arguments", initArgs).
+		WithField("console-pipe", opts.ConsolePipe).
+		Debug("LCOW effective guest boot command")
 
 	if !opts.KernelDirect {
 		doc.VirtualMachine.Chipset.Uefi = &hcsschema.Uefi{

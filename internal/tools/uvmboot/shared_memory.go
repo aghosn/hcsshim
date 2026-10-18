@@ -121,12 +121,19 @@ func createSharedMemorySection(name string, size uint64) (*sharedMemorySection, 
 	return section, nil
 }
 
+// sharedMemorySectionNames returns the Win32 name and its absolute NT path.
+// Session zero uses the global object directory; interactive sessions use
+// their session-specific directories.
 func sharedMemorySectionNames(name string, sessionID uint32) (string, string, error) {
 	if strings.ContainsAny(name, `\/`) {
 		return "", "", fmt.Errorf(
 			"shared-memory section name %q must be a simple object name",
 			name,
 		)
+	}
+
+	if sessionID == 0 {
+		return name, `\BaseNamedObjects\` + name, nil
 	}
 
 	return name, fmt.Sprintf(
