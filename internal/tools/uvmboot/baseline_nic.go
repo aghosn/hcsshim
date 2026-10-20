@@ -55,6 +55,9 @@ func baselineCommand(ctx context.Context, c *cli.Context, vm *uvm.UtilityVM) (st
 		return "", nil, err
 	}
 	if c.IsSet(baselineNICArgName) {
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			return baselineNICUp(nic) + networkBenchmarkClient(c, "baseline"), cleanup, nil
+		}
 		// iperf retries its connect for 30s while the NIC comes up.
 		return baselineNICUp(nic) + hostEndpointTests(), cleanup, nil
 	}

@@ -3,15 +3,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
-
-	"github.com/Microsoft/go-winio/pkg/guid"
-
-	"github.com/Microsoft/hcsshim/internal/cpugroup"
-	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
 // The network benchmarks use iperf 2: a static Linux build shared into the
@@ -107,29 +101,4 @@ func parseCPUGroupLPs(s string) ([][]uint32, error) {
 		groups = append(groups, lps)
 	}
 	return groups, nil
-}
-
-// joinCPUGroup creates a host CPU group from uvmboot-N's processor list and
-// puts the UVM in it. On failure the UVM runs unpinned. It returns the
-// group's cleanup, or nil.
-func joinCPUGroup(ctx context.Context, id string, groups [][]uint32, options *uvm.OptionsLCOW) func() {
-	n, err := strconv.Atoi(strings.TrimPrefix(id, "uvmboot-"))
-	if err != nil || n >= len(groups) {
-		return nil
-	}
-	g, err := guid.NewV4()
-	if err == nil {
-		err = cpugroup.Create(ctx, g.String(), groups[n])
-	}
-	if err != nil {
-		fmt.Printf("cpu group: %s lps=%v failed: %v\n", id, groups[n], err)
-		return nil
-	}
-	options.CPUGroupID = g.String()
-	fmt.Printf("cpu group: %s id=%s lps=%v\n", id, g, groups[n])
-	return func() {
-		if err := cpugroup.Delete(ctx, g.String()); err != nil {
-			fmt.Printf("cpu group: %s delete failed: %v\n", id, err)
-		}
-	}
 }

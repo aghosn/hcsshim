@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -256,8 +257,26 @@ var lcowCommand = cli.Command{
 			Usage: "Pin each UVM to a host CPU group: semicolon-separated logical " +
 				"processor lists, the Nth for uvmboot-N, e.g. \"2,3;4,5\".",
 		},
+		cli.StringFlag{
+			Name:  networkBenchmarkScriptArgName,
+			Usage: "Run this network-only benchmark shell script against an external LAN iperf2 server.",
+		},
+		cli.StringFlag{
+			Name:  networkBenchmarkServerArgName,
+			Usage: "External LAN server IPv4 address (not this host or a test-network endpoint).",
+		},
+		cli.IntFlag{
+			Name:  networkBenchmarkPortArgName,
+			Value: 5201,
+			Usage: "External iperf2 base port; port+1 is used for concurrent bulk load.",
+		},
+		cli.DurationFlag{
+			Name:  networkBenchmarkTimeoutArgName,
+			Value: time.Hour,
+			Usage: "Hard deadline for the complete network-only VM run, including startup.",
+		},
 	},
-	Action: func(c *cli.Context) error {
+	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
 			return err
@@ -279,6 +298,33 @@ var lcowCommand = cli.Command{
 		if err != nil {
 			return err
 		}
+		if err := validateNetworkBenchmark(c, cpuGroupLPs); err != nil {
+			return err
+		}
+		benchmarkCtx := context.Background()
+		var cancelBenchmark context.CancelFunc
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			topology, err := hostProcessorTopology(benchmarkCtx)
+			if err != nil {
+				return err
+			}
+			if err := validateBenchmarkCPUs(topology, cpuGroupLPs); err != nil {
+				return err
+			}
+			siblingTests = map[string]bool{}
+			var cancel context.CancelFunc
+			benchmarkCtx, cancel = context.WithTimeout(benchmarkCtx, c.Duration(networkBenchmarkTimeoutArgName))
+			cancelBenchmark = cancel
+			defer cancel()
+		}
+		cpuGroups, err := prepareCPUGroups(context.Background(), cpuGroupLPs,
+			c.GlobalInt(countArgName), hostCPUGroupOperations)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			resultErr = errors.Join(resultErr, cpuGroups.close(context.Background()))
+		}()
 
 		if c.Bool(sharedMemoryGuestInventoryArgName) &&
 			(c.Bool(sharedMemoryMappingOnlyArgName) ||
@@ -391,8 +437,8 @@ var lcowCommand = cli.Command{
 				return fmt.Errorf("OpenShell bundle is not a regular file: %s", bundle)
 			}
 		}
-		if c.IsSet(baselineNICArgName) ||
-			(c.Bool(siblingDiodeUplinkArgName) && c.String(siblingOpenShellBundleArgName) == "") {
+		if c.String(networkBenchmarkScriptArgName) == "" && (c.IsSet(baselineNICArgName) ||
+			(c.Bool(siblingDiodeUplinkArgName) && c.String(siblingOpenShellBundleArgName) == "")) {
 			stop, err := startHostEndpoint()
 			if err != nil {
 				return err
@@ -485,20 +531,31 @@ var lcowCommand = cli.Command{
 			mappingMu      sync.Mutex
 			mappingAddress = make(map[string]uint32)
 		)
-		runMany(c, func(id string) error {
-			ctx := context.Background()
+		runMany(c, func(id string) (workerErr error) {
+			ctx := benchmarkCtx
+			defer func() {
+				if workerErr != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = workerErr
+					}
+					errMu.Unlock()
+					if cancelBenchmark != nil {
+						cancelBenchmark()
+					}
+				}
+			}()
 
 			options, err := createLCOWOptions(ctx, c, id)
 			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
 				return err
 			}
-			if deleteGroup := joinCPUGroup(ctx, id, cpuGroupLPs, options); deleteGroup != nil {
-				defer deleteGroup()
+			options.CPUGroupID, err = cpuGroups.groupForVM(id)
+			if err != nil {
+				return err
+			}
+			if options.CPUGroupID != "" {
+				fmt.Printf("cpu group: %s id=%s\n", id, options.CPUGroupID)
 			}
 			if c.Bool(securityHardwareFlag) {
 				defer os.RemoveAll(options.BundleDirectory)
@@ -558,13 +615,6 @@ var lcowCommand = cli.Command{
 					return nil
 				},
 			)
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
-			}
 			return err
 		})
 
@@ -662,18 +712,22 @@ var lcowCommand = cli.Command{
 				markerVerified = true
 			}
 		}
-		if section != nil && firstErr != nil {
-			if markerVerified {
-				logrus.WithError(firstErr).Warn(
-					"ignoring UVM lifecycle error after verified " +
-						"shared-memory marker",
-				)
-				return nil
-			}
-			return firstErr
-		}
-		return nil
+		return lcowLifecycleResult(firstErr, section != nil, markerVerified,
+			c.String(networkBenchmarkScriptArgName) != "")
 	},
+}
+
+func lcowLifecycleResult(err error, sharedMemory, markerVerified, networkBenchmark bool) error {
+	if err == nil || (!sharedMemory && !networkBenchmark) {
+		return nil
+	}
+	if markerVerified && !networkBenchmark {
+		logrus.WithError(err).Warn(
+			"ignoring UVM lifecycle error after verified shared-memory marker",
+		)
+		return nil
+	}
+	return err
 }
 
 func loadExecCommand(c *cli.Context) (string, error) {
@@ -897,13 +951,21 @@ func runLCOW(
 		string,
 		[]hcsschema.SharedMemoryRegionInfo,
 	) error,
-) error {
+) (resultErr error) {
 	vm, err := uvm.CreateLCOW(ctx, options)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		_ = vm.CloseCtx(ctx)
+		if c.String(networkBenchmarkScriptArgName) == "" {
+			_ = vm.CloseCtx(ctx)
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := vm.CloseCtx(cleanupCtx); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close UVM %s: %w", vm.ID(), err))
+		}
 	}()
 
 	var (
@@ -924,6 +986,19 @@ func runLCOW(
 
 	if err := vm.Start(ctx); err != nil {
 		return err
+	}
+	var stopSampling func() error
+	if c.String(networkBenchmarkScriptArgName) != "" {
+		if vm.ProcessorCount() != 2 {
+			return fmt.Errorf("network benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		}
+		stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
+		defer func() {
+			resultErr = errors.Join(resultErr, stopSampling())
+		}()
+		if err := shareNetworkBenchmark(ctx, c, vm); err != nil {
+			return err
+		}
 	}
 
 	if len(options.SharedMemoryRegions) > 0 {
@@ -1117,14 +1192,20 @@ func runLCOW(
 					}
 					defer cleanup()
 				}
-				execCommand += "; " + siblingBusGuestModuleCommand(
-					busModuleRoot+"/"+filepath.Base(busModulePath),
-					netModuleRoot+"/"+netModuleName,
-					vsockModuleRoot+"/diode_vsock.ko",
-					role,
-					netCfg,
-					uplink,
-				)
+				if c.String(networkBenchmarkScriptArgName) != "" {
+					execCommand += "; " + networkBenchmarkSiblingCommand(c,
+						busModuleRoot+"/"+filepath.Base(busModulePath),
+						netModuleRoot+"/"+netModuleName, role, netCfg, uplink)
+				} else {
+					execCommand += "; " + siblingBusGuestModuleCommand(
+						busModuleRoot+"/"+filepath.Base(busModulePath),
+						netModuleRoot+"/"+netModuleName,
+						vsockModuleRoot+"/diode_vsock.ko",
+						role,
+						netCfg,
+						uplink,
+					)
+				}
 			}
 		}
 	}
@@ -1153,6 +1234,11 @@ func runLCOW(
 	if options.UseGuestConnection {
 		if err := execViaGCS(ctx, vm, c, execCommand); err != nil {
 			return err
+		}
+		if stopSampling != nil {
+			if err := stopSampling(); err != nil {
+				return err
+			}
 		}
 		if siblingInteractive {
 			role, err := sharedMemoryProofRole(vm.ID())
