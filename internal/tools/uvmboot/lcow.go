@@ -713,15 +713,16 @@ var lcowCommand = cli.Command{
 			}
 		}
 		return lcowLifecycleResult(firstErr, section != nil, markerVerified,
-			c.String(networkBenchmarkScriptArgName) != "")
+			c.String(networkBenchmarkScriptArgName) != "" ||
+				c.String(siblingBusGuestModuleArgName) != "")
 	},
 }
 
-func lcowLifecycleResult(err error, sharedMemory, markerVerified, networkBenchmark bool) error {
-	if err == nil || (!sharedMemory && !networkBenchmark) {
+func lcowLifecycleResult(err error, sharedMemory, markerVerified, requireGuestSuccess bool) error {
+	if err == nil || (!sharedMemory && !requireGuestSuccess) {
 		return nil
 	}
-	if markerVerified && !networkBenchmark {
+	if markerVerified && !requireGuestSuccess {
 		logrus.WithError(err).Warn(
 			"ignoring UVM lifecycle error after verified shared-memory marker",
 		)
@@ -1104,10 +1105,6 @@ func runLCOW(
 				if err := vm.Share(ctx, bundle, "/run/openshell-bundle", true); err != nil {
 					return fmt.Errorf("share OpenShell bundle: %w", err)
 				}
-				vsockModulePath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock.ko")
-				if err := vm.Share(ctx, vsockModulePath, "/run/diode-vsock-module", true); err != nil {
-					return fmt.Errorf("share diode vsock module: %w", err)
-				}
 				var uplink *diodeUplink
 				var dns []string
 				if role == diodeRole {
@@ -1124,7 +1121,6 @@ func runLCOW(
 				}
 				openShellCommand, commandErr := siblingOpenShellGuestCommand(
 					busModuleRoot+"/"+filepath.Base(busModulePath),
-					"/run/diode-vsock-module/diode_vsock.ko",
 					"/run/openshell-bundle/"+filepath.Base(bundle), role, uplink, dns)
 				if commandErr != nil {
 					return commandErr
@@ -1135,14 +1131,13 @@ func runLCOW(
 				// net module (next to sibling_bus.ko on the host) is shared too.
 				const netModuleRoot = "/run/diode-net-module"
 				netModuleName := siblingNetModuleName(role)
-				netModulePath := filepath.Join(filepath.Dir(busModulePath), netModuleName)
-				if err := vm.Share(ctx, netModulePath, netModuleRoot, true); err != nil {
-					return fmt.Errorf("share diode net module: %w", err)
-				}
-				const vsockModuleRoot = "/run/diode-vsock-module"
-				vsockModulePath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock.ko")
-				if err := vm.Share(ctx, vsockModulePath, vsockModuleRoot, true); err != nil {
-					return fmt.Errorf("share diode vsock module: %w", err)
+				netModuleGuestPath := ""
+				if netModuleName != "" {
+					netModulePath := filepath.Join(filepath.Dir(busModulePath), netModuleName)
+					if err := vm.Share(ctx, netModulePath, netModuleRoot, true); err != nil {
+						return fmt.Errorf("share diode net module: %w", err)
+					}
+					netModuleGuestPath = netModuleRoot + "/" + netModuleName
 				}
 				vsockTestPath := filepath.Join(filepath.Dir(busModulePath), "diode_vsock_test")
 				if err := vm.Share(ctx, vsockTestPath, "/run/diode-vsock-test", true); err != nil {
@@ -1195,12 +1190,11 @@ func runLCOW(
 				if c.String(networkBenchmarkScriptArgName) != "" {
 					execCommand += "; " + networkBenchmarkSiblingCommand(c,
 						busModuleRoot+"/"+filepath.Base(busModulePath),
-						netModuleRoot+"/"+netModuleName, role, netCfg, uplink)
+						netModuleGuestPath, role, netCfg, uplink)
 				} else {
 					execCommand += "; " + siblingBusGuestModuleCommand(
 						busModuleRoot+"/"+filepath.Base(busModulePath),
-						netModuleRoot+"/"+netModuleName,
-						vsockModuleRoot+"/diode_vsock.ko",
+						netModuleGuestPath,
 						role,
 						netCfg,
 						uplink,
@@ -1418,7 +1412,7 @@ func sharedMemoryGuestModuleCommand(
 // The backend stays up until the workload closes the network channel.
 func siblingNetModuleName(role string) string {
 	if role == workloadRole {
-		return "diode_netvsc.ko"
+		return ""
 	}
 	return "diode_netvsp.ko"
 }
@@ -1444,7 +1438,8 @@ const siblingVsockStage = `cp /run/diode-vsock-test/diode_vsock_test /run/dtb-ex
 // dvsc0's byte counters.
 const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + siblingVsockStage + `snap() { set -- $(grep HYP: /proc/interrupts); shift; h=0; ` +
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
-	`for f in /sys/bus/vmbus/devices/*/channels/*/interrupts; do [ -r $f ] && c=$((c+$(cat $f))); done; ` +
+	`for p in /sys/bus/vmbus/devices/*; do case ${p##*/} in bus*-relid*) continue;; esac; ` +
+	`for f in "$p"/channels/*/interrupts; do [ -r "$f" ] && c=$((c+$(cat "$f"))); done; done; ` +
 	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
 	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
 	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; `
@@ -1547,8 +1542,10 @@ func (cfg siblingNetConfig) commandDNS() string {
 // diode. It needs siblingWorkloadStage, which stages $dtb. The host may
 // drop ICMP, so the diode's MASQUERADE counters are the definitive check.
 func siblingWorkloadEgressCommand(dnsServers []string) string {
-	return "echo \"diode_net: workload interfaces $(ls /sys/class/net | tr '\\n' ' ')" +
-		"nics=$(ls -d /sys/class/net/*/device 2>/dev/null | wc -l)\"; " +
+	return `root_nics=0; for n in /sys/class/net/*; do if [ -e "$n/device" ]; then ` +
+		`d=$(readlink -f "$n/device"); case ${d##*/} in bus*-relid*) :;; *) root_nics=$((root_nics+1));; esac; fi; done; ` +
+		"echo \"diode_net: workload interfaces $(ls /sys/class/net | tr '\\n' ' ')" +
+		"nics=$root_nics\"; " +
 		"echo \"diode_net: workload route $(ip route | grep default)\"; " +
 		"echo \"diode_net: workload resolv $(grep nameserver /etc/resolv.conf | tr '\\n' ' ')\"; " +
 		"for dst in " + diodeUplinkGateway + " 1.1.1.1; do " +
@@ -1560,49 +1557,101 @@ func siblingWorkloadEgressCommand(dnsServers []string) string {
 		"echo \"diode_net: egress $(\"$dtb\" connect ${dst%:*} ${dst#*:})\"; done; "
 }
 
+func siblingFailureDiagnosticsCommand() string {
+	return `echo 'sibling_vmbus: failure diagnostics' >&2; ` +
+		`for p in /sys/class/net/*; do [ -e "$p" ] || continue; ` +
+		`echo "sibling_vmbus: interface=${p##*/} device=$(readlink -f "$p/device" 2>/dev/null) driver=$(readlink "$p/device/driver" 2>/dev/null)" >&2; done; ` +
+		`for p in /sys/bus/vmbus/devices/bus*-relid*; do [ -e "$p" ] || continue; ` +
+		`echo "sibling_vmbus: device=${p##*/} driver=$(readlink "$p/driver" 2>/dev/null)" >&2; ` +
+		`for a in state in_read_index in_write_index out_read_index out_write_index; do ` +
+		`[ ! -r "$p/$a" ] || { echo "sibling_vmbus: $a=$(cat "$p/$a")" >&2; }; done; done; ` +
+		`for p in /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats; do ` +
+		`[ ! -r "$p" ] || { echo "$p" >&2; cat "$p" >&2; }; done; ` +
+		`dmesg >&2 || true; `
+}
+
 // guestWaitFor polls cond once a second for up to 30s, then fails the guest
 // command.
 func guestWaitFor(cond, what string) string {
 	return "i=0; until " + cond + "; do i=$((i+1)); [ $i -le 30 ] || " +
 		"{ echo " + shellSingleQuote("diode_net: "+what+" timed out") + " >&2; " +
-		"dmesg | grep -E 'sibling_bus:|diode_net|diode_vsock:' >&2 || true; exit 1; }; " +
+		siblingFailureDiagnosticsCommand() + "exit 1; }; " +
 		"sleep 1; done; "
 }
 
-func siblingVsockGuestModuleCommand(modulePath, role string) string {
+func siblingInstanceCommand() string {
+	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
+		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +
+		`sb_instance=$1; ` +
+		guestWaitFor(`[ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance"`, "common peer instance") +
+		`set -- $(cat "$sb_instance"); sb_bus=${1#*=}; sb_local=${2#*=}; sb_peer=${3#*=}; ` +
+		`[ "${4#*=}" = 2 ] || { echo 'sibling_vmbus: protocol version mismatch' >&2; exit 1; }; `
+}
+
+func siblingStockNICCommand(name string) string {
+	return guestWaitFor(`sb_net=; sb_count=0; for p in /sys/class/net/*; do `+
+		`d=$(readlink -f "$p/device" 2>/dev/null); case ${d##*/} in bus${sb_bus}-relid*) `+
+		`sb_net=${p##*/}; sb_count=$((sb_count+1));; esac; done; [ "$sb_count" -eq 1 ]`, "stock peer NIC") +
+		`[ "$(basename "$(readlink /sys/class/net/$sb_net/device/driver)")" = hv_netvsc ] || ` +
+		`{ echo 'diode_net: peer NIC is not stock hv_netvsc' >&2; exit 1; }; ` +
+		`if [ "$sb_net" != ` + shellSingleQuote(name) + ` ]; then ip link set "$sb_net" name ` + shellSingleQuote(name) +
+		` || { echo 'diode_net: peer NIC rename failed' >&2; exit 1; }; fi; ` +
+		`echo "diode_net: stock hv_netvsc registered if=` + name + ` bus=$sb_bus mac=$(cat /sys/class/net/` + name + `/address)"; `
+}
+
+func siblingVsockReadyCommand(role string) string {
 	cid, transportRole := 4, "diode"
 	if role == workloadRole {
 		cid, transportRole = 3, "workload"
 	}
-	ready := fmt.Sprintf("diode_vsock: vsock up: role=%s local_cid=%d", transportRole, cid)
-	return "insmod " + shellSingleQuote(modulePath) + " diode_cid=4 workload_cid=3 || " +
-		"{ dmesg | grep -F 'diode_vsock:' >&2; exit 1; }; " +
-		guestWaitFor("dmesg | grep -qF "+shellSingleQuote(ready), "vsock channel") +
-		"echo " + shellSingleQuote(ready) + "; "
+	ready := fmt.Sprintf("sibling_vmbus: stock hv_sock ready role=%s local_cid=%d", transportRole, cid)
+	return guestWaitFor(`[ -d /sys/bus/vmbus/drivers/hv_sock ]`, "stock hv_sock") +
+		fmt.Sprintf(`[ "$sb_local" = %d ] || { echo 'sibling_vmbus: local CID mismatch' >&2; exit 1; }; `, cid) +
+		`echo "` + ready + ` peer_cid=$sb_peer bus=$sb_bus"; `
 }
 
-func siblingBusGuestModuleCommand(modulePath, netModulePath, vsockModulePath, role string,
+func siblingVsockProofCommand(role string) string {
+	listenPort, peerPort := 6103, 6104
+	name := siblingRoleName(role)
+	if role == diodeRole {
+		listenPort, peerPort = peerPort, listenPort
+	}
+	return fmt.Sprintf(`/run/dtb-exec/vsock-test listen %d "$sb_local" >/tmp/sibling-vsock-listen.log 2>&1 & sb_vsock_pid=$!; `, listenPort) +
+		guestWaitFor(`grep -qF 'listening on vsock port' /tmp/sibling-vsock-listen.log`, "stock socket listener") +
+		fmt.Sprintf(`i=0; until /run/dtb-exec/vsock-test connect "$sb_peer" %d stock-vmbus-%s >/tmp/sibling-vsock-connect.log 2>&1; `, peerPort, name) +
+		`do i=$((i+1)); [ $i -le 30 ] || { cat /tmp/sibling-vsock-*.log >&2; ` +
+		siblingFailureDiagnosticsCommand() + `exit 1; }; sleep 1; done; ` +
+		`wait "$sb_vsock_pid" || { cat /tmp/sibling-vsock-listen.log >&2; ` +
+		siblingFailureDiagnosticsCommand() + `exit 1; }; ` +
+		`echo 'sibling_vmbus: stock hv_sock payload role=` + name + ` ok'; `
+}
+
+func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 	net siblingNetConfig, uplink *diodeUplink) string {
 	ifName := net.ifName
 	waitFor := guestWaitFor
-	cmd := fmt.Sprintf("insmod %s; insmod %s; ",
-		shellSingleQuote(modulePath),
-		shellSingleQuote(netModulePath)) +
-		waitFor("dmesg | grep -qE 'sibling_bus: (chan: relid=1 echo|bus: link broken)'",
-			"echo") +
+	cmd := "insmod " + shellSingleQuote(modulePath) + " || exit 1; "
+	if netModulePath != "" {
+		cmd += "insmod " + shellSingleQuote(netModulePath) + " || exit 1; "
+	}
+	cmd += waitFor("dmesg | grep -qE 'sibling_bus: chan: relid=1 echo'",
+		"echo") +
 		"dmesg | grep -F 'sibling_bus:'; " +
 		"echo \"diode_net: tools $(command -v ip ifconfig ping | tr '\\n' ' ')\"; " +
-		waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command() +
-		siblingVsockGuestModuleCommand(vsockModulePath, role)
+		siblingInstanceCommand() + siblingVsockReadyCommand(role)
 	if role == workloadRole {
-		cmd += waitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter")
+		cmd += siblingStockNICCommand(ifName)
+	}
+	cmd += waitFor("[ -e /sys/class/net/"+ifName+" ]", ifName) + net.command()
+	if role == workloadRole {
+		cmd += waitFor("[ \"$(cat /sys/class/net/"+ifName+"/carrier)\" = 1 ]", "stock packet filter")
 		if !siblingInteractive {
 			cmd += "if ping -c 8 -W 2 10.200.0.1; then echo 'diode_net: ping ok'; " +
 				"else echo 'diode_net: ping failed'; fi; "
 		}
 		cmd += siblingWorkloadStage
 		if siblingTests["checks"] {
-			cmd += siblingNetRelayCheck
+			cmd += siblingVsockProofCommand(role) + siblingNetRelayCheck
 		}
 		if net.gateway != "" {
 			// Benchmark the sibling link before NAT, like the VM-pair
@@ -1628,8 +1677,11 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, vsockModulePath, ro
 			}
 		}
 	} else {
-		cmd += siblingTCPBulkStage + siblingVsockStage +
-			"(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
+		cmd += siblingTCPBulkStage + siblingVsockStage
+		if siblingTests["checks"] {
+			cmd += siblingVsockProofCommand(role)
+		}
+		cmd += "(\"$dtb\" sink 5001 >/tmp/dn-tcp 2>&1 &); " +
 			fmt.Sprintf("(\"$ipf\" -s -p %d >/dev/null 2>&1 &); ", iperfLinkPort)
 		if uplink != nil {
 			// Install NAT once the workload has benchmarked the link (sink
@@ -1659,7 +1711,7 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, vsockModulePath, ro
 			mon = "mon"
 		}
 		if !siblingInteractive {
-			cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'diode_netvsp: channel closed'; do "+
+			cmd += fmt.Sprintf("i=0; until dmesg | grep -qF 'dvsp0: channel closed'; do "+
 				"i=$((i+1)); [ $i -le %d ] || break; %s; sleep 1; done; ", 2*benchSeconds+300, mon) +
 				"echo \"diode_net: listener $(tr '\\n' ' ' </tmp/dn-tcp 2>/dev/null)\"; "
 		}
@@ -1673,7 +1725,8 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, vsockModulePath, ro
 	}
 	cmd += "echo \"diode_net: " + ifName + " tx=$(cat /sys/class/net/" + ifName +
 		"/statistics/tx_packets) rx=$(cat /sys/class/net/" + ifName +
-		"/statistics/rx_packets)\"; dmesg | grep -E 'diode_net'"
+		"/statistics/rx_packets)\"; " +
+		`dmesg | grep -E 'diode_net|hv_netvsc' || [ "$?" -eq 1 ]`
 	return cmd
 }
 func logSharedMemoryRegions(

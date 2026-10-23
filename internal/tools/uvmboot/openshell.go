@@ -4,7 +4,7 @@ package main
 
 import "fmt"
 
-func siblingOpenShellGuestCommand(busModule, vsockModule, bundle, role string, uplink *diodeUplink, dns []string) (string, error) {
+func siblingOpenShellGuestCommand(busModule, bundle, role string, uplink *diodeUplink, dns []string) (string, error) {
 	if role != diodeRole && role != workloadRole {
 		return "", fmt.Errorf("unsupported OpenShell sibling role %q", role)
 	}
@@ -12,7 +12,7 @@ func siblingOpenShellGuestCommand(busModule, vsockModule, bundle, role string, u
 		return "", fmt.Errorf("OpenShell requires an uplink on the diode only")
 	}
 	command := "set -eu; umask 022; insmod " + shellSingleQuote(busModule) + "; " +
-		siblingVsockGuestModuleCommand(vsockModule, role) +
+		siblingInstanceCommand() + siblingVsockReadyCommand(role) +
 		"mkdir -p /run/openshell; " +
 		"mount -t tmpfs -o exec,nosuid,nodev,size=768m,mode=0700 tmpfs /run/openshell; " +
 		"tar -xf " + shellSingleQuote(bundle) + " -C /run/openshell; " +

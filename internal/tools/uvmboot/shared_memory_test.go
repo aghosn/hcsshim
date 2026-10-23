@@ -41,28 +41,117 @@ func TestShellSingleQuote(t *testing.T) {
 	}
 }
 
-func TestSiblingVsockGuestModuleCommand(t *testing.T) {
+func TestSiblingVsockReadyCommand(t *testing.T) {
 	for _, test := range []struct {
 		role  string
 		ready string
 	}{
-		{diodeRole, "diode_vsock: vsock up: role=diode local_cid=4"},
-		{workloadRole, "diode_vsock: vsock up: role=workload local_cid=3"},
+		{diodeRole, "sibling_vmbus: stock hv_sock ready role=diode local_cid=4"},
+		{workloadRole, "sibling_vmbus: stock hv_sock ready role=workload local_cid=3"},
 	} {
 		t.Run(test.role, func(t *testing.T) {
-			command := siblingVsockGuestModuleCommand("/run/module's/diode_vsock.ko", test.role)
+			command := siblingVsockReadyCommand(test.role)
 			for _, expected := range []string{
-				`insmod '/run/module'"'"'s/diode_vsock.ko' diode_cid=4 workload_cid=3 ||`,
+				"/sys/bus/vmbus/drivers/hv_sock",
 				"exit 1",
-				"until dmesg | grep -qF '" + test.ready + "'",
 				"[ $i -le 30 ]",
-				"echo '" + test.ready + "'",
+				`echo "` + test.ready,
 			} {
 				if !strings.Contains(command, expected) {
 					t.Fatalf("command %q does not contain %q", command, expected)
 				}
 			}
+			if strings.Contains(command, "insmod") || strings.Contains(command, "diode_vsock") {
+				t.Fatal("stock socket setup must not load the legacy transport")
+			}
 		})
+	}
+}
+
+func TestSiblingGuestDiscoversInstanceOnce(t *testing.T) {
+	for _, role := range []string{diodeRole, workloadRole} {
+		command := siblingBusGuestModuleCommand("/run/sibling_bus.ko",
+			"", role, siblingNetConfig{ifName: "dvsc0"}, nil)
+		if strings.Count(command, "sb_instance=$1;") != 1 {
+			t.Fatal("guest setup must discover its bus exactly once")
+		}
+		for _, expected := range []string{"/sibling_instance", `grep -q 'ready=1'`,
+			"sibling_vmbus: protocol version mismatch"} {
+			if !strings.Contains(command, expected) {
+				t.Fatalf("guest setup missing %q", expected)
+			}
+		}
+		if role == workloadRole && strings.Index(command, "sb_bus=${1#*=}") >
+			strings.Index(command, "bus${sb_bus}-relid*") {
+			t.Fatal("bus discovery must precede NIC selection")
+		}
+	}
+}
+
+func TestStockPeerNICIsSelectedByBusOwnership(t *testing.T) {
+	command := siblingStockNICCommand("dvsc0")
+	for _, expected := range []string{
+		"bus${sb_bus}-relid*", "hv_netvsc",
+		`[ "$sb_count" -eq 1 ]`, `ip link set "$sb_net" name 'dvsc0'`,
+		"stock hv_netvsc registered", "peer NIC rename failed",
+	} {
+		if !strings.Contains(command, expected) {
+			t.Fatalf("stock NIC setup missing %q", expected)
+		}
+	}
+	if siblingNetModuleName(workloadRole) != "" || siblingNetModuleName(diodeRole) != "diode_netvsp.ko" {
+		t.Fatal("only the provider needs an out-of-tree network module")
+	}
+}
+
+func TestSiblingGuestKernelLogAllowsNoMatchingMessages(t *testing.T) {
+	for _, role := range []string{diodeRole, workloadRole} {
+		command := siblingBusGuestModuleCommand("/run/sibling_bus.ko",
+			"", role, siblingNetConfig{ifName: "dvsc0"}, nil)
+		if !strings.HasSuffix(command,
+			`dmesg | grep -E 'diode_net|hv_netvsc' || [ "$?" -eq 1 ]`) {
+			t.Fatal("final diagnostic grep must accept no matches without suppressing grep errors")
+		}
+	}
+}
+
+func TestStockSocketProofUsesActualPeerAndVerifiedToolExit(t *testing.T) {
+	for _, role := range []string{diodeRole, workloadRole} {
+		command := siblingVsockProofCommand(role)
+		for _, expected := range []string{
+			`"$sb_local"`, `connect "$sb_peer"`, `wait "$sb_vsock_pid" ||`,
+			"listening on vsock port", "[ $i -le 30 ]", "exit 1",
+			"stock hv_sock payload role=" + siblingRoleName(role) + " ok",
+		} {
+			if !strings.Contains(command, expected) {
+				t.Fatalf("stock socket proof missing %q", expected)
+			}
+		}
+		if strings.Contains(command, "insmod") {
+			t.Fatal("payload proof must use the built-in transport")
+		}
+	}
+}
+
+func TestSiblingFailuresIncludeDeviceStateAndUnfilteredKernelLog(t *testing.T) {
+	for _, command := range []string{
+		guestWaitFor("false", "test"),
+		siblingVsockProofCommand(diodeRole),
+		siblingVsockProofCommand(workloadRole),
+	} {
+		for _, expected := range []string{
+			"sibling_vmbus: failure diagnostics",
+			"/sys/class/net/*", "/sys/bus/vmbus/devices/bus*-relid*",
+			`readlink "$p/driver"`, "in_read_index", "out_write_index",
+			"sibling_instance", "sibling_stats", "dmesg >&2 || true",
+		} {
+			if !strings.Contains(command, expected) {
+				t.Fatalf("failure diagnostics missing %q", expected)
+			}
+		}
+		if strings.Contains(command, "dmesg | grep") {
+			t.Fatal("failure diagnostics must not hide stock-driver probe errors")
+		}
 	}
 }
 

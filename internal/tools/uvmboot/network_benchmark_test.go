@@ -17,12 +17,12 @@ import (
 	"github.com/urfave/cli"
 )
 
-func TestNetworkBenchmarkNeverSuppressesGuestFailure(t *testing.T) {
+func TestValidatedGuestNeverSuppressesFailure(t *testing.T) {
 	failure := errors.New("guest process exited with exit code 1")
 	for _, sharedMemory := range []bool{false, true} {
 		for _, markerVerified := range []bool{false, true} {
 			if err := lcowLifecycleResult(failure, sharedMemory, markerVerified, true); !errors.Is(err, failure) {
-				t.Fatalf("lost benchmark error with sharedMemory=%v markerVerified=%v: %v",
+				t.Fatalf("lost validated guest error with sharedMemory=%v markerVerified=%v: %v",
 					sharedMemory, markerVerified, err)
 			}
 		}
@@ -174,7 +174,7 @@ func TestNetworkBenchmarkHostGateway(t *testing.T) {
 func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.T) {
 	c := benchmarkTestContext(t, "--network-benchmark-script", `C:\scripts\experiment.sh`,
 		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-port", "5201")
-	workload := networkBenchmarkSiblingCommand(c, "/bus.ko", "/netvsc.ko", workloadRole,
+	workload := networkBenchmarkSiblingCommand(c, "/bus.ko", "", workloadRole,
 		siblingNetConfig{ifName: "dvsc0", address: "10.200.0.2/30", gateway: "10.200.0.1"}, nil)
 	diode := networkBenchmarkSiblingCommand(c, "/bus.ko", "/netvsp.ko", diodeRole,
 		siblingNetConfig{ifName: "dvsp0", address: "10.200.0.1/30"},
@@ -199,5 +199,9 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 		!strings.Contains(workload, "dev dvsc0 ") || !strings.Contains(baseline, "hv_netvsc") ||
 		!strings.Contains(workload, "/bin/sh /run/dtb-exec/network-benchmark.sh 192.0.2.10 5201") {
 		t.Fatal("path verification or external script invocation missing")
+	}
+	if strings.Contains(workload, "insmod ''") || strings.Contains(workload, "netvsc.ko") ||
+		!strings.Contains(workload, "bus${sb_bus}-relid*") {
+		t.Fatal("stock peer NIC must be selected by its owning bus without loading a consumer module")
 	}
 }

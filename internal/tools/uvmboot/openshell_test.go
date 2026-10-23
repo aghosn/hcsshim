@@ -9,12 +9,12 @@ import (
 
 func TestOpenShellWorkloadHasOnlySiblingVsock(t *testing.T) {
 	command, err := siblingOpenShellGuestCommand(
-		"/bus.ko", "/vsock.ko", "/bundle's.tar", workloadRole, nil, nil)
+		"/bus.ko", "/bundle's.tar", workloadRole, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, required := range []string{
-		"set -eu;", "umask 022;", "insmod '/bus.ko'", "insmod '/vsock.ko'",
+		"set -eu;", "umask 022;", "insmod '/bus.ko'", "stock hv_sock ready",
 		"local_cid=3", "exec,nosuid,nodev,size=768m,mode=0700",
 		"127.0.0.53",
 		`tar -xf '/bundle'"'"'s.tar'`, "/run/openshell/start.sh workload",
@@ -24,7 +24,7 @@ func TestOpenShellWorkloadHasOnlySiblingVsock(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"diode_netvsc", "diode_netvsp", "ip addr", "ip route",
+		"diode_netvsc", "diode_netvsp", "diode_vsock", "ip addr", "ip route",
 		"MASQUERADE", "ip_forward", `"$dtb"`, "iperf",
 	} {
 		if strings.Contains(command, forbidden) {
@@ -35,7 +35,7 @@ func TestOpenShellWorkloadHasOnlySiblingVsock(t *testing.T) {
 
 func TestOpenShellDiodeHasUplinkWithoutNAT(t *testing.T) {
 	command, err := siblingOpenShellGuestCommand(
-		"/bus.ko", "/vsock.ko", "/bundle.tar", diodeRole,
+		"/bus.ko", "/bundle.tar", diodeRole,
 		&diodeUplink{address: "172.31.250.2/24", gateway: "172.31.250.1"}, []string{"1.1.1.1"})
 	if err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestOpenShellRejectsWrongRoleOrUplink(t *testing.T) {
 		{workloadRole, &diodeUplink{}, nil},
 		{diodeRole, &diodeUplink{}, nil},
 	} {
-		if _, err := siblingOpenShellGuestCommand("/bus", "/vsock", "/bundle", test.role, test.uplink, test.dns); err == nil {
+		if _, err := siblingOpenShellGuestCommand("/bus", "/bundle", test.role, test.uplink, test.dns); err == nil {
 			t.Fatalf("expected rejection for %+v", test)
 		}
 	}

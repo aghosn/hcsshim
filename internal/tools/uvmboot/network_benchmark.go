@@ -124,8 +124,9 @@ func networkBenchmarkPreflight(role, server string) string {
 func networkBenchmarkClient(c *cli.Context, role string) string {
 	server := c.String(networkBenchmarkServerArgName)
 	expected := "dvsc0"
-	deviceCheck := `for n in /sys/class/net/*; do [ ! -e "$n/device" ] || ` +
-		`{ echo 'network_benchmark: FAIL workload has an external NIC' >&2; exit 1; }; done; `
+	deviceCheck := `for n in /sys/class/net/*; do if [ -e "$n/device" ]; then ` +
+		`d=$(readlink -f "$n/device"); case ${d##*/} in bus${sb_bus}-relid*) :;; ` +
+		`*) echo 'network_benchmark: FAIL workload has an external NIC' >&2; exit 1;; esac; fi; done; `
 	if role == "baseline" {
 		expected = "$up"
 		deviceCheck = `[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
@@ -142,11 +143,17 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 
 func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role string,
 	cfg siblingNetConfig, uplink *diodeUplink) string {
-	command := "set -eu; insmod " + shellSingleQuote(module) + "; insmod " + shellSingleQuote(netModule) + "; " +
-		guestWaitFor("[ -e /sys/class/net/"+cfg.ifName+" ]", cfg.ifName) + cfg.command() +
+	command := "set -eu; insmod " + shellSingleQuote(module) + "; "
+	if netModule != "" {
+		command += "insmod " + shellSingleQuote(netModule) + "; "
+	}
+	if role == workloadRole {
+		command += siblingInstanceCommand() + siblingStockNICCommand(cfg.ifName)
+	}
+	command += guestWaitFor("[ -e /sys/class/net/"+cfg.ifName+" ]", cfg.ifName) + cfg.command() +
 		"set -eu; " + siblingTCPBulkStage + "set -eu; "
 	if role == workloadRole {
-		return command + guestWaitFor("dmesg | grep -qF 'diode_netvsc: rndis: set complete'", "packet filter") +
+		return command + guestWaitFor(`[ "$(cat /sys/class/net/dvsc0/carrier)" = 1 ]`, "stock packet filter") +
 			networkBenchmarkClient(c, "workload")
 	}
 	return command + siblingDiodeUplinkCommand(uplink, guestWaitFor) +
@@ -156,7 +163,7 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 		`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 		`{ echo 'network_benchmark: FAIL diode uplink is not synthetic hv_netvsc' >&2; exit 1; }; ` +
 		`echo 'network_benchmark: diode forwarding ready'; ` +
-		`until dmesg | grep -qF 'diode_netvsp: channel closed'; do sleep 1; done; ` +
+		`until dmesg | grep -qF 'dvsp0: channel closed'; do sleep 1; done; ` +
 		`"$ipt" iptables -t nat -L POSTROUTING -v -n -x; `
 }
 
