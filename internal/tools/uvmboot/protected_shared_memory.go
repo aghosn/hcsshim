@@ -155,11 +155,14 @@ func proofErrorText(err error) string {
 // prevents final resource release and is returned as failure, not a lab pass.
 // Valid forward progress/ownership is recorded before observing cancellation.
 // The original context is never rechecked after entering the cleanup budget.
+// A/B/C are owned before preparation; only A/B install before all pages seal.
+// C's first install must then be denied before repeated host probes and the
+// fresh A/B exchange. C remains a prepared owner requiring cleanup on denial.
 func executeProtectedProof(ctx context.Context, p *realProof, pages uint64, cleanupTimeout time.Duration) (err error) {
 	if pages == 0 || cleanupTimeout <= 0 {
 		return errors.New("invalid protected proof bounds")
 	}
-	participants := []string{"a", "b"}
+	participants := []string{"a", "b", "c"}
 	var initialized uint64
 	var uncertain bool
 	var attempted []string
@@ -242,6 +245,8 @@ func executeProtectedProof(ctx context.Context, p *realProof, pages uint64, clea
 		return err
 	}
 	for _, id := range participants {
+		// Own each attempt before acquisition: a failed start or missing receipt
+		// cannot remove that participant from the independent cleanup walk.
 		attempted = append(attempted, id)
 		if err = call(proofStep{Kind: "prepare", Participant: id}); err != nil {
 			return err
@@ -281,7 +286,16 @@ func executeProtectedProof(ctx context.Context, p *realProof, pages uint64, clea
 			return err
 		}
 	}
-	for _, kind := range []string{"negative-sealed", "exchange"} {
+	// C has only a backing pin/lifetime reference, never a guest mapping or
+	// loaded diagnostic. All page seals and the host probe precede its first
+	// genuine Install; only a fully classified denial permits A/B to exchange.
+	if err = call(proofStep{Kind: "negative-sealed"}); err != nil {
+		return err
+	}
+	if err = call(proofStep{Kind: "post-seal-C-install-denial", Participant: "c"}); err != nil {
+		return err
+	}
+	for _, kind := range []string{"negative-post-c-denial", "exchange"} {
 		if err = call(proofStep{Kind: kind}); err != nil {
 			return err
 		}
@@ -420,6 +434,8 @@ func (p *realProof) guest(ctx context.Context, id, command string) (string, erro
 // primary backing with no state file/paravisor; SNP requires state-file boot,
 // explicitly disabled HCL and non-overcommit primary backing.
 // Starting hidden backing prepares it but does not install a GPA mapping.
+// This applies equally to A/B/C: C only receives the module share here and
+// never executes it. Its early attachment retains pins, not an HV guest binding.
 // Requires a cached native preparation receipt before accepting the lease/GPA;
 // GPA is checked in bytes before retaining a 4-KiB page index. Missing framing
 // or failed creation returns an error with ownership/uncertainty preserved.
@@ -523,20 +539,35 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	return v.vm.Share(ctx, p.cli.String(sharedMemoryGuestModuleArgName), "/run/protected-module", true)
 }
 
-// install consumes the real action HRESULT and cached local installation flag,
-// not a native lifecycle receipt or controller observer. Successful range
-// ownership survives receipt-read errors for cleanup. Calls are serialized;
-// errors do not imply that the native mapping operation made no progress.
-func (p *realProof) install(ctx context.Context, id string) error {
+// attemptInstall submits the genuine Install request for the prepared participant
+// id using its retained lease and byte-length region. The caller serializes
+// action/read pairs and keeps p.resource borrowed through completion. It returns
+// raw action and independent receipt errors without classifying success/denial.
+// Any Installed flag updates local mapping ownership before cancellation,
+// evidence or error checks, even for malformed receipts, so cleanup can remove
+// unexpected mappings. No flag proves live native state or absence of progress.
+func (p *realProof) attemptInstall(ctx context.Context, id string) uvm.ProtectedSharedModifyOutcome {
 	v := p.vms[id]
 	request := v.region
 	request.HiddenFromGuest = false
 	request.ProtectedSharedOperation = hcsschema.ProtectedSharedInstall
-	info, mapErr := v.vm.ModifyProtectedShared(ctx, request, p.resource)
-	p.evidence.record("worker", map[string]any{"Participant": id, "Frame": info, "Error": proofErrorText(mapErr)})
-	if info != nil && info.Installed {
+	outcome := v.vm.ModifyProtectedSharedWithOutcome(ctx, request, p.resource)
+	if outcome.Receipt != nil && outcome.Receipt.Installed {
 		v.region.HiddenFromGuest = false
 	}
+	return outcome
+}
+
+// install requires the real Install action and complete cached local ownership
+// success for prepared participant id. Calls are serialized and borrow the
+// controller through completion; page/lease identity comes from p. Ownership is
+// retained before recording evidence, including on failure. Errors do not imply
+// zero native mapping progress; this is not a native lifecycle receipt/query.
+func (p *realProof) install(ctx context.Context, id string) error {
+	outcome := p.attemptInstall(ctx, id)
+	info := outcome.Receipt
+	mapErr := errors.Join(outcome.ActionError, outcome.ReceiptError)
+	p.evidence.record("worker", map[string]any{"Participant": id, "Frame": info, "Error": proofErrorText(mapErr)})
 	if err := uvm.ValidateProtectedSharedOperationResult(info, p.lease, p.pages); err != nil {
 		return errors.Join(mapErr, err)
 	}
@@ -548,6 +579,58 @@ func (p *realProof) install(ctx context.Context, id string) error {
 		return errors.New("incomplete protected installation")
 	}
 	return nil
+}
+
+// validatePostSealInstallDenial accepts only an issued Install's exact HV denial
+// with independent valid compact receipt, matching nonzero lease and 4-KiB page
+// count, and a live forward context (contextErr nil). It preserves outcome and
+// owns no resources; the caller serializes action/read pairs and must retain
+// participant ownership for cleanup even on error. This classifies cached
+// evidence, not native protection or precise rejection attribution.
+func validatePostSealInstallDenial(outcome uvm.ProtectedSharedModifyOutcome, lease, pages uint64, contextErr error) error {
+	if contextErr != nil {
+		return fmt.Errorf("post-seal installation context: %w", contextErr)
+	}
+	if !outcome.Dispatched {
+		return errors.New("post-seal installation was not dispatched")
+	}
+	if outcome.ReceiptError != nil {
+		return fmt.Errorf("post-seal installation receipt: %w", outcome.ReceiptError)
+	}
+	if lease == 0 || pages == 0 {
+		return errors.New("missing post-seal installation identity")
+	}
+	info := outcome.Receipt
+	if err := uvm.ValidateProtectedSharedOperationResultStructure(info, lease, pages); err != nil {
+		return err
+	}
+	// Install has no native lifecycle receipt. InitializedPages is cached from
+	// installation, not a live observation that the sealed lifetime is uninitialized.
+	if !info.Prepared || info.Installed || info.Removed || info.OperationResultValid ||
+		info.OperationHresult != uint32(windows.ERROR_HV_OPERATION_DENIED) {
+		return errors.New("post-seal installation did not report the exact unmapped HV denial")
+	}
+	// HCS SystemError/HcsError and ResultError wrappers expose a single cause
+	// ending in syscall.Errno. Do not use errors.Is/As to search an error tree:
+	// an expected status beside a transport/cancellation failure is not a pass.
+	actionErr := outcome.ActionError
+	if actionErr == nil {
+		return errors.New("post-seal installation action unexpectedly succeeded")
+	}
+	for actionErr != nil {
+		if status, ok := actionErr.(syscall.Errno); ok {
+			if status == windows.ERROR_HV_OPERATION_DENIED {
+				return nil
+			}
+			break
+		}
+		if _, joined := actionErr.(interface{ Unwrap() []error }); joined {
+			break
+		}
+		actionErr = errors.Unwrap(actionErr)
+	}
+	return fmt.Errorf("post-seal installation lacks the exact failed HCS action: %w",
+		outcome.ActionError)
 }
 
 // hostProbe tests the existing host mapping with fault-reporting Windows APIs.
@@ -654,6 +737,10 @@ func (p *realProof) exchange(ctx context.Context) error {
 // Cached worker receipts establish only local ownership; no page state is read.
 // Reclaim retries only known, framed zero-prefix preflight contention inside a
 // required deadline. Actual reclaim completion alone permits restored access.
+// The prepared barrier requires all three independent owners on the same lease.
+// The post-seal C step records separate raw action/receipt errors, then accepts
+// only the classifier's exact denial with a live context. Expected
+// rejection leaves C owned; even unexpected installation never bypasses cleanup.
 func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, err error) {
 	// Record the real dispatch outcome without changing its ownership/prefix.
 	// Forward work observes writer failure only after consuming that outcome.
@@ -708,10 +795,21 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	case "prepared":
 		// Read cached preparation receipts only. No participant count or HV
 		// snapshot is inferred, and no native control framing is fabricated.
-		for _, v := range p.vms {
+		if len(p.vms) != 3 || p.lease == 0 {
+			return out, errors.New("preparation barrier requires A/B/C and a lease")
+		}
+		for _, id := range []string{"a", "b", "c"} {
+			v := p.vms[id]
+			if v == nil || v.vm == nil || v.terminated || v.removed ||
+				v.region.ProtectedSharedLeaseId != p.lease {
+				return out, errors.New("preparation barrier missing a live matching owner")
+			}
 			var info *hcsschema.ProtectedSharedRegionInfo
 			info, err = v.vm.ProtectedSharedOperationResult(ctx, v.region)
 			if err != nil {
+				break
+			}
+			if err = uvm.ValidateProtectedSharedOperationResult(info, p.lease, p.pages); err != nil {
 				break
 			}
 			if !info.Prepared || info.Installed || info.Removed ||
@@ -765,10 +863,29 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 				p.reclaimed += uint64(r.PagesProcessed)
 			}
 		}
-	case "negative-ready", "negative-sealed":
+	case "negative-ready", "negative-sealed", "negative-post-c-denial":
 		err = p.hostProbe(true)
 	case "install":
 		err = p.install(ctx, step.Participant)
+	case "post-seal-C-install-denial":
+		// Keep the raw action and independent observation apart. attemptInstall
+		// retains any reported mapping ownership before classification/writes;
+		// Installed=false is cached evidence, not zero partial native progress.
+		v := p.vms[step.Participant]
+		outcome := p.attemptInstall(ctx, step.Participant)
+		contextErr := ctx.Err()
+		err = validatePostSealInstallDenial(outcome, p.lease, p.pages, contextErr)
+		p.evidence.record("post-seal-install", map[string]any{
+			"Participant": step.Participant, "ID": v.vm.ID(), "Runtime": fmt.Sprint(v.vm.RuntimeID()),
+			"LeaseId": p.lease, "GPA": v.gpn * 4096, "PageIndex": uint64(0), "PageCount": p.pages,
+			"Operation": hcsschema.ProtectedSharedInstall, "Dispatched": outcome.Dispatched,
+			"ActionError": proofErrorText(outcome.ActionError), "ActionStatus": proofWin32Status(outcome.ActionError),
+			"ReceiptError": proofErrorText(outcome.ReceiptError), "Frame": outcome.Receipt,
+			"ContextError": proofErrorText(contextErr), "Error": proofErrorText(err),
+			"LocalHiddenFromGuest": v.region.HiddenFromGuest, "ExpectedDenied": err == nil,
+			"UnexpectedSuccess": (outcome.Dispatched && outcome.ActionError == nil) ||
+				(outcome.Receipt != nil && outcome.Receipt.Installed),
+		})
 	case "exchange":
 		err = p.exchange(ctx)
 	case "remove":

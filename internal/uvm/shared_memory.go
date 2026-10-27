@@ -174,8 +174,22 @@ func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 // local owner flags and retained lease/page identity. It never queries native
 // state. A failed HRESULT/status is an error alongside the preserved receipt;
 // missing native validity is not zero progress or release authorization.
+// pages counts 4-KiB pages; lease zero permits retained-lease discovery.
 // Install/Remove legitimately have only HRESULT/local ownership outcomes.
+// The caller owns p and serializes access; validation does not change it.
 func ValidateProtectedSharedOperationResult(p *hcsschema.ProtectedSharedRegionInfo, lease, pages uint64) error {
+	if err := ValidateProtectedSharedOperationResultStructure(p, lease, pages); err != nil {
+		return err
+	}
+	return validateProtectedSharedOperationStatus(p)
+}
+
+// ValidateProtectedSharedOperationResultStructure checks compact v2 framing,
+// local owner consistency and lease/page identity without judging action success.
+// pages counts 4-KiB pages; lease zero permits discovery of the retained lease.
+// It reads caller-owned cached data only, not live native state. A nil error
+// does not authorize release or imply that the reported action succeeded.
+func ValidateProtectedSharedOperationResultStructure(p *hcsschema.ProtectedSharedRegionInfo, lease, pages uint64) error {
 	if p == nil || p.Version != 2 || p.LeaseId == 0 || p.PageCount == 0 ||
 		(lease != 0 && p.LeaseId != lease) || p.PageCount != pages ||
 		p.InitializedPages > pages ||
@@ -184,6 +198,13 @@ func ValidateProtectedSharedOperationResult(p *hcsschema.ProtectedSharedRegionIn
 		(p.Removed && (p.Prepared || p.Installed)) || (p.Installed && !p.Prepared) {
 		return fmt.Errorf("malformed or mismatched protected operation receipt")
 	}
+	return nil
+}
+
+// validateProtectedSharedOperationStatus rejects failed HRESULT/native status
+// while preserving the original diagnostics. p must already be structurally
+// validated; this reads cached status only and neither dispatches nor owns work.
+func validateProtectedSharedOperationStatus(p *hcsschema.ProtectedSharedRegionInfo) error {
 	if p.OperationHresult&0x80000000 != 0 ||
 		(p.OperationResultValid && p.OperationStatus&0x80000000 != 0) {
 		return fmt.Errorf("protected action failed: HRESULT=%#08x native-valid=%t status=%#08x processed=%d",
@@ -196,7 +217,22 @@ func ValidateProtectedSharedOperationResult(p *hcsschema.ProtectedSharedRegionIn
 // with ordinary SectionName/GPA properties. No native lifecycle/query occurs.
 // Callers serialize actions and receipt reads; this is not live page state.
 // Missing, mismatched or failed receipts return errors, never zero progress.
+// region.Length is bytes and its optional lease must match when nonzero.
+// The returned receipt remains available on status/structural failure.
 func (uvm *UtilityVM) ProtectedSharedOperationResult(ctx context.Context, region hcsschema.SharedMemoryRegion) (*hcsschema.ProtectedSharedRegionInfo, error) {
+	p, err := uvm.protectedSharedOperationReceipt(ctx, region)
+	if err == nil {
+		err = validateProtectedSharedOperationStatus(p)
+	}
+	return p, err
+}
+
+// protectedSharedOperationReceipt reads and structurally validates the cached
+// receipt for the region's section and lease, with Length in bytes. The caller
+// serializes actions and reads; returned data is not a live native observation.
+// Query/decode/identity errors remain separate from the cached action status,
+// and a returned malformed receipt must not be treated as validated progress.
+func (uvm *UtilityVM) protectedSharedOperationReceipt(ctx context.Context, region hcsschema.SharedMemoryRegion) (*hcsschema.ProtectedSharedRegionInfo, error) {
 	if err := ValidateProtectedSharedRegion(region); err != nil {
 		return nil, err
 	}
@@ -220,20 +256,32 @@ func (uvm *UtilityVM) ProtectedSharedOperationResult(ctx context.Context, region
 		return nil, err
 	}
 	p := found.ProtectedShared
-	return p, ValidateProtectedSharedOperationResult(p, region.ProtectedSharedLeaseId, uint64(region.Length)/4096)
+	return p, ValidateProtectedSharedOperationResultStructure(p, region.ProtectedSharedLeaseId, uint64(region.Length)/4096)
 }
 
-// ModifyProtectedShared checks a private action and borrows the controller
-// capability through HCS completion. Returns the cached receipt even on action
-// failure, joining real action failure with independent read/validation errors.
-// Unframed work is never zero progress. After cancellation, receipt reading has
-// a separate five-second budget; it dispatches no further lifecycle operation.
-func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource) (*hcsschema.ProtectedSharedRegionInfo, error) {
+// ProtectedSharedModifyOutcome separates an attempted HCS action from its
+// independent cached receipt observation. Dispatched means the validated request
+// was submitted to HCS ModifyWithResources, not proof of native execution.
+// ActionError includes preflight/submission/completion failure. ReceiptError
+// covers only acquisition, decoding and structural validation, never a failed
+// cached HRESULT. Receipt may be nonnil on either failure; flags must be retained
+// conservatively for cleanup. Counts are 4-KiB pages, not live page inventory.
+type ProtectedSharedModifyOutcome struct {
+	Dispatched   bool
+	ActionError  error
+	Receipt      *hcsschema.ProtectedSharedRegionInfo
+	ReceiptError error
+}
+
+// validateProtectedSharedModify checks region identity, byte/page bounds and
+// borrowed controller identity before submission. It neither dispatches work
+// nor transfers resource ownership; the capability must survive HCS completion.
+func validateProtectedSharedModify(region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource) error {
 	if err := ValidateProtectedSharedRegion(region); err != nil {
-		return nil, err
+		return err
 	}
 	if resource.URI != region.ProtectedSharedControllerUri || resource.Type != computecore.HcsResourceTypeFile {
-		return nil, fmt.Errorf("protected operation controller mismatch")
+		return fmt.Errorf("protected operation controller mismatch")
 	}
 	pages := uint64(region.Length) / 4096
 	switch region.ProtectedSharedOperation {
@@ -241,13 +289,13 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 		if !region.HiddenFromGuest || region.ProtectedSharedLeaseId != 0 ||
 			region.ProtectedSharedLifetimeId != 0 || region.ProtectedSharedPageIndex != 0 ||
 			region.ProtectedSharedPageCount != 0 {
-			return nil, fmt.Errorf("invalid protected preparation request")
+			return fmt.Errorf("invalid protected preparation request")
 		}
 	case hcsschema.ProtectedSharedInstall, hcsschema.ProtectedSharedRemove:
 		if region.ProtectedSharedLeaseId == 0 || region.ProtectedSharedLifetimeId != 0 ||
 			region.ProtectedSharedPageIndex != 0 || region.ProtectedSharedPageCount != 0 ||
 			(region.ProtectedSharedOperation == hcsschema.ProtectedSharedInstall && region.HiddenFromGuest) {
-			return nil, fmt.Errorf("invalid protected installation/removal request")
+			return fmt.Errorf("invalid protected installation/removal request")
 		}
 	case hcsschema.ProtectedSharedInitialize, hcsschema.ProtectedSharedSeal,
 		hcsschema.ProtectedSharedBeginTeardown, hcsschema.ProtectedSharedReclaim:
@@ -255,15 +303,34 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 			region.ProtectedSharedPageCount > 4 || region.ProtectedSharedPageIndex >= pages ||
 			uint64(region.ProtectedSharedPageCount) > pages-region.ProtectedSharedPageIndex ||
 			(region.ProtectedSharedOperation == hcsschema.ProtectedSharedInitialize && region.ProtectedSharedLifetimeId != 0) {
-			return nil, fmt.Errorf("invalid protected control range/identity")
+			return fmt.Errorf("invalid protected control range/identity")
 		}
 	default:
-		return nil, fmt.Errorf("unsupported protected shared-memory action")
+		return fmt.Errorf("unsupported protected shared-memory action")
+	}
+	return nil
+}
+
+// ModifyProtectedSharedWithOutcome validates and submits one private action,
+// borrowing resource through HCS completion without transferring ownership.
+// Callers serialize this entire action/read pair against all other actions and
+// receipt reads. Length is bytes; private ranges/counts use 4-KiB pages.
+// Preflight failure leaves Dispatched false and performs no receipt query.
+// After cancellation the independent cached read has a five-second budget;
+// ReceiptError never incorporates the action's failed HRESULT/native status.
+// A valid receipt is diagnostic evidence, not proof of zero work or safe release.
+func (uvm *UtilityVM) ModifyProtectedSharedWithOutcome(ctx context.Context, region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource) ProtectedSharedModifyOutcome {
+	var outcome ProtectedSharedModifyOutcome
+	if err := validateProtectedSharedModify(region, resource); err != nil {
+		outcome.ActionError = err
+		return outcome
 	}
 	if uvm.hcsSystem == nil {
-		return nil, fmt.Errorf("protected operation has no compute system")
+		outcome.ActionError = fmt.Errorf("protected operation has no compute system")
+		return outcome
 	}
-	err := uvm.hcsSystem.ModifyWithResources(ctx, &hcsschema.ModifySettingRequest{
+	outcome.Dispatched = true
+	outcome.ActionError = uvm.hcsSystem.ModifyWithResources(ctx, &hcsschema.ModifySettingRequest{
 		ResourcePath: resourcepaths.SharedMemoryRegionResourcePath,
 		RequestType:  "Update",
 		Settings:     region,
@@ -276,7 +343,25 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 		queryCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 	}
-	p, queryErr := uvm.ProtectedSharedOperationResult(queryCtx, region)
+	outcome.Receipt, outcome.ReceiptError = uvm.protectedSharedOperationReceipt(queryCtx, region)
+	return outcome
+}
+
+// ModifyProtectedShared borrows the controller through the serialized action/
+// cached-read pair and returns the receipt even on failure. Length is bytes;
+// control ranges are 4-KiB pages. It joins action and independent query/validation
+// errors and requires complete action-specific success evidence. Cancellation
+// retains the outcome helper's independent five-second query budget; unframed
+// work never means zero progress or release authorization.
+func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschema.SharedMemoryRegion, resource hcsv2.OperationResource) (*hcsschema.ProtectedSharedRegionInfo, error) {
+	outcome := uvm.ModifyProtectedSharedWithOutcome(ctx, region, resource)
+	if !outcome.Dispatched {
+		return outcome.Receipt, outcome.ActionError
+	}
+	p, queryErr := outcome.Receipt, outcome.ReceiptError
+	if queryErr == nil {
+		queryErr = validateProtectedSharedOperationStatus(p)
+	}
 	if queryErr == nil {
 		switch region.ProtectedSharedOperation {
 		case hcsschema.ProtectedSharedInstall:
@@ -298,5 +383,5 @@ func (uvm *UtilityVM) ModifyProtectedShared(ctx context.Context, region hcsschem
 			}
 		}
 	}
-	return p, errors.Join(err, queryErr)
+	return p, errors.Join(outcome.ActionError, queryErr)
 }

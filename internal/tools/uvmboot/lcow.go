@@ -70,19 +70,20 @@ var lcowCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  protectedModeFlag,
-			Usage: "Private CPU-only manual lifecycle: m1 only. Creates two fresh owned VMs; " +
+			Usage: "Private CPU-only manual lifecycle: m1 only. Prepares three fresh owned VMs; " +
+				"maps A/B, seals pages, requires C's first install denied, then exchanges A/B. " +
 				"plain direct-kernel/vhd boot by default, SNP VMGS/none boot with --security-hardware=true.",
 		},
 		cli.DurationFlag{
 			Name:  protectedTimeoutFlag,
 			Value: 3 * time.Minute,
-			Usage: "Time budget for M1 creation, setup and guest exchange, not a VM lifetime limit " +
+			Usage: "Time budget for three-UVM M1 startup, preparation, A/B mapping, seal, C denial and A/B exchange, not a VM lifetime limit " +
 				"(greater than 0, at most 10m). In-flight native VID calls are not forcibly interrupted.",
 		},
 		cli.DurationFlag{
 			Name:  protectedCleanupFlag,
 			Value: 2 * time.Minute,
-			Usage: "Fresh, independent budget for safe M1 cleanup after success, failure or forward timeout " +
+			Usage: "Fresh, independent budget for safe M1 cleanup of all three UVMs and backing after success, failure or forward timeout " +
 				"(greater than 0, at most 10m). Expiry does not force backing release.",
 		},
 		cli.StringSliceFlag{
