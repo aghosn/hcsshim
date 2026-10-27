@@ -31,6 +31,12 @@ import (
 
 var validID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,95}$`)
 
+const (
+	protocolVersion  = 3
+	maxTrialDuration = 10 * time.Minute
+	accessViolation  = "iperf-access-violation"
+)
+
 type capturedOutput struct {
 	mu    sync.Mutex
 	data  bytes.Buffer
@@ -64,9 +70,19 @@ type listener struct {
 	err  error
 }
 
-func startListener(binary, bind string, port int) (*listener, error) {
+func listenerArgs(bind string, port int, latency bool) []string {
+	args := []string{"-s", "-B", bind, "-p", strconv.Itoa(port), "-e", "-f", "m", "--utc"}
+	if latency || runtime.GOOS == "windows" {
+		// On Windows, -i 1 also makes a 500 ms receive timeout fatal.
+		// Bound Windows bulk and RTT listeners by the trial deadline instead.
+		return append(args, "-t", strconv.Itoa(int(maxTrialDuration/time.Second)))
+	}
+	return append(args, "-i", "1")
+}
+
+func startListener(binary, bind string, port int, latency bool) (*listener, error) {
 	out := &capturedOutput{ready: make(chan struct{})}
-	cmd := exec.Command(binary, "-s", "-B", bind, "-p", strconv.Itoa(port), "-e", "-f", "m", "-i", "1", "--utc")
+	cmd := exec.Command(binary, listenerArgs(bind, port, latency)...)
 	for _, env := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(env), "IPERF_") {
 			cmd.Env = append(cmd.Env, env)
@@ -97,47 +113,66 @@ func (l *listener) stop() (string, float64, error) {
 	var result error
 	select {
 	case <-l.done:
-		result = fmt.Errorf("iperf listener exited unexpectedly: %v", l.err)
+		if l.err == nil {
+			result = errors.New("iperf listener exited unexpectedly with status 0")
+		} else {
+			result = fmt.Errorf("iperf listener exited unexpectedly: %w", l.err)
+		}
 	default:
 		if err := l.cmd.Process.Kill(); err != nil {
 			result = fmt.Errorf("stop iperf listener: %w", err)
 		}
 		<-l.done
+		if result != nil && l.err != nil {
+			result = fmt.Errorf("%w; process exit: %w", result, l.err)
+		}
 	}
 	cpu := l.cmd.ProcessState.UserTime() + l.cmd.ProcessState.SystemTime()
 	return l.out.String(), cpu.Seconds(), result
 }
 
 type trialResult struct {
-	ID            string    `json:"id"`
-	StartedUTC    time.Time `json:"started_utc"`
-	EndedUTC      time.Time `json:"ended_utc"`
-	OS            string    `json:"os"`
-	CPUs          int       `json:"cpus"`
-	Primary       string    `json:"primary"`
-	Load          string    `json:"load"`
-	ServerCPUTime float64   `json:"server_cpu_seconds"`
-	Failure       string    `json:"failure,omitempty"`
+	ID                  string    `json:"id"`
+	StartedUTC          time.Time `json:"started_utc"`
+	EndedUTC            time.Time `json:"ended_utc"`
+	OS                  string    `json:"os"`
+	CPUs                int       `json:"cpus"`
+	Primary             string    `json:"primary"`
+	PrimaryLatency      bool      `json:"primary_latency"`
+	BulkIntervalSeconds int       `json:"bulk_interval_seconds"`
+	Load                string    `json:"load"`
+	ServerCPUTime       float64   `json:"server_cpu_seconds"`
+	Failure             string    `json:"failure,omitempty"`
+	FailureKind         string    `json:"failure_kind,omitempty"`
+	Attempt             int       `json:"attempt,omitempty"`
 }
 
 type controller struct {
-	mu          sync.Mutex
-	token       string
-	binary      string
-	bind        string
-	port        int
-	output      string
-	active      string
-	seen        map[string]bool
-	started     time.Time
-	servers     []*listener
-	timer       *time.Timer
-	iperfSHA256 string
+	mu             sync.Mutex
+	token          string
+	binary         string
+	bind           string
+	port           int
+	output         string
+	active         string
+	seen           map[string]bool
+	started        time.Time
+	servers        []*listener
+	timer          *time.Timer
+	iperfSHA256    string
+	primaryLatency bool
+	attempt        int
+	lastResult     *trialResult
 }
 
 func (c *controller) finish(failure string) trialResult {
 	result := trialResult{ID: c.active, StartedUTC: c.started,
-		OS: runtime.GOOS, CPUs: runtime.NumCPU(), Failure: failure}
+		OS: runtime.GOOS, CPUs: runtime.NumCPU(), Failure: failure,
+		PrimaryLatency: c.primaryLatency, Attempt: c.attempt}
+	retryable := failure == ""
+	if runtime.GOOS != "windows" {
+		result.BulkIntervalSeconds = 1
+	}
 	if c.timer != nil {
 		c.timer.Stop()
 	}
@@ -145,6 +180,11 @@ func (c *controller) finish(failure string) trialResult {
 		text, cpu, err := server.stop()
 		if err != nil {
 			result.Failure += "; " + err.Error()
+			var exitError *exec.ExitError
+			if i != 1 || runtime.GOOS != "windows" || !errors.As(err, &exitError) ||
+				uint32(exitError.ExitCode()) != 0xc0000005 {
+				retryable = false
+			}
 		}
 		if i == 0 {
 			result.Primary = text
@@ -154,15 +194,36 @@ func (c *controller) finish(failure string) trialResult {
 		result.ServerCPUTime += cpu
 	}
 	result.EndedUTC = time.Now().UTC()
+	if retryable && result.Failure != "" {
+		result.FailureKind = accessViolation
+	}
 	data, err := json.MarshalIndent(result, "", "  ")
 	if err == nil {
 		err = os.WriteFile(filepath.Join(c.output, c.active+".json"), data, 0600)
 	}
 	if err != nil {
 		result.Failure += "; save server result: " + err.Error()
+		result.FailureKind = ""
 	}
 	c.active, c.servers = "", nil
+	c.primaryLatency = false
+	c.lastResult = &result
 	return result
+}
+
+func (c *controller) archiveFailedAttempt() error {
+	data, err := json.MarshalIndent(c.lastResult, "", "  ")
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(c.output, c.lastResult.ID+".failed-attempt-0.json"),
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeError := file.Write(data)
+	closeError := file.Close()
+	return errors.Join(writeError, closeError)
 }
 
 func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +234,7 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	if r.Method == http.MethodGet && r.URL.Path == "/health" {
-		_ = json.NewEncoder(w).Encode(map[string]any{"protocol": 1, "os": runtime.GOOS, "cpus": runtime.NumCPU(),
+		_ = json.NewEncoder(w).Encode(map[string]any{"protocol": protocolVersion, "os": runtime.GOOS, "cpus": runtime.NumCPU(),
 			"iperf_version": "2.2.1", "iperf_sha256": c.iperfSHA256})
 		return
 	}
@@ -183,12 +244,31 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"active_id": c.active})
 		return
 	}
+	if r.Method == http.MethodGet && r.URL.Path == "/result" {
+		id := r.URL.Query().Get("id")
+		if !validID.MatchString(id) {
+			http.Error(w, "invalid trial ID", http.StatusBadRequest)
+			return
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.active == id {
+			http.Error(w, "trial is still active", http.StatusConflict)
+		} else if c.lastResult == nil || c.lastResult.ID != id {
+			http.Error(w, "no completed result for this ID", http.StatusNotFound)
+		} else {
+			_ = json.NewEncoder(w).Encode(c.lastResult)
+		}
+		return
+	}
 	if r.Method != http.MethodPost || (r.URL.Path != "/begin" && r.URL.Path != "/end") {
 		http.Error(w, "use POST /begin or /end", http.StatusMethodNotAllowed)
 		return
 	}
 	var request struct {
-		ID string `json:"id"`
+		ID             string `json:"id"`
+		PrimaryLatency bool   `json:"primary_latency"`
+		Retry          bool   `json:"retry"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
 	decoder.DisallowUnknownFields()
@@ -204,14 +284,29 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if r.URL.Path == "/begin" {
-		if c.active != "" || c.seen[request.ID] {
+		if c.active != "" || (!request.Retry && c.seen[request.ID]) {
 			http.Error(w, "another trial is active or this ID was already used", http.StatusConflict)
 			return
 		}
+		c.attempt = 0
+		if request.Retry {
+			if c.lastResult == nil || c.lastResult.ID != request.ID ||
+				c.lastResult.FailureKind != accessViolation || c.lastResult.Attempt != 0 ||
+				c.lastResult.PrimaryLatency != request.PrimaryLatency {
+				http.Error(w, "trial is not eligible for a server-crash retry", http.StatusConflict)
+				return
+			}
+			if err := c.archiveFailedAttempt(); err != nil {
+				http.Error(w, "preserve failed server attempt: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			c.attempt = 1
+		}
 		c.active, c.started = request.ID, time.Now().UTC()
+		c.primaryLatency = request.PrimaryLatency
 		c.seen[request.ID] = true
-		for _, port := range []int{c.port, c.port + 1} {
-			server, err := startListener(c.binary, c.bind, port)
+		for i, port := range []int{c.port, c.port + 1} {
+			server, err := startListener(c.binary, c.bind, port, i == 0 && c.primaryLatency)
 			if err != nil {
 				result := c.finish(err.Error())
 				w.WriteHeader(http.StatusInternalServerError)
@@ -221,10 +316,11 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			c.servers = append(c.servers, server)
 		}
 		id := c.active
-		c.timer = time.AfterFunc(10*time.Minute, func() {
+		attempt := c.attempt
+		c.timer = time.AfterFunc(maxTrialDuration, func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			if c.active == id {
+			if c.active == id && c.attempt == attempt {
 				result := c.finish("trial exceeded the 10-minute server deadline")
 				log.Printf("trial %s failed: %s", id, result.Failure)
 			}
