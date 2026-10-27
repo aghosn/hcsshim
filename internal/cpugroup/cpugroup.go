@@ -15,6 +15,31 @@ import (
 
 const NullGroupID = "00000000-0000-0000-0000-000000000000"
 
+// MaxSchedulingPriority is the highest Hyper-V CPU group scheduling priority.
+const MaxSchedulingPriority uint32 = 7
+
+type setPropertyOperation struct {
+	GroupId       string
+	PropertyCode  uint32
+	PropertyValue uint64
+}
+
+// SetSchedulingPriority sets a CPU group's scheduling priority (0 through 7).
+func SetSchedulingPriority(ctx context.Context, id string, priority uint32) error {
+	if priority > MaxSchedulingPriority {
+		return fmt.Errorf("CPU group scheduling priority %d exceeds %d", priority, MaxSchedulingPriority)
+	}
+	details := &setPropertyOperation{
+		GroupId:       strings.ToLower(id),
+		PropertyCode:  hcsschema.CPUSchedulingPriorityProperty,
+		PropertyValue: uint64(priority),
+	}
+	if err := modifyCPUGroupRequest(ctx, hcsschema.SetProperty, details); err != nil {
+		return errors.Wrapf(err, "failed to set CPU group %s scheduling priority to %d", id, priority)
+	}
+	return nil
+}
+
 // ErrHVStatusInvalidCPUGroupState corresponds to the internal error code for HV_STATUS_INVALID_CPU_GROUP_STATE
 var ErrHVStatusInvalidCPUGroupState = errors.New("The hypervisor could not perform the operation because the CPU group is entering or in an invalid state.")
 
@@ -63,6 +88,9 @@ func GetCPUGroupConfig(ctx context.Context, id string) (*hcsschema.CpuGroupConfi
 	cpuGroupsPresent, err := hcs.GetServiceProperties(ctx, query)
 	if err != nil {
 		return nil, err
+	}
+	if len(cpuGroupsPresent.Properties) != 1 {
+		return nil, fmt.Errorf("expected one CPU group configuration property, got %d", len(cpuGroupsPresent.Properties))
 	}
 	groupConfigs := &hcsschema.CpuGroupConfigurations{}
 	if err := json.Unmarshal(cpuGroupsPresent.Properties[0], groupConfigs); err != nil {

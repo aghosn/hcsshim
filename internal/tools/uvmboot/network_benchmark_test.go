@@ -185,6 +185,7 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 			if !strings.Contains(command, required) {
 				t.Fatalf("missing mandatory preflight %q in %s", required, command)
 			}
+
 		}
 		for _, forbidden := range []string{"openshell", "iperf -s", "ipbench ", "ping -", "mon()", "insmod '/diode_vsock", "ip -details"} {
 			if strings.Contains(command, forbidden) {
@@ -203,5 +204,25 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 	if strings.Contains(workload, "insmod ''") || strings.Contains(workload, "netvsc.ko") ||
 		!strings.Contains(workload, "bus${sb_bus}-relid*") {
 		t.Fatal("stock peer NIC must be selected by its owning bus without loading a consumer module")
+	}
+}
+
+func TestNetworkBenchmarkNoSMTRecordsTopologyAndPreservesPreflight(t *testing.T) {
+	for _, role := range []string{"diode", "workload"} {
+		command := networkBenchmarkPreflight(role, "192.0.2.10", true)
+		for _, required := range []string{"SEV-SNP", "expected exactly two online VPs",
+			"thread_siblings_list", "guest_topology", "host_smt=disabled", "idle=poll",
+			"iperf version 2.2.1", "ip route get 192.0.2.10"} {
+			if !strings.Contains(command, required) {
+				t.Fatalf("missing SMT-off preflight %q", required)
+			}
+		}
+		if strings.Contains(command, "guest virtual SMT pair missing") || strings.Contains(command, "threads_per_core=2") {
+			t.Fatal("SMT-off preflight still assumes guest SMT")
+		}
+	}
+	c := benchmarkTestContext(t, "--network-benchmark-no-smt")
+	if err := validateNetworkBenchmark(c, nil); err == nil {
+		t.Fatal("SMT-off flag accepted outside a benchmark")
 	}
 }

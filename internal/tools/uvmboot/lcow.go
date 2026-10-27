@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -258,6 +259,11 @@ var lcowCommand = cli.Command{
 				"processor lists, the Nth for uvmboot-N, e.g. \"2,3;4,5\".",
 		},
 		cli.StringFlag{
+			Name: cpuGroupPrioritiesArgName,
+			Usage: "Optional comma-separated scheduling priorities (0-7), one per UVM. " +
+				"Requires CPU affinity; creates distinct groups even for identical LP lists.",
+		},
+		cli.StringFlag{
 			Name:  networkBenchmarkScriptArgName,
 			Usage: "Run this network-only benchmark shell script against an external LAN iperf2 server.",
 		},
@@ -274,6 +280,10 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkTimeoutArgName,
 			Value: time.Hour,
 			Usage: "Hard deadline for the complete network-only VM run, including startup.",
+		},
+		cli.BoolFlag{
+			Name:  networkBenchmarkNoSMTArgName,
+			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
@@ -298,6 +308,13 @@ var lcowCommand = cli.Command{
 		if err != nil {
 			return err
 		}
+		cpuGroupPriorities, err := parseCPUGroupPriorities(c.String(cpuGroupPrioritiesArgName))
+		if err != nil {
+			return err
+		}
+		if c.IsSet(cpuGroupPrioritiesArgName) && len(cpuGroupPriorities) == 0 {
+			return fmt.Errorf("--%s cannot be empty", cpuGroupPrioritiesArgName)
+		}
 		if err := validateNetworkBenchmark(c, cpuGroupLPs); err != nil {
 			return err
 		}
@@ -308,7 +325,7 @@ var lcowCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			if err := validateBenchmarkCPUs(topology, cpuGroupLPs); err != nil {
+			if err := validateBenchmarkCPUs(topology, cpuGroupLPs, c.Bool(networkBenchmarkNoSMTArgName)); err != nil {
 				return err
 			}
 			siblingTests = map[string]bool{}
@@ -318,13 +335,20 @@ var lcowCommand = cli.Command{
 			defer cancel()
 		}
 		cpuGroups, err := prepareCPUGroups(context.Background(), cpuGroupLPs,
-			c.GlobalInt(countArgName), hostCPUGroupOperations)
+			c.GlobalInt(countArgName), hostCPUGroupOperations, cpuGroupPriorities...)
 		if err != nil {
 			return err
 		}
 		defer func() {
 			resultErr = errors.Join(resultErr, cpuGroups.close(context.Background()))
 		}()
+		for _, report := range cpuGroups.reports {
+			data, err := json.Marshal(report)
+			if err != nil {
+				return fmt.Errorf("encode CPU group configuration: %w", err)
+			}
+			fmt.Printf("cpu_group_config: %s\n", data)
+		}
 
 		if c.Bool(sharedMemoryGuestInventoryArgName) &&
 			(c.Bool(sharedMemoryMappingOnlyArgName) ||
