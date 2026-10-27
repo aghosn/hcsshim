@@ -497,7 +497,7 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 			"Participant": id, "Stage": "after-hcs-start-query-end",
 			"Frame": info, "Error": proofErrorText(queryErr),
 			"ContextError": proofErrorText(queryCtx.Err()),
-			"Elapsed": time.Since(started).String(), "DiagnosticOnly": true,
+			"Elapsed":      time.Since(started).String(), "DiagnosticOnly": true,
 		})
 	}); err != nil {
 		return err
@@ -533,7 +533,7 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 		"Runtime": fmt.Sprint(v.vm.RuntimeID()), "GPA": address, "LeaseId": p.lease,
 		"GuestMode": p.guestMode(), "GuestStateFileBoot": options.GuestStateFilePath != "",
 		"KernelDirect": options.GuestStateFilePath == "" && options.KernelDirect,
-		"KernelFile": options.KernelFile, "RootFSFile": options.RootFSFile,
+		"KernelFile":   options.KernelFile, "RootFSFile": options.RootFSFile,
 		"AllowOvercommit": options.AllowOvercommit, "FullyPhysicallyBacked": options.FullyPhysicallyBacked,
 		"HclEnabled": options.HclEnabled, "DmVerityMode": options.DmVerityMode})
 	return v.vm.Share(ctx, p.cli.String(sharedMemoryGuestModuleArgName), "/run/protected-module", true)
@@ -635,9 +635,11 @@ func validatePostSealInstallDenial(outcome uvm.ProtectedSharedModifyOutcome, lea
 
 // hostProbe tests the existing host mapping with fault-reporting Windows APIs.
 // After revocation ONLY named negative probes may attempt access. Both denial
-// statuses and zero byte counts are required; probe output never formats data.
+// statuses and zero byte counts are required on every page. Positive controls
+// seed/check offset 256 in each page; probe output never formats protected data.
 func (p *realProof) hostProbe(negative bool) error {
-	if p.section == nil || p.section.view == 0 || p.section.size < 4096 ||
+	if p.section == nil || p.section.view == 0 || p.pages == 0 ||
+		p.pages > 4096 || p.section.size != p.pages*4096 ||
 		p.section.protected != negative {
 		return errors.New("host probe phase/mapping mismatch")
 	}
@@ -645,34 +647,39 @@ func (p *realProof) hostProbe(negative bool) error {
 	if err != nil {
 		return err
 	}
-	var data [8]byte
-	var read, written uintptr
-	address := p.section.view + 256
-	readErr := windows.ReadProcessMemory(process, address, &data[0], 8, &read)
 	writeData := []byte("BADWRITE")
 	if !negative {
 		writeData = []byte("HOSTKEEP")
 	}
-	writeErr := windows.WriteProcessMemory(process, address, &writeData[0], 8, &written)
-	p.evidence.record("host", map[string]any{"Negative": negative,
-		"ReadStatus": proofWin32Status(readErr), "ReadBytes": read,
-		"WriteStatus": proofWin32Status(writeErr), "WriteBytes": written})
-	if negative {
-		// Both APIs report actual access failure. Unrelated setup errors (such
-		// as invalid handles) are not accepted as proof of CPU denial.
-		denied := func(e error) bool {
-			return errors.Is(e, windows.ERROR_PARTIAL_COPY) || errors.Is(e, windows.ERROR_NOACCESS)
+	for page := uint64(0); page < p.pages; page++ {
+		offset := page*4096 + 256
+		address := p.section.view + uintptr(offset)
+		var data [8]byte
+		var read, written uintptr
+		readErr := windows.ReadProcessMemory(process, address, &data[0], 8, &read)
+		writeErr := windows.WriteProcessMemory(process, address, &writeData[0], 8, &written)
+		p.evidence.record("host", map[string]any{"Negative": negative, "PageIndex": page, "Offset": offset,
+			"ReadStatus": proofWin32Status(readErr), "ReadBytes": read,
+			"WriteStatus": proofWin32Status(writeErr), "WriteBytes": written})
+		if negative {
+			// Unrelated setup failures cannot stand in for direct CPU denial.
+			denied := func(e error) bool {
+				return errors.Is(e, windows.ERROR_PARTIAL_COPY) || errors.Is(e, windows.ERROR_NOACCESS)
+			}
+			if !denied(readErr) || !denied(writeErr) || read != 0 || written != 0 {
+				return fmt.Errorf("direct host negative probe failed acceptance on page %d", page)
+			}
+			continue
 		}
-
-		if !denied(readErr) || !denied(writeErr) || read != 0 || written != 0 {
-			return errors.New("direct host negative probe failed acceptance")
+		if readErr != nil || writeErr != nil || read != 8 || written != 8 {
+			return fmt.Errorf("direct host positive control failed on page %d: %w",
+				page, errors.Join(readErr, writeErr, errors.New("expected full 8-byte read/write")))
 		}
-		return nil
+		if err := p.section.expect(offset, []byte("HOSTKEEP")); err != nil {
+			return err
+		}
 	}
-	if readErr != nil || writeErr != nil || read != 8 || written != 8 {
-		return errors.New("direct host positive control failed")
-	}
-	return p.section.expect(256, []byte("HOSTKEEP"))
+	return nil
 }
 
 // proofWin32Status preserves the raw unsigned Windows error for probe evidence.
@@ -693,7 +700,8 @@ func proofWin32Status(err error) uint32 {
 // retained GPA in bytes and the section byte length, with decrypted=0 for plain
 // backing and decrypted=1 for SNP; neither converts guest-private page state.
 // Concurrent module loads prove fresh A->B->A causality,
-// verify the host-denied write sentinel and report through guest output.
+// verify distinct page-indexed exchanges and every host-denied write sentinel,
+// and report the complete verified page count through guest output.
 // Randomness, transport or missing causal receipts return errors. Both commands
 // use finite post-exit stream drains and finish before cleanup can touch owners.
 func (p *realProof) exchange(ctx context.Context) error {
@@ -702,7 +710,7 @@ func (p *realProof) exchange(ctx context.Context) error {
 		return err
 	}
 	challenge := hex.EncodeToString(nonce[:])
-	p.evidence.record("challenge", map[string]any{"Token": challenge})
+	p.evidence.record("challenge", map[string]any{"Token": challenge, "Pages": p.pages})
 	decrypted := 0
 	if p.snp {
 		decrypted = 1
@@ -717,16 +725,34 @@ func (p *realProof) exchange(ctx context.Context) error {
 			command := fmt.Sprintf("set -eu; insmod %s gpa=%#x length=%#x decrypted=%d protected_mode=1 role=%s challenge=%s; dmesg | grep -F 'hcs-shmem-diag:'",
 				shellSingleQuote(module), v.gpn*4096, p.pages*4096, decrypted, shellSingleQuote(id), shellSingleQuote(challenge))
 			output, err := p.guest(ctx, id, command)
-			if err == nil && !bytes.Contains([]byte(output), []byte("protected exchange "+id+" "+challenge+" complete; host sentinel unchanged")) {
-				err = errors.New("missing fresh guest exchange/sentinel receipt")
+			if err == nil {
+				err = validateProtectedExchangeReceipt(output, id, challenge, p.pages)
 			}
 			if err == nil {
-				p.evidence.record("exchange-receipt", map[string]any{"Participant": id, "Token": challenge})
+				p.evidence.record("exchange-receipt", map[string]any{
+					"Participant": id, "Token": challenge, "Pages": p.pages})
 			}
 			results <- err
 		}(id)
 	}
 	return errors.Join(<-results, <-results)
+}
+
+// validateProtectedExchangeReceipt requires the fresh guest's all-page completion
+// and sentinel count. Old first-page-only output cannot satisfy this protocol.
+// It checks unauthenticated diagnostics only and neither touches nor owns backing.
+func validateProtectedExchangeReceipt(output, participant, challenge string, pages uint64) error {
+	if (participant != "a" && participant != "b") || pages == 0 || pages > 4096 {
+		return errors.New("invalid protected exchange receipt identity")
+	}
+	expected := fmt.Sprintf("hcs-shmem-diag: protected exchange %s %s complete; pages=%d; host sentinels unchanged",
+		participant, challenge, pages)
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), expected) {
+			return nil
+		}
+	}
+	return fmt.Errorf("missing fresh guest exchange/sentinel receipt for %d pages", pages)
 }
 
 // Run performs and records one real launcher step, returning native progress
@@ -914,19 +940,20 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 		err = v.vm.CloseCtx(ctx)
 	case "restored":
 		// Every reclaim batch succeeded and participants are gone. Only now
-		// reopen ordinary host reads and verify EVERY byte, not just the seed.
+		// reopen ordinary reads and verify every initialized byte, not just
+		// the seeds. A never-initialized tail still holds its original sentinels.
 		if p.reclaimed != p.initialized {
 			return out, errors.New("backing not authorized for host reuse")
 		}
 		p.section.protected = false
-		for offset := uint64(0); offset < p.pages*4096; offset += 4096 {
+		for offset := uint64(0); offset < p.initialized*4096; offset += 4096 {
 			var data []byte
 			data, err = p.section.read(offset, 4096)
 			if err != nil {
 				break
 			}
 			if !bytes.Equal(data, make([]byte, 4096)) {
-				err = errors.New("reclaimed backing was not wholly zeroed")
+				err = fmt.Errorf("reclaimed backing was not wholly zeroed on page %d", offset/4096)
 				break
 			}
 			out.ZeroVerifiedBytes += 4096

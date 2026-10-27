@@ -69,7 +69,7 @@ var lcowCommand = cli.Command{
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
 		cli.StringFlag{
-			Name:  protectedModeFlag,
+			Name: protectedModeFlag,
 			Usage: "Private CPU-only manual lifecycle: m1 only. Prepares three fresh owned VMs; " +
 				"maps A/B, seals pages, requires C's first install denied, then exchanges A/B. " +
 				"plain direct-kernel/vhd boot by default, SNP VMGS/none boot with --security-hardware=true.",
@@ -135,7 +135,7 @@ var lcowCommand = cli.Command{
 				"Leave empty to use the default enforcer",
 		},
 		cli.BoolFlag{
-			Name:  securityHardwareFlag,
+			Name: securityHardwareFlag,
 			Usage: "Use VMGS file to run on SNP secure hardware when true; omitted or false applies no CLI hardware-security override. " +
 				"Ordinary commands still respect annotation-derived settings. " +
 				"('root-fs-type' must be set to 'none' when true)",
@@ -196,8 +196,9 @@ var lcowCommand = cli.Command{
 				"Requires --shared-memory-size.",
 		},
 		cli.Uint64Flag{
-			Name:  sharedMemorySizeArgName,
-			Usage: "Size in bytes of the shared-memory section. Maximum 2147483647.",
+			Name: sharedMemorySizeArgName,
+			Usage: "Size in bytes of the shared-memory section. Maximum 2147483647. " +
+				"Private M1 requires 4096-byte alignment, at most 16 MiB, and checks every page.",
 		},
 		cli.DurationFlag{
 			Name: sharedMemoryObserveArgName,

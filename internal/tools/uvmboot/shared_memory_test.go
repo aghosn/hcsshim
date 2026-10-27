@@ -3,9 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -36,6 +39,151 @@ func TestSharedMemorySectionNames(t *testing.T) {
 			}
 			if hcsName != test.hcsName {
 				t.Fatalf("HCS section name = %q, want %q", hcsName, test.hcsName)
+			}
+		})
+	}
+}
+
+// TestProtectedSharedExchangeReceipt rejects old first-page-only output and
+// mismatched role, nonce or page counts without treating diagnostics as attestation.
+func TestProtectedSharedExchangeReceipt(t *testing.T) {
+	const token = "00112233445566778899aabbccddeeff"
+	receipt := func(participant, nonce string, pages uint64) string {
+		return fmt.Sprintf("[1.234] hcs-shmem-diag: protected exchange %s %s complete; pages=%d; host sentinels unchanged\n",
+			participant, nonce, pages)
+	}
+	for _, test := range []struct {
+		name        string
+		output      string
+		participant string
+		pages       uint64
+		accept      bool
+	}{
+		{"single-page", receipt("a", token, 1), "a", 1, true},
+		{"four-plus-tail", receipt("a", token, 5), "a", 5, true},
+		{"peer", receipt("b", token, 5), "b", 5, true},
+		{"two-full-batches", receipt("a", token, 8), "a", 8, true},
+		{"maximum-size", receipt("a", token, 4096), "a", 4096, true},
+		{"old-module", "hcs-shmem-diag: protected exchange a " + token + " complete; host sentinel unchanged\n", "a", 5, false},
+		{"missing-tail", receipt("a", token, 4), "a", 5, false},
+		{"first-page-only", receipt("a", token, 1), "a", 5, false},
+		{"extra-digit", receipt("a", token, 50), "a", 5, false},
+		{"wrong-peer", receipt("b", token, 5), "a", 5, false},
+		{"wrong-token", receipt("a", strings.Repeat("f", 32), 5), "a", 5, false},
+		{"missing-summary", "", "a", 5, false},
+		{"trailing-error", strings.TrimSpace(receipt("a", token, 5)) + " ERROR", "a", 5, false},
+		{"zero-pages", receipt("a", token, 0), "a", 0, false},
+		{"too-many-pages", receipt("a", token, 4097), "a", 4097, false},
+		{"third-participant", receipt("c", token, 5), "c", 5, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateProtectedExchangeReceipt(test.output, test.participant, token, test.pages)
+			if (err == nil) != test.accept {
+				t.Fatalf("receipt acceptance = %t, want %t: %v", err == nil, test.accept, err)
+			}
+		})
+	}
+}
+
+// TestProtectedSharedHostProbeAllPages checks ordinary owned mappings only:
+// every page must receive a sentinel and a correctly indexed evidence record.
+// No native ProtectedShared operation, VM or protection claim is involved.
+func TestProtectedSharedHostProbeAllPages(t *testing.T) {
+	for _, pages := range []uint64{1, 5, 8} {
+		t.Run(fmt.Sprint(pages), func(t *testing.T) {
+			section, err := createSharedMemorySection(
+				fmt.Sprintf("protected-host-probe-%d-%d", windows.GetCurrentProcessId(), pages), pages*4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := section.Close(); err != nil {
+					t.Errorf("close test mapping: %v", err)
+				}
+			})
+			var evidence bytes.Buffer
+			p := &realProof{pages: pages, section: section, evidence: &proofEvidence{writer: &evidence}}
+			if err := p.hostProbe(false); err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(evidence.String()), "\n")
+			if uint64(len(lines)) != pages {
+				t.Fatalf("got %d host records, want %d", len(lines), pages)
+			}
+			for page := uint64(0); page < pages; page++ {
+				offset := page*4096 + 256
+				if err := section.expect(offset, []byte("HOSTKEEP")); err != nil {
+					t.Fatal(err)
+				}
+				var record struct {
+					Kind string
+					Data struct {
+						PageIndex, Offset, ReadBytes, WriteBytes uint64
+						Negative                                 bool
+					}
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[page], "PROTECTED-EVIDENCE ")), &record); err != nil {
+					t.Fatal(err)
+				}
+				if record.Kind != "host" || record.Data.Negative || record.Data.PageIndex != page ||
+					record.Data.Offset != offset || record.Data.ReadBytes != 8 || record.Data.WriteBytes != 8 {
+					t.Fatalf("incorrect host evidence for page %d: %+v", page, record)
+				}
+			}
+		})
+	}
+}
+
+// TestProtectedSharedRestoredPages models only the local post-reclaim ledger on
+// ordinary mappings. Scrub validation must include the last initialized page but
+// not a never-initialized tail after partial failure; this is not native reclaim.
+func TestProtectedSharedRestoredPages(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		initialized uint64
+		corrupt     bool
+	}{
+		{"first-page-prefix", 1, false},
+		{"first-batch-prefix", 4, false},
+		{"four-plus-tail", 5, false},
+		{"corrupt-tail", 5, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const pages = uint64(5)
+			section, err := createSharedMemorySection(
+				fmt.Sprintf("protected-restored-%d-%s", windows.GetCurrentProcessId(), test.name), pages*4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := section.Close(); err != nil {
+					t.Errorf("close test mapping: %v", err)
+				}
+			})
+			p := &realProof{pages: pages, section: section,
+				initialized: test.initialized, reclaimed: test.initialized,
+				evidence: &proofEvidence{writer: io.Discard}}
+			if err := p.hostProbe(false); err != nil {
+				t.Fatal(err)
+			}
+			if err := section.write(0, make([]byte, test.initialized*4096)); err != nil {
+				t.Fatal(err)
+			}
+			if test.corrupt {
+				if err := section.write(test.initialized*4096-1, []byte{1}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := p.Run(context.Background(), proofStep{Kind: "restored"})
+			if (err != nil) != test.corrupt {
+				t.Fatalf("restore error = %v, want failure = %t", err, test.corrupt)
+			}
+			wantBytes := test.initialized * 4096
+			if test.corrupt {
+				wantBytes -= 4096
+			}
+			if result.ZeroVerifiedBytes != wantBytes {
+				t.Fatalf("verified %d zero bytes, want %d", result.ZeroVerifiedBytes, wantBytes)
 			}
 		})
 	}
