@@ -303,8 +303,10 @@ func executeProtectedProof(ctx context.Context, p *realProof, pages uint64, clea
 	return nil
 }
 
-// proofVM retains exactly one independently created UVM and its immutable
-// preparation. Removed/terminated owners are not interchangeable with peers.
+// proofVM retains one region's immutable preparation and its UVM reference.
+// M1 and primary entries own independently created UVMs; the late entry borrows
+// A with no options or separate termination/Close authority. Removed/terminated
+// owners are not interchangeable with peers.
 type proofVM struct {
 	vm         *uvm.UtilityVM
 	options    *uvm.OptionsLCOW
@@ -312,6 +314,10 @@ type proofVM struct {
 	gpn        uint64
 	terminated bool
 	removed    bool
+	// freshPrepared records a validated native uninitialized preparation.
+	// The partition-seal adapter uses absence to retain uncertain backing;
+	// it does not change M1's existing ownership/cleanup dispatcher.
+	freshPrepared bool
 }
 
 // acceptRemoval checks the real action HRESULT and cached local owner flags.
@@ -331,8 +337,10 @@ func (v *proofVM) acceptRemoval(info *hcsschema.ProtectedSharedRegionInfo, actio
 	return nil
 }
 
-// realProof owns the only launcher controller and the host section for either
-// plain or SNP boot. snp is immutable after CLI preflight; it selects only boot
+// realProof owns one lifetime's controller and host section for either plain or
+// SNP boot. M1 uses one instance; partition-seal uses separate primary/late
+// instances, with late VM borrowing enforced by its adapter.
+// snp is immutable after CLI preflight; it selects only boot
 // and guest mapping options, never lifecycle authority. Calls are serialized
 // except for the two independent guest exchange commands.
 type realProof struct {
@@ -350,6 +358,9 @@ type realProof struct {
 	reclaimed        uint64
 	prepareUncertain bool
 	vms              map[string]*proofVM
+	// lateSlot is metadata only, reserved exclusively by partition-seal in A.
+	// Empty preserves M1's original single-region preparation requirement.
+	lateSlot string
 }
 
 // guestMode returns the selected diagnostic boot label, not attestation or
@@ -433,13 +444,19 @@ func (p *realProof) guest(ctx context.Context, id, command string) (string, erro
 // failures for cleanup. Plain requires direct vmlinux/vhd boot and virtual
 // primary backing with no state file/paravisor; SNP requires state-file boot,
 // explicitly disabled HCL and non-overcommit primary backing.
-// Starting hidden backing prepares it but does not install a GPA mapping.
-// This applies equally to A/B/C: C only receives the module share here and
+// Starting protected hidden backing prepares it but does not install a GPA mapping.
+// This applies equally to A/B/C: M1's C only receives the module share here and
 // never executes it. Its early attachment retains pins, not an HV guest binding.
 // Requires a cached native preparation receipt before accepting the lease/GPA;
 // GPA is checked in bytes before retaining a 4-KiB page index. Missing framing
 // or failed creation returns an error with ownership/uncertainty preserved.
 // Both modes borrow the same retained controller and share the module via GCS.
+// Only partition-seal sets lateSlot: A reserves an additional ordinary-hidden
+// one-page name/GPA slot, without opening backing or preparing a late owner.
+// Its primary response is selected by exact name; M1 still requires one region.
+// Structurally valid preparation ownership is consumed even when status fails.
+// freshPrepared is set only after the full fresh, uninitialized receipt passes;
+// a partial/unknown preparation must not be interpreted as zero initialized work.
 // An early receipt query is diagnostic only, bounded to five seconds within
 // startup, and never substitutes for post-Start receipt validation.
 func (p *realProof) prepare(ctx context.Context, id string) error {
@@ -470,6 +487,11 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	v.region = hcsschema.SharedMemoryRegion{SectionName: p.section.hcsName, Length: int32(p.pages * 4096),
 		AllowGuestWrite: true, HiddenFromGuest: true, ProtectedShared: true, ProtectedSharedControllerUri: p.resource.URI}
 	options.SharedMemoryRegions = []hcsschema.SharedMemoryRegion{v.region}
+	if p.lateSlot != "" && id == "a" {
+		options.SharedMemoryRegions = append(options.SharedMemoryRegions, hcsschema.SharedMemoryRegion{
+			SectionName: p.lateSlot, Length: 4096, AllowGuestWrite: true, HiddenFromGuest: true,
+		})
+	}
 	options.ProtectedSharedResources = []hcsv2.OperationResource{p.resource}
 	v.vm, err = uvm.CreateLCOW(ctx, options)
 	if err != nil {
@@ -503,6 +525,15 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 		return err
 	}
 	info, err := v.vm.ProtectedSharedOperationResult(ctx, v.region)
+	// Retain any structurally valid owner identity before examining the action
+	// or context error. A failed preparation read never proves no backing pins.
+	if uvm.ValidateProtectedSharedOperationResultStructure(info, p.lease, p.pages) == nil {
+		p.lease = info.LeaseId
+		v.region.ProtectedSharedLeaseId = p.lease
+		if info.Installed {
+			v.region.HiddenFromGuest = false
+		}
+	}
 	p.evidence.record("prepare", map[string]any{"Participant": id, "Frame": info, "Error": proofErrorText(err)})
 	if err != nil {
 		return err
@@ -517,14 +548,16 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 	}
 	p.lease = info.LeaseId
 	v.region.ProtectedSharedLeaseId = p.lease
+	v.freshPrepared = true
 	regions, err := v.vm.SharedMemoryRegions(ctx)
 	if err != nil {
 		return err
 	}
-	if len(regions) != 1 {
-		return errors.New("proof requires exactly one region")
+	mapped, err := selectProtectedProofRegion(regions, v.region.SectionName, p.lateSlot, id)
+	if err != nil {
+		return err
 	}
-	address, err := uvm.SharedMemoryByteGPA(int64(regions[0].GuestPhysicalAddress), int64(v.region.Length))
+	address, err := uvm.SharedMemoryByteGPA(int64(mapped.GuestPhysicalAddress), int64(v.region.Length))
 	if err != nil {
 		return err
 	}
@@ -537,6 +570,49 @@ func (p *realProof) prepare(ctx context.Context, id string) error {
 		"AllowOvercommit": options.AllowOvercommit, "FullyPhysicallyBacked": options.FullyPhysicallyBacked,
 		"HclEnabled": options.HclEnabled, "DmVerityMode": options.DmVerityMode})
 	return v.vm.Share(ctx, p.cli.String(sharedMemoryGuestModuleArgName), "/run/protected-module", true)
+}
+
+// selectProtectedProofRegion selects exactly one primary section response.
+// Without a late slot it retains the single-region contract. Only A may have
+// the additional named ordinary-hidden slot, which current native properties
+// omit until conversion (SharedRegionManager::QueryRegions reports protected or
+// mapped regions only). No duplicate, missing primary, unexpected or already
+// protected late response is accepted. Returned data is a borrowed cached
+// property snapshot, not evidence that either GPA is installed.
+func selectProtectedProofRegion(regions []hcsschema.SharedMemoryRegionInfo, primary, late, id string) (*hcsschema.SharedMemoryRegionInfo, error) {
+	expected := 1
+	if late != "" && id == "a" {
+		expected = 2
+	}
+	if len(regions) != 1 && (expected != 2 || len(regions) != 2) {
+		return nil, errors.New("proof returned unexpected region count")
+	}
+	var found *hcsschema.SharedMemoryRegionInfo
+	lateFound := false
+	for i := range regions {
+		r := &regions[i]
+		switch {
+		case r.SectionName == primary:
+			if found != nil {
+				return nil, errors.New("duplicate primary section response")
+			}
+			found = r
+		case expected == 2 && r.SectionName == late:
+			if lateFound || r.ProtectedShared != nil || r.ProtectedSharedPartition != nil {
+				return nil, errors.New("late slot is duplicate or already protected")
+			}
+			if _, err := uvm.SharedMemoryByteGPA(int64(r.GuestPhysicalAddress), 4096); err != nil {
+				return nil, err
+			}
+			lateFound = true
+		default:
+			return nil, errors.New("unexpected proof section response")
+		}
+	}
+	if found == nil {
+		return nil, errors.New("missing named proof section response")
+	}
+	return found, nil
 }
 
 // attemptInstall submits the genuine Install request for the prepared participant
@@ -758,8 +834,9 @@ func validateProtectedExchangeReceipt(output, participant, challenge string, pag
 // Run performs and records one real launcher step, returning native progress
 // separately from sticky evidence errors. Missing diagnostic output never blocks
 // known-safe cleanup; missing native framing still prevents release.
-// It is serialized by executeProtectedProof; guest exchange is the sole parallel
-// phase. Actual v2 prefixes remain valid on failure when Framed is true.
+// It is serialized by executeProtectedProof or partition-seal's concrete adapter;
+// guest exchange is the sole parallel phase. Actual v2 prefixes remain valid
+// on failure when Framed is true.
 // Cached worker receipts establish only local ownership; no page state is read.
 // Reclaim retries only known, framed zero-prefix preflight contention inside a
 // required deadline. Actual reclaim completion alone permits restored access.
@@ -783,16 +860,8 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	}
 	switch step.Kind {
 	case "open":
-		if runtime.GOARCH != "amd64" || unsafe.Sizeof(psRequest{}) != 48 || unsafe.Sizeof(psResult{}) != 40 ||
-			unsafe.Offsetof(psRequest{}.Version) != 0 || unsafe.Offsetof(psRequest{}.Flags) != 4 ||
-			unsafe.Offsetof(psRequest{}.LeaseId) != 8 || unsafe.Offsetof(psRequest{}.PageIndex) != 16 ||
-			unsafe.Offsetof(psRequest{}.LifetimeId) != 24 || unsafe.Offsetof(psRequest{}.PageCount) != 32 ||
-			unsafe.Offsetof(psRequest{}.Operation) != 36 || unsafe.Offsetof(psRequest{}.Reserved) != 40 ||
-			unsafe.Offsetof(psResult{}.Version) != 0 || unsafe.Offsetof(psResult{}.Size) != 4 ||
-			unsafe.Offsetof(psResult{}.Status) != 8 || unsafe.Offsetof(psResult{}.PagesProcessed) != 12 ||
-			unsafe.Offsetof(psResult{}.LeaseId) != 16 || unsafe.Offsetof(psResult{}.PageCount) != 24 ||
-			unsafe.Offsetof(psResult{}.InitializedPages) != 32 {
-			return out, errors.New("unsupported private VID v2 native layout")
+		if err = validateProtectedSharedNativeLayout(); err != nil {
+			return out, err
 		}
 		dll := windows.NewLazySystemDLL("vid.dll")
 		create := dll.NewProc("VidCreateProtectedSharedController")
@@ -987,19 +1056,39 @@ func (p *realProof) Run(ctx context.Context, step proofStep) (out proofResult, e
 	return out, err
 }
 
-// runProtectedSharedCLI validates raw M1 CLI mode/boot/override combinations
+// validateProtectedSharedNativeLayout checks the existing exact AMD64 VID v2
+// request/result sizes and every field offset before either mode acquires a
+// controller. It performs no native work and never changes either wire layout.
+func validateProtectedSharedNativeLayout() error {
+	if runtime.GOARCH != "amd64" || unsafe.Sizeof(psRequest{}) != 48 || unsafe.Sizeof(psResult{}) != 40 ||
+		unsafe.Offsetof(psRequest{}.Version) != 0 || unsafe.Offsetof(psRequest{}.Flags) != 4 ||
+		unsafe.Offsetof(psRequest{}.LeaseId) != 8 || unsafe.Offsetof(psRequest{}.PageIndex) != 16 ||
+		unsafe.Offsetof(psRequest{}.LifetimeId) != 24 || unsafe.Offsetof(psRequest{}.PageCount) != 32 ||
+		unsafe.Offsetof(psRequest{}.Operation) != 36 || unsafe.Offsetof(psRequest{}.Reserved) != 40 ||
+		unsafe.Offsetof(psResult{}.Version) != 0 || unsafe.Offsetof(psResult{}.Size) != 4 ||
+		unsafe.Offsetof(psResult{}.Status) != 8 || unsafe.Offsetof(psResult{}.PagesProcessed) != 12 ||
+		unsafe.Offsetof(psResult{}.LeaseId) != 16 || unsafe.Offsetof(psResult{}.PageCount) != 24 ||
+		unsafe.Offsetof(psResult{}.InitializedPages) != 32 {
+		return errors.New("unsupported private VID v2 native layout")
+	}
+	return nil
+}
+
+// runProtectedSharedCLI validates raw M1/partition-seal mode/boot/override combinations
 // before native acquisition. Omitted/false hardware security selects plain
 // direct-kernel/vhd boot with virtual backing; true selects SNP state-file/none
 // boot. Incompatible explicit inputs fail rather than being silently ignored.
 // Size is page-aligned bytes (4096..16 MiB); forward/independent cleanup budgets
 // are positive and at most ten minutes, not VM lifetime or forced-release timers.
-// It then owns one fresh lifetime and evidence stream through conservative
+// It dispatches M1 unchanged (three VMs/one lifetime) or partition-seal (two
+// VMs/two independent lifetimes and an installed hvtest prerequisite).
+// It owns the evidence stream through conservative
 // cleanup, returning validation, operation, cleanup or evidence errors. It never
 // uses runMany/existing VM IDs or lets markers override lifecycle errors.
 // CLI/global settings remain serialized and immutable during the proof.
 func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
-	if mode != "m1" {
+	if mode != "m1" && mode != "partition-seal" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
 	}
 	// The command defaults to warning-only logs; retain startup progress without
@@ -1060,11 +1149,20 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	p.evidence = &proofEvidence{writer: os.Stdout, runID: p.runID}
+	claim := "CPU-ONLY-NOT-ATTESTATION"
+	if mode == "partition-seal" {
+		claim = "HV-COPY-AND-ADMISSION-NOT-ATTESTATION"
+	}
 	p.evidence.record("run", map[string]any{"Mode": mode, "GuestMode": p.guestMode(),
-		"Pages": p.pages, "Claim": "CPU-ONLY-NOT-ATTESTATION"})
+		"Pages": p.pages, "Claim": claim})
 	if err := p.evidence.failure(); err != nil {
 		return err
 	}
-	err := executeProtectedProof(ctx, p, p.pages, cleanup)
+	var err error
+	if mode == "partition-seal" {
+		err = executePartitionSealProof(ctx, &realPartitionSealProof{primary: p}, p.pages, cleanup)
+	} else {
+		err = executeProtectedProof(ctx, p, p.pages, cleanup)
+	}
 	return p.evidence.finish(mode, err)
 }

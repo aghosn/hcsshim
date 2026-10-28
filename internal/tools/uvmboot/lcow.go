@@ -70,20 +70,20 @@ var lcowCommand = cli.Command{
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name: protectedModeFlag,
-			Usage: "Private CPU-only manual lifecycle: m1 only. Prepares three fresh owned VMs; " +
-				"maps A/B, seals pages, requires C's first install denied, then exchanges A/B. " +
+			Usage: "Private manual lifecycle: m1 (three fresh VMs, page seals and C install denial) or " +
+				"partition-seal (two fresh VMs, page locks then partition seals, installed matched hvtest.sys required, fresh late lifetime denial). " +
 				"plain direct-kernel/vhd boot by default, SNP VMGS/none boot with --security-hardware=true.",
 		},
 		cli.DurationFlag{
 			Name:  protectedTimeoutFlag,
 			Value: 3 * time.Minute,
-			Usage: "Time budget for three-UVM M1 startup, preparation, A/B mapping, seal, C denial and A/B exchange, not a VM lifetime limit " +
+			Usage: "Forward budget for three-UVM M1 or two-UVM partition-seal, including controls and A/B exchange, not a VM lifetime limit " +
 				"(greater than 0, at most 10m). In-flight native VID calls are not forcibly interrupted.",
 		},
 		cli.DurationFlag{
 			Name:  protectedCleanupFlag,
 			Value: 2 * time.Minute,
-			Usage: "Fresh, independent budget for safe M1 cleanup of all three UVMs and backing after success, failure or forward timeout " +
+			Usage: "Fresh independent budget for owned-VM cleanup (M1: three; partition-seal: two) and all backing after success, failure or forward timeout " +
 				"(greater than 0, at most 10m). Expiry does not force backing release.",
 		},
 		cli.StringSliceFlag{
@@ -198,7 +198,7 @@ var lcowCommand = cli.Command{
 		cli.Uint64Flag{
 			Name: sharedMemorySizeArgName,
 			Usage: "Size in bytes of the shared-memory section. Maximum 2147483647. " +
-				"Private M1 requires 4096-byte alignment, at most 16 MiB, and checks every page.",
+				"Private m1/partition-seal require 4096-byte alignment, 1..4096 pages (at most 16 MiB), and check every page.",
 		},
 		cli.DurationFlag{
 			Name: sharedMemoryObserveArgName,
