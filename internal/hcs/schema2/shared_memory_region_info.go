@@ -21,6 +21,77 @@ type SharedMemoryRegionInfo struct {
 	GuestPhysicalAddress int32 `json:"GuestPhysicalAddress,omitempty"`
 
 	ProtectedShared *ProtectedSharedRegionInfo `json:"ProtectedShared,omitempty"`
+
+	ProtectedSharedPartition *ProtectedSharedPartitionInfo `json:"ProtectedSharedPartition,omitempty"`
+}
+
+// ProtectedSharedPartitionInfo is an optional, independent v1 last-action
+// receipt, not live partition state or attestation. The numeric ID is diagnostic,
+// never authority. SealCompleted acknowledges only a successful SealPartition;
+// identity and failed actions leave it false without asserting an unsealed state.
+type ProtectedSharedPartitionInfo struct {
+	Version               uint32                `json:"Version"`
+	Operation             ProtectedSharedAction `json:"Operation"`
+	HypervisorPartitionId uint64                `json:"HypervisorPartitionId"`
+	PartitionIdValid      bool                  `json:"PartitionIdValid"`
+	OperationHresult      uint32                `json:"OperationHresult"`
+	SealCompleted         bool                  `json:"SealCompleted"`
+}
+
+// UnmarshalJSON requires all six exact, nonnull, unique fields and v1 framing.
+// Typed decoding rejects unsigned overflow; errors leave the exclusively owned
+// receiver unchanged. Action, target and completion checks belong to consumers.
+func (p *ProtectedSharedPartitionInfo) UnmarshalJSON(data []byte) error {
+	type partition ProtectedSharedPartitionInfo
+	var next partition
+	if err := rejectProtectedSharedPartitionDuplicates(data); err != nil {
+		return err
+	}
+	err := decodeProtectedSharedObject(data, []string{
+		"Version", "Operation", "HypervisorPartitionId", "PartitionIdValid",
+		"OperationHresult", "SealCompleted",
+	}, &next)
+	if err == nil && next.Version != 1 {
+		err = fmt.Errorf("unsupported protected partition receipt version %d", next.Version)
+	}
+	if err != nil {
+		return fmt.Errorf("decode ProtectedSharedPartitionInfo: %w", err)
+	}
+	*p = ProtectedSharedPartitionInfo(next)
+	return nil
+}
+
+// rejectProtectedSharedPartitionDuplicates rejects repeated object keys before
+// the common exact-field decoder collapses them into a map. It parses only this
+// new sibling and changes no receiver or existing v2 decoding behavior.
+func rejectProtectedSharedPartitionDuplicates(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	first, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if first != json.Delim('{') {
+		return fmt.Errorf("protected partition receipt must be an object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := token.(string)
+		if !ok || seen[name] {
+			return fmt.Errorf("invalid or duplicate protected partition field %q", name)
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	// Complete/trailing framing and typed values are checked by the common
+	// json.Unmarshal path before any field can be published to the receiver.
+	return nil
 }
 
 // ProtectedSharedRegionInfo is the private v2 cached last-operation receipt,
