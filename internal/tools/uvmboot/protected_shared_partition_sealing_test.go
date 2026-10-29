@@ -570,6 +570,8 @@ func TestProtectedSharedHvUniqueAddedChildRejects(t *testing.T) {
 // lifecycle prefixes. It is not a VM, HCS, driver or HV-policy simulation.
 // The single chosen failing step may still return valid ownership/progress;
 // this protects the coordinator's consume-before-error cleanup contract.
+// Discovery uses the real adapter with the existing narrow synchronous IOCTL
+// fake and synthetic child lists; selected IDs are not real HV evidence.
 type partitionSealFake struct {
 	steps                             []partitionSealStep
 	events                            []string
@@ -583,13 +585,32 @@ type partitionSealFake struct {
 	partial                           uint32
 	unframed, uncertain, omitVM        bool
 	cleanupContextInvalid, doubleClose bool
+	discovery                         *realPartitionSealProof
+	snapshots                         map[string][]uint64
+	evidenceOnFailure                 bool
 }
 
 // newPartitionSealFake returns an empty receipt recorder with no real resource
-// acquisition. Its maps track two independent synthetic lease identities only.
-func newPartitionSealFake() *partitionSealFake {
+// acquisition. Its maps track independent synthetic leases and quiet-host child
+// snapshots. A buffer receives real discovery diagnostics, not native evidence.
+// Non-AMD64 tests skip because the preserved enumeration transport rejects that
+// architecture before invoking the synchronous IOCTL fake.
+func newPartitionSealFake(t *testing.T) *partitionSealFake {
+	t.Helper()
+	if runtime.GOARCH != "amd64" {
+		t.Skip("discovery transport client is explicitly Windows AMD64 only")
+	}
 	return &partitionSealFake{initialized: map[string]uint64{}, leases: map[string]uint64{},
-		vmOwned: map[string]bool{}, backing: map[string]bool{}}
+		vmOwned: map[string]bool{}, backing: map[string]bool{},
+		snapshots: map[string][]uint64{
+			"snapshot-before/a": {900}, "snapshot-after/a": {42, 900},
+			"snapshot-before/b": {900, 42}, "snapshot-after/b": {11, 42, 900},
+		},
+		discovery: &realPartitionSealProof{
+			primary: &realProof{evidence: &proofEvidence{writer: &bytes.Buffer{}}, vms: map[string]*proofVM{}},
+			before: map[string]protectedSharedHvSnapshot{}, after: map[string]protectedSharedHvSnapshot{},
+			targets: map[string]uint64{},
+		}}
 }
 
 // EvidenceError supplies the fake's sticky evidence error without changing its
@@ -600,6 +621,8 @@ func (f *partitionSealFake) EvidenceError() error { return f.evidenceErr }
 // facts before its configured error/cancellation. Cleanup calls are required
 // to have a fresh live deadline; releases/VM closes are recorded separately so
 // tests can detect forgotten partial owners, duplicate closes and unsafe frees.
+// Discovery feeds synthetic enumerations through the real selection adapter;
+// fake seal submissions record order only and do not simulate HCS or VID.
 func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (partitionSealResult, error) {
 	f.steps = append(f.steps, s)
 	cleanup := s.Kind == "teardown" || s.Kind == "remove" || s.Kind == "terminate" ||
@@ -611,6 +634,7 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 	fail := s.Kind == f.failKind && (f.failLifetime == "" || s.Lifetime == f.failLifetime) &&
 		(f.failVM == "" || s.Participant == f.failVM)
 	r := partitionSealResult{}
+	var stepErr error
 	switch s.Kind {
 	case "driver":
 		r.DriverOwned = true
@@ -618,6 +642,25 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 	case "open":
 		f.backing[s.Lifetime] = true
 		f.events = append(f.events, "acquire-"+s.Lifetime)
+	case "snapshot-before", "snapshot-after":
+		ids := f.snapshots[s.Kind+"/"+s.Participant]
+		calls := 0
+		// The existing synchronous seam supplies one synthetic child per
+		// call and then INVALID. Failure/cancellation must discard the set.
+		ioctl := func(_ windows.Handle, _ uint32, _ []byte, output []byte) (uint32, error) {
+			if fail && f.failErr != nil {
+				return 0, f.failErr
+			}
+			if calls < len(ids) {
+				binary.LittleEndian.PutUint64(output[8:16], ids[calls])
+			} else if fail && f.cancel != nil {
+				f.cancel()
+			}
+			calls++
+			return 16, nil
+		}
+		f.discovery.probe = &protectedSharedHvProbe{handle: 123, ioctl: ioctl}
+		stepErr = f.discovery.discover(ctx, s.Participant, s.Kind == "snapshot-after")
 	case "prepare":
 		if !fail || !f.omitVM {
 			r.VMOwned = true
@@ -628,6 +671,12 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 	case "late-prepare":
 		f.leases["late"] = 22
 		f.events = append(f.events, "borrow-a")
+	case "hv-positive", "hv-negative":
+		if f.discovery.targets[s.Participant] == 0 {
+			stepErr = errors.New("fake probe lacks a validated discovery target")
+		}
+	case "partition-seal", "partition-seal-repeat":
+		f.events = append(f.events, "submit-"+s.Kind+"-"+s.Participant)
 	case "initialize", "seal", "teardown", "reclaim":
 		processed := s.Count
 		if fail && f.partial < processed {
@@ -659,12 +708,15 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 	}
 	if fail {
 		r.Uncertain = f.uncertain
+		if f.evidenceOnFailure {
+			f.evidenceErr = errors.New("sticky evidence failure after synthetic submission")
+		}
 		if f.cancel != nil {
 			f.cancel()
 		}
-		return r, f.failErr
+		return r, errors.Join(stepErr, f.failErr)
 	}
-	return r, nil
+	return r, stepErr
 }
 
 // partitionStepPosition locates a recorded operation, optionally narrowed to a
@@ -685,15 +737,19 @@ func partitionStepPosition(steps []partitionSealStep, kind, lifetime, participan
 // and alive through fresh primary exchange. Separate cleanup must zero-check
 // both leases before release and close exactly the two independently owned VMs.
 // This protects orchestration only; synthetic steps do not prove HV behavior.
+// U2-c brackets each entire prepare boundary with discovery before B starts;
+// U3-a omits identity actions and requires fresh initial/repeat submissions.
 func TestProtectedSharedPartitionOrder(t *testing.T) {
-	f := newPartitionSealFake()
+	f := newPartitionSealFake(t)
 	if err := executePartitionSealProof(context.Background(), f, 5, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
-		"driver//", "open/primary/", "seed/primary/", "prepare/primary/a", "prepare/primary/b",
+		"driver//", "open/primary/", "seed/primary/",
+		"snapshot-before//a", "prepare/primary/a", "snapshot-after//a",
+		"snapshot-before//b", "prepare/primary/b", "snapshot-after//b",
 		"initialize/primary/", "initialize/primary/", "install/primary/a", "install/primary/b",
-		"seal/primary/", "seal/primary/", "identity/primary/a", "identity/primary/b",
+		"seal/primary/", "seal/primary/",
 		"hv-positive/primary/a", "hv-positive/primary/b",
 		"partition-seal/primary/a", "partition-seal/primary/b",
 		"partition-seal-repeat/primary/a", "partition-seal-repeat/primary/b",
@@ -727,6 +783,116 @@ func TestProtectedSharedPartitionOrder(t *testing.T) {
 		f.cleanupContextInvalid || f.doubleClose {
 		t.Fatal("VM ownership or independent cleanup contract violated")
 	}
+	if f.discovery.targets["a"] != 42 || f.discovery.targets["b"] != 11 ||
+		len(f.discovery.before["b"]) != 2 || len(f.discovery.after["b"]) != 3 {
+		t.Fatal("sequential discovery lost validated snapshots or distinct diagnostic targets")
+	}
+	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
+		for _, id := range []string{"a", "b"} {
+			if strings.Count(strings.Join(f.events, ","), "submit-"+kind+"-"+id) != 1 {
+				t.Error("initial/repeat seal was not independently submitted")
+			}
+		}
+	}
+}
+
+// TestProtectedSharedPartitionDiscoveryFailures covers U2-a/b/c using synthetic
+// child lists through the existing IOCTL fake and the real discovery adapter.
+// Enumeration/selection errors and cancellation must publish no failed target,
+// stop B/probes as applicable, and independently clean every acquired VM and
+// known backing. Prepare errors still return ownership before cleanup decisions.
+// These order/correlation assertions are not real HCS or hypervisor evidence.
+func TestProtectedSharedPartitionDiscoveryFailures(t *testing.T) {
+	for _, scenario := range []struct {
+		name, kind, id      string
+		override            bool
+		ids                 []uint64
+		operationErr, cancel bool
+		wantA, wantB         bool
+	}{
+		{"A before enumeration error", "snapshot-before", "a", false, nil, true, false, false, false},
+		{"A before cancelled", "snapshot-before", "a", false, nil, false, true, false, false},
+		{"A acquired prepare error", "prepare", "a", false, nil, true, false, true, false},
+		{"A acquired prepare cancelled", "prepare", "a", false, nil, false, true, true, false},
+		{"A after enumeration error", "snapshot-after", "a", false, nil, true, false, true, false},
+		{"A after cancelled", "snapshot-after", "a", false, nil, false, true, true, false},
+		{"A no addition", "snapshot-after", "a", true, []uint64{900}, false, false, true, false},
+		{"A ambiguous", "snapshot-after", "a", true, []uint64{900, 42, 43}, false, false, true, false},
+		{"A removed baseline", "snapshot-after", "a", true, []uint64{42}, false, false, true, false},
+		{"B before enumeration error", "snapshot-before", "b", false, nil, true, false, true, false},
+		{"B before cancelled", "snapshot-before", "b", false, nil, false, true, true, false},
+		{"B baseline missing A", "snapshot-before", "b", true, []uint64{900}, false, false, true, false},
+		{"B acquired prepare error", "prepare", "b", false, nil, true, false, true, true},
+		{"B acquired prepare cancelled", "prepare", "b", false, nil, false, true, true, true},
+		{"B after enumeration error", "snapshot-after", "b", false, nil, true, false, true, true},
+		{"B after cancelled", "snapshot-after", "b", false, nil, false, true, true, true},
+		{"B after missing A", "snapshot-after", "b", true, []uint64{900, 11}, false, false, true, true},
+		{"B no distinct addition", "snapshot-after", "b", true, []uint64{42, 900}, false, false, true, true},
+		{"B ambiguous", "snapshot-after", "b", true, []uint64{11, 42, 900, 12}, false, false, true, true},
+		{"B removed baseline", "snapshot-after", "b", true, []uint64{11, 42}, false, false, true, true},
+	} {
+		// Isolate each failed boundary so later acquisitions cannot mask a
+		// missing owner or a target accidentally retained after an error.
+		t.Run(scenario.name, func(t *testing.T) {
+			f := newPartitionSealFake(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.failKind, f.failVM = scenario.kind, scenario.id
+			if scenario.override {
+				f.snapshots[scenario.kind+"/"+scenario.id] = scenario.ids
+			}
+			if scenario.operationErr {
+				f.failErr = errors.New("synthetic discovery/preparation failure")
+			}
+			if scenario.cancel {
+				f.cancel = cancel
+			}
+			err := executePartitionSealProof(ctx, f, 5, time.Minute)
+			if err == nil || (scenario.operationErr && !errors.Is(err, f.failErr)) ||
+				(scenario.cancel && !errors.Is(err, context.Canceled)) {
+				t.Fatal("discovery/acquisition failure was not retained")
+			}
+			if f.discovery.targets[scenario.id] != 0 || f.discovery.after[scenario.id] != nil {
+				t.Error("failed discovery published a usable candidate or after snapshot")
+			}
+			if scenario.kind != "prepare" && f.discovery.before[scenario.id] != nil {
+				t.Error("failed discovery retained its baseline for accidental reuse")
+			}
+			if scenario.id == "b" && f.discovery.targets["a"] != 42 {
+				t.Error("B failure discarded independently validated A diagnostics")
+			}
+			if partitionStepPosition(f.steps, "hv-positive", "", "") >= 0 ||
+				partitionStepPosition(f.steps, "hv-negative", "", "") >= 0 ||
+				partitionStepPosition(f.steps, "open", "late", "") >= 0 {
+				t.Error("discovery failure allowed GPA probing or late acquisition")
+			}
+			failed := partitionStepPosition(f.steps, scenario.kind, "", scenario.id)
+			if failed < 0 {
+				t.Fatal("configured discovery boundary was skipped")
+			}
+			for _, s := range f.steps[failed+1:] {
+				switch s.Kind {
+				case "remove", "terminate", "release", "close-driver":
+				default:
+					t.Errorf("forward work continued after discovery failure: %s", s.Kind)
+				}
+			}
+			for id, owned := range map[string]bool{"a": scenario.wantA, "b": scenario.wantB} {
+				closed := partitionStepPosition(f.steps, "terminate", "", id) >= 0
+				if closed != owned {
+					t.Errorf("%s: cleanup did not match acquired VM ownership", id)
+				}
+				if owned && partitionStepPosition(f.steps, "remove", "primary", id) < 0 {
+					t.Errorf("%s: acquired prepared owner was not removed independently", id)
+				}
+			}
+			if partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+				partitionStepPosition(f.steps, "close-driver", "", "") < 0 ||
+				f.cleanupContextInvalid || f.doubleClose {
+				t.Error("discovery failure lost known-safe backing/driver or cleanup context")
+			}
+		})
+	}
 }
 
 // TestProtectedSharedPartitionPartialAcquisition cancels/errors at acquired VM,
@@ -753,7 +919,7 @@ func TestProtectedSharedPartitionPartialAcquisition(t *testing.T) {
 		// Each subtest owns a fresh recorder/context. No native resource or
 		// protection result is fabricated; only step receipts are supplied.
 		t.Run(scenario.name, func(t *testing.T) {
-			f := newPartitionSealFake()
+			f := newPartitionSealFake(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			f.failKind, f.failLifetime, f.failVM = scenario.kind, scenario.lifetime, scenario.vm
@@ -833,7 +999,7 @@ func TestProtectedSharedPartitionRetainsUncertain(t *testing.T) {
 		// Failure is injected only into this unit recorder, not the lab
 		// coordinator/native implementation or partition sealing primitive.
 		t.Run(scenario.name, func(t *testing.T) {
-			f := newPartitionSealFake()
+			f := newPartitionSealFake(t)
 			f.failKind, f.failLifetime, f.failVM = scenario.kind, scenario.lifetime, scenario.vm
 			f.unframed, f.uncertain = scenario.unframed, scenario.uncertain
 			f.failErr = errors.New("uncertain or failed cleanup operation")
@@ -857,23 +1023,61 @@ func TestProtectedSharedPartitionRetainsUncertain(t *testing.T) {
 	}
 }
 
-// TestProtectedSharedPartitionPartialSealing fails B's seal after A succeeded.
-// Forward work must stop without negative probes or late creation, while normal
-// two-VM teardown/reclaim/release remains required. No seal reopening operation
-// exists in the recorder or coordinator; partial sealing is not special cleanup.
+// TestProtectedSharedPartitionPartialSealing covers U3-b operation errors,
+// cancellation and sticky evidence failure at each initial/repeat A/B seal.
+// Every synthetic submission must stop later forward work on failure while
+// preserving independent two-VM teardown/reclaim/release. Neither cancellation
+// nor a fake submission proves native sealing had no effect or produced a receipt.
 func TestProtectedSharedPartitionPartialSealing(t *testing.T) {
-	f := newPartitionSealFake()
-	f.failKind, f.failVM, f.failErr = "partition-seal", "b", errors.New("B seal failed")
-	if err := executePartitionSealProof(context.Background(), f, 5, time.Minute); err == nil {
-		t.Fatal("B seal failure passed")
-	}
-	if partitionStepPosition(f.steps, "partition-seal", "", "a") < 0 ||
-		partitionStepPosition(f.steps, "hv-negative", "", "") >= 0 ||
-		partitionStepPosition(f.steps, "open", "late", "") >= 0 ||
-		partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
-		partitionStepPosition(f.steps, "terminate", "", "a") < 0 ||
-		partitionStepPosition(f.steps, "terminate", "", "b") < 0 {
-		t.Fatal("partial seal violated stop-forward or ordinary safe cleanup")
+	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
+		for _, id := range []string{"a", "b"} {
+			for _, failure := range []string{"operation error", "cancellation", "sticky evidence"} {
+				// Each independent recorder models a completed attempt and
+				// its failure, not native success or the partition's state.
+				t.Run(kind+"/"+id+"/"+failure, func(t *testing.T) {
+					f := newPartitionSealFake(t)
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					f.failKind, f.failVM = kind, id
+					switch failure {
+					case "operation error":
+						f.failErr = errors.New("synthetic seal operation failed")
+					case "cancellation":
+						f.cancel = cancel
+					case "sticky evidence":
+						f.evidenceOnFailure = true
+					}
+					err := executePartitionSealProof(ctx, f, 5, time.Minute)
+					if err == nil || (f.failErr != nil && !errors.Is(err, f.failErr)) ||
+						(failure == "cancellation" && !errors.Is(err, context.Canceled)) ||
+						(failure == "sticky evidence" && !errors.Is(err, f.evidenceErr)) {
+						t.Fatal("seal failure/cancellation/evidence error was not retained")
+					}
+					failed := partitionStepPosition(f.steps, kind, "", id)
+					if failed < 0 {
+						t.Fatal("failed seal submission was skipped")
+					}
+					for _, s := range f.steps[failed+1:] {
+						switch s.Kind {
+						case "teardown", "remove", "terminate", "reclaim", "zero", "release", "close-driver":
+						default:
+							t.Errorf("forward work continued after seal failure: %s", s.Kind)
+						}
+					}
+					for _, owner := range []string{"a", "b"} {
+						if partitionStepPosition(f.steps, "terminate", "", owner) < 0 ||
+							partitionStepPosition(f.steps, "remove", "primary", owner) < 0 {
+							t.Error("seal failure lost independent VM/region cleanup")
+						}
+					}
+					if partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+						partitionStepPosition(f.steps, "close-driver", "", "") < 0 ||
+						f.cleanupContextInvalid || f.doubleClose {
+						t.Error("seal failure prevented known-safe independent cleanup")
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -883,18 +1087,18 @@ func TestProtectedSharedPartitionPartialSealing(t *testing.T) {
 // acquired driver even though no backing or further forward work is allowed.
 func TestProtectedSharedPartitionNoPhantomOwner(t *testing.T) {
 	for _, pages := range []uint64{0, 4097} {
-		f := newPartitionSealFake()
+		f := newPartitionSealFake(t)
 		if err := executePartitionSealProof(context.Background(), f, pages, time.Minute); err == nil || len(f.steps) != 0 {
 			t.Error("invalid page bound acquired resources")
 		}
 	}
-	f := newPartitionSealFake()
+	f := newPartitionSealFake(t)
 	f.failKind, f.failVM, f.omitVM, f.failErr = "prepare", "a", true, errors.New("no returned VM")
 	if err := executePartitionSealProof(context.Background(), f, 1, time.Minute); err == nil ||
 		partitionStepPosition(f.steps, "terminate", "", "") >= 0 || f.doubleClose {
 		t.Error("failed acquisition invented a VM owner")
 	}
-	f = newPartitionSealFake()
+	f = newPartitionSealFake(t)
 	f.evidenceErr = errors.New("evidence write failed")
 	if err := executePartitionSealProof(context.Background(), f, 1, time.Minute); err == nil ||
 		partitionStepPosition(f.steps, "open", "", "") >= 0 ||

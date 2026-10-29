@@ -65,10 +65,10 @@ const (
 	protectedSharedHvPolicyDenied uint32 = 0xc0350006
 )
 
-// protectedSharedHvTarget borrows a caller-validated owned partition identity
-// and one 4-KiB-aligned page GPA. The caller must obtain ID/validity from its
-// serialized HCS partition-action outcome, never enumeration or an ID guess.
-// Neither these diagnostics nor this struct grant authority to access a VM.
+// protectedSharedHvTarget borrows a diagnostic partition ID selected by complete
+// before/after child enumeration around serialized VM creation/start on a quiet,
+// isolated host, plus one 4-KiB-aligned page GPA. The validity marker records
+// successful correlation, not trusted identity, ownership or access authority.
 type protectedSharedHvTarget struct {
 	partitionID      uint64
 	partitionIDValid bool
@@ -286,13 +286,13 @@ func uniqueProtectedSharedHvAddedChild(before, after protectedSharedHvSnapshot) 
 
 // encodeProtectedSharedHvRequest fills a fresh zeroed header/native AMD64 frame
 // for exactly one eight-byte, inside-page VP0/VTL0 write-back access. It checks
-// owned-ID validity, rejects self/invalid IDs, unaligned pages and address
+// diagnostic-ID validity, rejects self/invalid IDs, unaligned pages and address
 // overflow before encoding. Data is copied only for writes. Errors yield no
 // usable request and change no native state; returned bytes belong to caller.
 func encodeProtectedSharedHvRequest(target protectedSharedHvTarget, offset uint32, write bool, data [8]byte) ([]byte, error) {
 	if !target.partitionIDValid || target.partitionID == 0 || target.partitionID == math.MaxUint64 ||
 		target.pageGPA%4096 != 0 || target.pageGPA > math.MaxUint64-4095 || offset > 4096-8 {
-		return nil, errors.New("hvtest probe requires owned identity and an eight-byte inside-page GPA")
+		return nil, errors.New("hvtest probe requires a correlated diagnostic target and an eight-byte inside-page GPA")
 	}
 	size, id := protectedSharedHvReadInputSize, protectedSharedHvReadID
 	if write {
