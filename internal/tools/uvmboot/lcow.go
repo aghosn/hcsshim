@@ -214,6 +214,15 @@ var lcowCommand = cli.Command{
 			Usage: "After the shared-memory guest module, load this matching " +
 				"sibling_bus.ko and wait for the host's sibling-link offer.",
 		},
+		cli.StringFlag{
+			Name: siblingStorageBackendsArgName,
+			Usage: "Export disposable VHD backends through the Linux diode using this JSON plan. " +
+				"The existing workload RP root stays unchanged; startup performs no test writes.",
+		},
+		cli.BoolFlag{
+			Name:  validateStorageBackendsArgName,
+			Usage: "Validate --sibling-storage-backends and exit without creating VMs.",
+		},
 		cli.BoolFlag{
 			Name: siblingDiodeUplinkArgName,
 			Usage: "With the sibling bus, give the diode a NIC on the " +
@@ -294,6 +303,18 @@ var lcowCommand = cli.Command{
 	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
+			return err
+		}
+		storagePlan, err := loadSiblingStoragePlan(c)
+		if err != nil {
+			return err
+		}
+		if c.Bool(validateStorageBackendsArgName) {
+			data, err := json.Marshal(storagePlan)
+			if err != nil {
+				return fmt.Errorf("encode sibling storage backend plan: %w", err)
+			}
+			_, err = fmt.Printf("storage_backend_plan: %s\n", data)
 			return err
 		}
 		benchSeconds = c.Int(benchSecondsArgName)
@@ -620,6 +641,7 @@ var lcowCommand = cli.Command{
 				ctx,
 				options,
 				c,
+				storagePlan,
 				execCommand,
 				func(
 					uvmID string,
@@ -976,6 +998,7 @@ func runLCOW(
 	ctx context.Context,
 	options *uvm.OptionsLCOW,
 	c *cli.Context,
+	storagePlan *siblingStoragePlan,
 	execCommand string,
 	mappingObserver func(
 		string,
@@ -1076,6 +1099,26 @@ func runLCOW(
 
 	if err := mountSCSI(ctx, c, vm); err != nil {
 		return err
+	}
+
+	backends, err := prepareSiblingStorageBackends(ctx, vm.ID(), storagePlan,
+		func(ctx context.Context, disk siblingStorageDisk) (siblingStorageAttachment, error) {
+			return attachSiblingStorageDisk(ctx, vm, disk)
+		})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, backends.close(ctx))
+	}()
+	for _, report := range backends.reports {
+		data, err := json.Marshal(report)
+		if err != nil {
+			return fmt.Errorf("encode sibling storage backend mapping: %w", err)
+		}
+		if _, err := fmt.Printf("storage_backend_config: %s\n", data); err != nil {
+			return fmt.Errorf("write sibling storage backend mapping: %w", err)
+		}
 	}
 
 	if err := shareFiles(ctx, c, vm); err != nil {
@@ -1228,6 +1271,26 @@ func runLCOW(
 						netCfg,
 						uplink,
 					)
+				}
+				if storagePlan != nil {
+					storageModulePath := ""
+					if role == diodeRole {
+						storageModulePath = "/run/diode-storage-module/diode_storvsp.ko"
+						hostModulePath := filepath.Join(filepath.Dir(busModulePath), "diode_storvsp.ko")
+						if err := vm.Share(ctx, hostModulePath, "/run/diode-storage-module", true); err != nil {
+							return fmt.Errorf("share diode storage provider: %w", err)
+						}
+					} else {
+						hostTestPath := filepath.Join(filepath.Dir(busModulePath), "diode_storage_test")
+						if err := vm.Share(ctx, hostTestPath, "/run/diode-storage-test", true); err != nil {
+							return fmt.Errorf("share disposable storage test: %w", err)
+						}
+					}
+					storageCommand, err := siblingStorageGuestCommand(storageModulePath, role, storagePlan, backends.reports)
+					if err != nil {
+						return err
+					}
+					execCommand += "; " + storageCommand
 				}
 			}
 		}
