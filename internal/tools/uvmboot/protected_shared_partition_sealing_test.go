@@ -21,6 +21,50 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// TestProtectedSharedHvInterfacePath requires the active hvtest interface GUID
+// and returns the enumerated PnP path, not the nonexistent legacy alias. Missing,
+// duplicate (including the observed ROOT/UNKNOWN instance), empty or failed
+// enumeration must publish no path, preventing arbitrary device selection.
+func TestProtectedSharedHvInterfacePath(t *testing.T) {
+	const path = `\\?\ROOT#HVTEST#0000#{795e12bd-1d51-4e15-9f8a-4bad23d6bb4d}`
+	const duplicate = `\\?\ROOT#UNKNOWN#0000#{795e12bd-1d51-4e15-9f8a-4bad23d6bb4d}`
+	enumerationErr := errors.New("interface enumeration failed")
+	for _, scenario := range []struct {
+		name  string
+		paths []string
+		err   error
+		want  string
+	}{
+		{"single active interface", []string{path}, nil, path},
+		{"missing interface", nil, nil, ""},
+		{"duplicate instances", []string{path, duplicate}, nil, ""},
+		{"empty path", []string{""}, nil, ""},
+		{"enumeration failure", []string{path}, enumerationErr, ""},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			calls := 0
+			got, err := protectedSharedHvInterfacePath(func(deviceID string, class *windows.GUID, flags uint32) ([]string, error) {
+				calls++
+				if deviceID != "" || class == nil || !strings.EqualFold(class.String(), "{795e12bd-1d51-4e15-9f8a-4bad23d6bb4d}") ||
+					flags != windows.CM_GET_DEVICE_INTERFACE_LIST_PRESENT {
+					t.Fatal("enumeration did not request all active hvtest interfaces")
+				}
+				return scenario.paths, scenario.err
+			})
+			if calls != 1 || got != scenario.want || (err == nil) != (scenario.want != "") {
+				t.Fatalf("path=%q error=%v calls=%d, want path=%q", got, err, calls, scenario.want)
+			}
+			if scenario.err != nil && !errors.Is(err, scenario.err) {
+				t.Fatal("enumeration error was not preserved")
+			}
+			if scenario.name == "duplicate instances" &&
+				(!strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), duplicate)) {
+				t.Fatal("ambiguity error did not identify both device interfaces")
+			}
+		})
+	}
+}
+
 // protectedSharedHvGolden decodes test-only literal wire bytes. Invalid fixture
 // text fails the calling test, never a transport or native operation.
 func protectedSharedHvGolden(t *testing.T, text string) []byte {

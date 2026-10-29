@@ -104,22 +104,54 @@ type protectedSharedHvProbe struct {
 	ioctl  protectedSharedHvIOCTL
 }
 
-// openProtectedSharedHvProbe opens only the installed \\.\hvtest with the same
-// read/write access and sharing as tfdeviceadapter.cpp. The caller owns Close.
-// Unsupported architecture, missing device or ACL errors are prerequisites,
-// never a policy-denial result. Call before acquiring backing or starting VMs.
+// protectedSharedHvInterfacePath enumerates active interfaces registered by the
+// matched WDF hvtest driver, which does not create the legacy \\.\hvtest alias.
+// Exactly one interface is required; missing/ambiguous results or enumeration
+// errors yield no path. enumerate is a synchronous test seam and retains nothing.
+func protectedSharedHvInterfacePath(enumerate func(string, *windows.GUID, uint32) ([]string, error)) (string, error) {
+	// onecore/hv/test/hvtest/inc/hvtestpublic.h: HVTW_INTERFACE_GUID.
+	interfaceClass := windows.GUID{
+		Data1: 0x795e12bd,
+		Data2: 0x1d51,
+		Data3: 0x4e15,
+		Data4: [8]byte{0x9f, 0x8a, 0x4b, 0xad, 0x23, 0xd6, 0xbb, 0x4d},
+	}
+	paths, err := enumerate("", &interfaceClass, windows.CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
+	if err != nil {
+		return "", fmt.Errorf("enumerate active hvtest device interfaces: %w", err)
+	}
+	if len(paths) == 0 {
+		return "", errors.New("no active hvtest device interface; install and enable the matched driver")
+	}
+	if len(paths) != 1 {
+		return "", fmt.Errorf("expected exactly one active hvtest device interface, found %d: %v; remove duplicate hvtest device instances", len(paths), paths)
+	}
+	if paths[0] == "" {
+		return "", errors.New("hvtest enumeration returned an empty device interface path")
+	}
+	return paths[0], nil
+}
+
+// openProtectedSharedHvProbe opens the single active installed hvtest PnP
+// interface with read/write access and sharing as tfdeviceadapter.cpp. The caller
+// owns Close. Unsupported architecture, missing/duplicate devices or ACL errors
+// are prerequisites, never policy denial. Call before acquiring backing or VMs.
 func openProtectedSharedHvProbe() (*protectedSharedHvProbe, error) {
 	if runtime.GOARCH != "amd64" {
 		return nil, errors.New("hvtest GPA probe prerequisite: Windows AMD64 required")
 	}
-	name, err := windows.UTF16PtrFromString(`\\.\hvtest`)
+	path, err := protectedSharedHvInterfacePath(windows.CM_Get_Device_Interface_List)
+	if err != nil {
+		return nil, fmt.Errorf("hvtest GPA probe prerequisite: %w", err)
+	}
+	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return nil, err
 	}
 	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open installed hvtest GPA probe prerequisite: %w", err)
+		return nil, fmt.Errorf("open installed hvtest GPA probe prerequisite %q: %w", path, err)
 	}
 	return &protectedSharedHvProbe{handle: handle, ioctl: protectedSharedHvDeviceIOCTL}, nil
 }

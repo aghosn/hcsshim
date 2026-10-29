@@ -93,6 +93,7 @@ var (
 	procHcsStartLiveMigrationOnSource              = modcomputecore.NewProc("HcsStartLiveMigrationOnSource")
 	procHcsStartLiveMigrationTransfer              = modcomputecore.NewProc("HcsStartLiveMigrationTransfer")
 	procHcsSubmitWerReport                         = modcomputecore.NewProc("HcsSubmitWerReport")
+	procHcsSystemControl                           = modcomputecore.NewProc("HcsSystemControl")
 	procHcsTerminateComputeSystem                  = modcomputecore.NewProc("HcsTerminateComputeSystem")
 	procHcsTerminateProcess                        = modcomputecore.NewProc("HcsTerminateProcess")
 	procHcsWaitForComputeSystemExit                = modcomputecore.NewProc("HcsWaitForComputeSystemExit")
@@ -1173,6 +1174,35 @@ func _hcsSubmitWerReport(settings *uint16) (hr error) {
 		return
 	}
 	r0, _, _ := syscall.SyscallN(procHcsSubmitWerReport.Addr(), uintptr(unsafe.Pointer(settings)))
+	if int32(r0) < 0 {
+		if r0&0x1fff0000 == 0x00070000 {
+			r0 &= 0xffff
+		}
+		hr = syscall.Errno(r0)
+	}
+	return
+}
+
+func hcsSystemControl(computeSystem HcsSystem, operation HcsOperation, uri string, input string) (hr error) {
+	var _p0 *uint16
+	_p0, hr = syscall.UTF16PtrFromString(uri)
+	if hr != nil {
+		return
+	}
+	var _p1 *uint16
+	_p1, hr = syscall.UTF16PtrFromString(input)
+	if hr != nil {
+		return
+	}
+	return _hcsSystemControl(computeSystem, operation, _p0, _p1)
+}
+
+func _hcsSystemControl(computeSystem HcsSystem, operation HcsOperation, uri *uint16, input *uint16) (hr error) {
+	hr = procHcsSystemControl.Find()
+	if hr != nil {
+		return
+	}
+	r0, _, _ := syscall.SyscallN(procHcsSystemControl.Addr(), uintptr(computeSystem), uintptr(operation), uintptr(unsafe.Pointer(uri)), uintptr(unsafe.Pointer(input)))
 	if int32(r0) < 0 {
 		if r0&0x1fff0000 == 0x00070000 {
 			r0 &= 0xffff
