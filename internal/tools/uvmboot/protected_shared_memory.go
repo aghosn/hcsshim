@@ -598,7 +598,7 @@ func selectProtectedProofRegion(regions []hcsschema.SharedMemoryRegionInfo, prim
 			}
 			found = r
 		case expected == 2 && r.SectionName == late:
-			if lateFound || r.ProtectedShared != nil || r.ProtectedSharedPartition != nil {
+			if lateFound || r.ProtectedShared != nil {
 				return nil, errors.New("late slot is duplicate or already protected")
 			}
 			if _, err := uvm.SharedMemoryByteGPA(int64(r.GuestPhysicalAddress), 4096); err != nil {

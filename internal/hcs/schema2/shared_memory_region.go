@@ -21,11 +21,6 @@ const (
 	ProtectedSharedBeginTeardown ProtectedSharedAction = "BeginTeardown"
 	ProtectedSharedRemove        ProtectedSharedAction = "Remove"
 	ProtectedSharedReclaim       ProtectedSharedAction = "Reclaim"
-
-	// PartitionIdentity and SealPartition are whole-VM owned-handle actions,
-	// not page lifecycle operations. Seal remains the distinct page-lock action.
-	ProtectedSharedPartitionIdentity ProtectedSharedAction = "PartitionIdentity"
-	ProtectedSharedSealPartition     ProtectedSharedAction = "SealPartition"
 )
 
 type SharedMemoryRegion struct {
