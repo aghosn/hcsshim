@@ -260,6 +260,312 @@ func TestProtectedSharedHvProbePrerequisites(t *testing.T) {
 	}
 }
 
+// TestProtectedSharedHvChildrenGolden covers U1-a with empty and nonempty
+// sequences in nonnumeric order. Literal AMD64 frames protect testcase 101/20,
+// the 16-byte padded header/input and native output ID at 8, not packed offset 4.
+// The synchronous fake checks alignment/zero padding without opening a driver;
+// successful INVALID termination alone yields a complete, nonnil snapshot.
+func TestProtectedSharedHvChildrenGolden(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("wire transport client is explicitly Windows AMD64 only")
+	}
+	for _, sequence := range [][]string{
+		{"0000000000000000"},
+		{"0807060504030201", "2a00000000000000", "0000000000000000"},
+	} {
+		calls := 0
+		previous := "0000000000000000"
+		// The fake borrows only this call's aligned buffers. Nonzero output
+		// padding proves the decoder reads the child at offset 8, not 4.
+		ioctl := func(handle windows.Handle, code uint32, input, output []byte) (uint32, error) {
+			if calls >= len(sequence) {
+				t.Fatal("enumeration continued after INVALID")
+			}
+			golden := protectedSharedHvGolden(t, "14006500"+"000000000000000000000000"+
+				"ffffffffffffffff"+previous)
+			if handle != 123 || code != 9 || len(input) != 32 || len(output) != 16 ||
+				uintptr(unsafe.Pointer(&input[0]))%16 != 0 || uintptr(unsafe.Pointer(&output[0]))%16 != 0 ||
+				!bytes.Equal(input, golden) || !bytes.Equal(output, make([]byte, 16)) {
+				t.Fatal("enumeration handle/code/frame/alignment/zero initialization differs from ABI")
+			}
+			copy(output, protectedSharedHvGolden(t, "00000000aabbccdd"+sequence[calls]))
+			previous = sequence[calls]
+			calls++
+			return 16, nil
+		}
+		probe := &protectedSharedHvProbe{handle: 123, ioctl: ioctl}
+		snapshot, err := probe.children(context.Background())
+		if err != nil || snapshot == nil || len(snapshot) != len(sequence)-1 || calls != len(sequence) {
+			t.Fatalf("complete enumeration failed: children=%d calls=%d err=%v", len(snapshot), calls, err)
+		}
+		for _, wireID := range sequence[:len(sequence)-1] {
+			id := binary.LittleEndian.Uint64(protectedSharedHvGolden(t, wireID))
+			if _, found := snapshot[id]; !found {
+				t.Fatal("snapshot omitted a successfully enumerated child")
+			}
+		}
+		if _, found := snapshot[0]; found {
+			t.Fatal("INVALID became a child")
+		}
+	}
+}
+
+// TestProtectedSharedHvChildrenFailures covers U1-b after a valid first child:
+// native failures (including junk/INVALID output), nonzero informational status,
+// ACL/transport failures and short/long framing must discard all progress.
+// Decoder buffer-length checks also reject malformed slices before interpreting
+// output; failure must never masquerade as successful exhaustion or a usable ID.
+func TestProtectedSharedHvChildrenFailures(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("wire transport client is explicitly Windows AMD64 only")
+	}
+	transportErr := errors.New("enumeration IOCTL failed")
+	for _, scenario := range []struct {
+		name     string
+		status   uint32
+		id       uint64
+		returned uint32
+		err      error
+	}{
+		{"native INVALID", 0xc035000d, 0, 16, nil},
+		{"native junk", 0xc035000d, math.MaxUint64, 16, nil},
+		{"informational INVALID", 1, 0, 16, nil},
+		{"informational child", 1, 88, 16, nil},
+		{"short", 0, 0, 15, nil},
+		{"long", 0, 0, 17, nil},
+		{"ACL", 0, 0, 16, windows.ERROR_ACCESS_DENIED},
+		{"transport", 0, 0, 16, transportErr},
+	} {
+		// Each case returns one valid child before the injected failure so
+		// accepting partial progress cannot hide behind an empty baseline.
+		t.Run(scenario.name, func(t *testing.T) {
+			calls := 0
+			// This synchronous fake supplies synthetic native output only;
+			// its second call must be the final call on every failure path.
+			ioctl := func(_ windows.Handle, _ uint32, _ []byte, output []byte) (uint32, error) {
+				calls++
+				if calls == 1 {
+					binary.LittleEndian.PutUint64(output[8:16], 42)
+					return 16, nil
+				}
+				if calls != 2 {
+					t.Fatal("enumeration continued after a failed response")
+				}
+				binary.LittleEndian.PutUint32(output[0:4], scenario.status)
+				binary.LittleEndian.PutUint64(output[8:16], scenario.id)
+				return scenario.returned, scenario.err
+			}
+			probe := &protectedSharedHvProbe{handle: 123, ioctl: ioctl}
+			snapshot, err := probe.children(context.Background())
+			if snapshot != nil || err == nil || calls != 2 {
+				t.Fatal("failed enumeration published a partial set or continued traversal")
+			}
+			if scenario.err != nil && !errors.Is(err, scenario.err) {
+				t.Error("enumeration lost the underlying transport error")
+			}
+			output := make([]byte, 16)
+			binary.LittleEndian.PutUint32(output[0:4], scenario.status)
+			binary.LittleEndian.PutUint64(output[8:16], scenario.id)
+			id, err := decodeProtectedSharedHvNextChildResult(output, scenario.returned, scenario.err)
+			if id != 0 || err == nil {
+				t.Fatal("failed decoder returned a usable ID")
+			}
+		})
+	}
+	for _, length := range []int{0, 15, 17} {
+		id, err := decodeProtectedSharedHvNextChildResult(make([]byte, length), 16, nil)
+		if id != 0 || err == nil {
+			t.Errorf("output buffer length %d accepted", length)
+		}
+	}
+}
+
+// TestProtectedSharedHvChildrenBounds covers U1-c SELF/repeat/cycle rejection
+// and the finite traversal limit. Exactly 65,536 returned children followed by
+// INVALID succeeds; a 65,537th child fails without publishing partial progress.
+// This guards both an off-by-one limit and unbounded changing-list traversal.
+func TestProtectedSharedHvChildrenBounds(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("wire transport client is explicitly Windows AMD64 only")
+	}
+	if protectedSharedHvMaxChildren != 65536 {
+		t.Fatal("isolated-host traversal bound changed")
+	}
+	for _, scenario := range []struct {
+		name     string
+		ids      []uint64
+		calls    int
+		complete bool
+	}{
+		{"SELF", []uint64{42, math.MaxUint64}, 2, false},
+		{"repeat", []uint64{42, 42}, 2, false},
+		{"cycle", []uint64{42, 88, 42}, 3, false},
+		{"limit then termination", nil, 65537, true},
+		{"no termination", nil, 65537, false},
+	} {
+		// Each case independently bounds fake calls; no real partition list
+		// or driver state is changed by the synthetic traversal.
+		t.Run(scenario.name, func(t *testing.T) {
+			calls := 0
+			// This fake returns either the malformed sequence or increasing
+			// IDs; only the complete boundary case returns terminal INVALID.
+			ioctl := func(_ windows.Handle, _ uint32, _ []byte, output []byte) (uint32, error) {
+				calls++
+				if calls > scenario.calls {
+					t.Fatal("enumeration exceeded the expected bounded calls")
+				}
+				id := uint64(calls)
+				if scenario.ids != nil {
+					id = scenario.ids[calls-1]
+				} else if scenario.complete && calls == scenario.calls {
+					id = 0
+				}
+				binary.LittleEndian.PutUint64(output[8:16], id)
+				return 16, nil
+			}
+			probe := &protectedSharedHvProbe{handle: 123, ioctl: ioctl}
+			snapshot, err := probe.children(context.Background())
+			if calls != scenario.calls || (err == nil) != scenario.complete ||
+				(!scenario.complete && snapshot != nil) {
+				t.Fatal("malformed or excessive traversal did not fail closed at the bound")
+			}
+			if scenario.complete && (snapshot == nil || len(snapshot) != 65536) {
+				t.Fatal("maximum valid snapshot was not published")
+			}
+		})
+	}
+}
+
+// TestProtectedSharedHvChildrenContext covers U1-c pre-cancelled/expired
+// contexts and cancellation during a child or terminal synchronous response,
+// including after earlier successful progress.
+// No call starts with an expired context, and cancellation observed on return
+// discards even complete output. It does not claim in-flight IOCTL cancellation.
+func TestProtectedSharedHvChildrenContext(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("wire transport client is explicitly Windows AMD64 only")
+	}
+	for _, scenario := range []string{"cancelled", "deadline", "during child", "during termination", "after progress"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		wantErr, wantCalls := error(context.Canceled), 0
+		switch scenario {
+		case "cancelled":
+			cancel()
+		case "deadline":
+			cancel()
+			ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			wantErr = context.DeadlineExceeded
+		case "after progress":
+			wantCalls = 2
+		default:
+			wantCalls = 1
+		}
+		calls := 0
+		// The synchronous fake cancels while borrowing the buffers and
+		// still returns normally, modeling a non-cancellable native call.
+		ioctl := func(_ windows.Handle, _ uint32, _ []byte, output []byte) (uint32, error) {
+			calls++
+			if calls > wantCalls {
+				t.Fatal("enumeration invoked IOCTL after observed cancellation")
+			}
+			if scenario == "after progress" && calls == 1 {
+				binary.LittleEndian.PutUint64(output[8:16], 42)
+				return 16, nil
+			}
+			if scenario == "during child" {
+				binary.LittleEndian.PutUint64(output[8:16], 42)
+			}
+			cancel()
+			return 16, nil
+		}
+		probe := &protectedSharedHvProbe{handle: 123, ioctl: ioctl}
+		snapshot, err := probe.children(ctx)
+		cancel()
+		if snapshot != nil || !errors.Is(err, wantErr) || calls != wantCalls {
+			t.Errorf("%s: cancellation/deadline published output or issued another call", scenario)
+		}
+	}
+}
+
+// protectedSharedHvChildSet creates an owned synthetic snapshot for pure U2
+// tests. No arguments deliberately yields a nonnil complete empty set; callers
+// use nil explicitly to model an enumeration error, never a partial snapshot.
+func protectedSharedHvChildSet(ids ...uint64) protectedSharedHvSnapshot {
+	snapshot := make(protectedSharedHvSnapshot)
+	for _, id := range ids {
+		snapshot[id] = struct{}{}
+	}
+	return snapshot
+}
+
+// TestProtectedSharedHvUniqueAddedChild covers pure U2-a on empty/nonempty
+// baselines with different insertion orders and a numerically smaller new ID.
+// Sequential A/B selection must preserve A and choose distinct IDs without
+// numeric ordering heuristics or changing either borrowed snapshot.
+func TestProtectedSharedHvUniqueAddedChild(t *testing.T) {
+	for _, baseline := range []protectedSharedHvSnapshot{
+		protectedSharedHvChildSet(), protectedSharedHvChildSet(900, 700),
+		protectedSharedHvChildSet(700, 900),
+	} {
+		afterA := protectedSharedHvChildSet(42)
+		afterB := protectedSharedHvChildSet(11, 42)
+		for id := range baseline {
+			afterA[id] = struct{}{}
+			afterB[id] = struct{}{}
+		}
+		a, err := uniqueProtectedSharedHvAddedChild(baseline, afterA)
+		if err != nil || a != 42 {
+			t.Fatalf("A correlation failed: id=%d err=%v", a, err)
+		}
+		b, err := uniqueProtectedSharedHvAddedChild(afterA, afterB)
+		if err != nil || b != 11 || a == b {
+			t.Fatalf("B correlation failed: id=%d err=%v", b, err)
+		}
+		if len(afterA) != len(baseline)+1 || len(afterB) != len(baseline)+2 {
+			t.Fatal("selection mutated borrowed snapshot sizes")
+		}
+		for id := range baseline {
+			if _, retained := afterA[id]; !retained {
+				t.Fatal("selection mutated baseline retention")
+			}
+		}
+		if _, retained := afterA[a]; !retained {
+			t.Fatal("B baseline lost A")
+		}
+		if _, retained := afterB[a]; !retained {
+			t.Fatal("B after snapshot lost A")
+		}
+	}
+}
+
+// TestProtectedSharedHvUniqueAddedChildRejects covers pure U2-b: incomplete
+// snapshots, absent/ambiguous additions, disappearing baseline (including A),
+// and invalid sentinel IDs anywhere in the sets must return an error and zero,
+// never a guessed candidate. Orchestration/probe suppression is reserved for S3.
+func TestProtectedSharedHvUniqueAddedChildRejects(t *testing.T) {
+	for _, scenario := range []struct {
+		name          string
+		before, after protectedSharedHvSnapshot
+	}{
+		{"before enumeration error", nil, protectedSharedHvChildSet(42)},
+		{"after enumeration error", protectedSharedHvChildSet(42), nil},
+		{"no child", protectedSharedHvChildSet(), protectedSharedHvChildSet()},
+		{"no addition", protectedSharedHvChildSet(42), protectedSharedHvChildSet(42)},
+		{"multiple", protectedSharedHvChildSet(700), protectedSharedHvChildSet(11, 700, 42)},
+		{"removed baseline", protectedSharedHvChildSet(700, 900), protectedSharedHvChildSet(700, 42)},
+		{"absent known A", protectedSharedHvChildSet(42, 700), protectedSharedHvChildSet(700, 11)},
+		{"INVALID candidate", protectedSharedHvChildSet(), protectedSharedHvChildSet(0)},
+		{"SELF candidate", protectedSharedHvChildSet(), protectedSharedHvChildSet(math.MaxUint64)},
+		{"INVALID baseline", protectedSharedHvChildSet(0), protectedSharedHvChildSet(0, 42)},
+		{"SELF baseline", protectedSharedHvChildSet(math.MaxUint64), protectedSharedHvChildSet(math.MaxUint64, 42)},
+	} {
+		id, err := uniqueProtectedSharedHvAddedChild(scenario.before, scenario.after)
+		if id != 0 || err == nil || err.Error() == "" {
+			t.Errorf("%s: rejected correlation published a candidate or lacked a diagnostic", scenario.name)
+		}
+	}
+}
+
 // partitionSealFake records only runner steps, acquired owners and supplied
 // lifecycle prefixes. It is not a VM, HCS, driver or HV-policy simulation.
 // The single chosen failing step may still return valid ownership/progress;

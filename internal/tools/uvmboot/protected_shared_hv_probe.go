@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -20,7 +21,10 @@ import (
 //   - test/common/tf/inc/tfkcontrol.h: type 0, function 2, METHOD_IN_DIRECT (1),
 //     FILE_ANY_ACCESS (0); TFK_TESTCASE_HEADER is size/alignment 16, NOT 4.
 //   - test/common/tf/inc/tfcomponent.h and hvtest/inc/hvtestcasedefs.h:
-//     component 101, ReadGpa 35, WriteGpa 36.
+//     component 101, GetNextChildPartition 20, ReadGpa 35, WriteGpa 36.
+//   - GetNextChildPartition uses native input ParentId 0, PreviousChildId 8
+//     (16 bytes), output Status 0, padding 4..7, NextChildId 8 (16 bytes).
+//     hvtestcaseslist.h registers the existing WinHvKtGetNextChildPartition.
 //   - test/nt/winhv/inc/winhvkt.h: native (not packed) AMD64 input offsets
 //     PartitionId 0, VpIndex 8, BaseGpa 16, ByteCount 24, ControlFlags 32,
 //     write DataBuffer[16] 40; sizes 40/56. Output Status 0, padding 4..7,
@@ -31,6 +35,7 @@ import (
 // or static winhvtf.lib-as-DLL calls are involved.
 const (
 	protectedSharedHvIOCTLCode       uint32 = (2 << 2) | 1
+	protectedSharedHvNextChildID     uint32 = (101 << 16) | 20
 	protectedSharedHvReadID          uint32 = (101 << 16) | 35
 	protectedSharedHvWriteID         uint32 = (101 << 16) | 36
 	protectedSharedHvHeaderSize            = 16
@@ -38,6 +43,12 @@ const (
 	protectedSharedHvWriteInputSize        = 56
 	protectedSharedHvReadOutputSize        = 32
 	protectedSharedHvWriteOutputSize       = 16
+	protectedSharedHvNextChildInputSize    = 16
+	protectedSharedHvNextChildOutputSize   = 16
+
+	// Bound diagnostic traversal on the isolated host, including a changing
+	// child list. A terminal call after this many children is still allowed.
+	protectedSharedHvMaxChildren = 65536
 
 	// hvx/inc/HvAmApi.h defines CacheType byte 0 (WriteBack=6), InputVtl
 	// byte 1; published/hvgdk_mini.w HV_INPUT_VTL has TargetVtl bits 0..3,
@@ -80,14 +91,14 @@ type protectedSharedHvProbeResult struct {
 	data              [8]byte
 }
 
-// protectedSharedHvIOCTL is only a synchronous DeviceIoControl seam for the two
+// protectedSharedHvIOCTL is only a synchronous DeviceIoControl seam for the three
 // existing test cases. The function borrows aligned slices for the entire call,
 // may fill output, returns actual bytes, and must not retain buffers or handle.
 type protectedSharedHvIOCTL func(windows.Handle, uint32, []byte, []byte) (uint32, error)
 
 // protectedSharedHvProbe exclusively owns an already installed driver's handle.
-// Callers serialize all reads/writes/Close and keep the VM/target alive through
-// each synchronous call. It does not own, create or configure driver/VM/backing.
+// Callers serialize enumeration/reads/writes/Close and keep the VM/target alive
+// through each synchronous call. It does not own, create or configure driver/VM/backing.
 type protectedSharedHvProbe struct {
 	handle windows.Handle
 	ioctl  protectedSharedHvIOCTL
@@ -144,6 +155,133 @@ func protectedSharedHvAligned(size int) (storage, view []byte) {
 	storage = make([]byte, size+15)
 	offset := int((16 - uintptr(unsafe.Pointer(&storage[0]))%16) % 16)
 	return storage, storage[offset : offset+size]
+}
+
+// protectedSharedHvSnapshot is a complete, caller-owned child-ID set. A nil
+// snapshot is unusable (including enumeration failure); a nonnil empty set is
+// valid. It is diagnostic correlation on a quiet host, not ownership authority
+// or an atomic view of a concurrently changing partition tree.
+type protectedSharedHvSnapshot map[uint64]struct{}
+
+// encodeProtectedSharedHvNextChildRequest returns owned, zero-padded AMD64
+// header/input bytes for root-parent SELF. Previous is INVALID (zero) initially,
+// otherwise a validated child from the preceding successful response. The
+// caller copies this frame into aligned storage before synchronous transport.
+func encodeProtectedSharedHvNextChildRequest(previous uint64) []byte {
+	frame := make([]byte, protectedSharedHvHeaderSize+protectedSharedHvNextChildInputSize)
+	binary.LittleEndian.PutUint32(frame[0:4], protectedSharedHvNextChildID)
+	input := frame[protectedSharedHvHeaderSize:]
+	binary.LittleEndian.PutUint64(input[0:8], math.MaxUint64)
+	binary.LittleEndian.PutUint64(input[8:16], previous)
+	return frame
+}
+
+// decodeProtectedSharedHvNextChildResult borrows an exact 16-byte native output
+// only after successful transport and requires exact STATUS_SUCCESS. It returns
+// zero (INVALID/end) or the next ID only on success; failed native output IDs
+// are never interpreted. Errors return no usable ID and retain no buffer.
+func decodeProtectedSharedHvNextChildResult(output []byte, returned uint32, transportErr error) (uint64, error) {
+	if transportErr != nil {
+		return 0, fmt.Errorf("hvtest child enumeration transport: %w", transportErr)
+	}
+	if len(output) != protectedSharedHvNextChildOutputSize || returned != protectedSharedHvNextChildOutputSize {
+		return 0, fmt.Errorf("hvtest child enumeration protocol size mismatch: buffer=%d returned=%d expected=%d",
+			len(output), returned, protectedSharedHvNextChildOutputSize)
+	}
+	if status := binary.LittleEndian.Uint32(output[0:4]); status != 0 {
+		return 0, fmt.Errorf("hvtest child enumeration native status=%#08x", status)
+	}
+	return binary.LittleEndian.Uint64(output[8:16]), nil
+}
+
+// children enumerates root children through the existing installed-driver seam.
+// The caller serializes it against other operations/Close. Aligned owned storage
+// survives each full synchronous IOCTL; context is checked between calls and
+// before publishing, but cannot cancel an in-flight syscall. Only successful
+// INVALID termination publishes a complete owned set. Transport/framing/native
+// errors, SELF, repeats/cycles, cancellation and more than
+// protectedSharedHvMaxChildren returned children discard all progress and return
+// nil, never a partial snapshot.
+func (p *protectedSharedHvProbe) children(ctx context.Context) (protectedSharedHvSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if runtime.GOARCH != "amd64" || p == nil || p.handle == 0 || p.handle == windows.InvalidHandle || p.ioctl == nil {
+		return nil, errors.New("hvtest child enumeration prerequisite: unavailable AMD64 driver client")
+	}
+	children := make(protectedSharedHvSnapshot)
+	var previous uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		frame := encodeProtectedSharedHvNextChildRequest(previous)
+		inputStorage, input := protectedSharedHvAligned(len(frame))
+		copy(input, frame)
+		outputStorage, output := protectedSharedHvAligned(protectedSharedHvNextChildOutputSize)
+		returned, ioctlErr := p.ioctl(p.handle, protectedSharedHvIOCTLCode, input, output)
+		runtime.KeepAlive(inputStorage)
+		runtime.KeepAlive(outputStorage)
+
+		// Cancellation during a synchronous call cannot abort it, but must
+		// prevent even a terminal response from publishing a usable snapshot.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		next, err := decodeProtectedSharedHvNextChildResult(output, returned, ioctlErr)
+		if err != nil {
+			return nil, err
+		}
+		if next == 0 {
+			return children, nil
+		}
+		if next == math.MaxUint64 {
+			return nil, errors.New("hvtest child enumeration returned SELF")
+		}
+		if _, repeated := children[next]; repeated {
+			return nil, errors.New("hvtest child enumeration repeated a child ID or cycled")
+		}
+		if len(children) == protectedSharedHvMaxChildren {
+			return nil, fmt.Errorf("hvtest child enumeration exceeded %d children", protectedSharedHvMaxChildren)
+		}
+		children[next] = struct{}{}
+		previous = next
+	}
+}
+
+// uniqueProtectedSharedHvAddedChild borrows complete before/after sets without
+// mutation and returns the sole added valid ID only if all baseline children
+// remain. Nil/invalid sets, removals and zero/multiple additions yield zero plus
+// an actionable error, never a candidate. This pure quiet-host correlation does
+// not prove identity/ownership and makes no numeric-ID ordering assumption.
+func uniqueProtectedSharedHvAddedChild(before, after protectedSharedHvSnapshot) (uint64, error) {
+	if before == nil || after == nil {
+		return 0, errors.New("partition discovery requires complete before/after child snapshots")
+	}
+	for id := range before {
+		if id == 0 || id == math.MaxUint64 {
+			return 0, errors.New("partition discovery baseline contains an invalid child ID")
+		}
+		if _, retained := after[id]; !retained {
+			return 0, errors.New("partition discovery lost a baseline child; require a quiet isolated host")
+		}
+	}
+	var added uint64
+	for id := range after {
+		if id == 0 || id == math.MaxUint64 {
+			return 0, errors.New("partition discovery after snapshot contains an invalid child ID")
+		}
+		if _, retained := before[id]; !retained {
+			if added != 0 {
+				return 0, errors.New("partition discovery found multiple added children; require a quiet isolated host")
+			}
+			added = id
+		}
+	}
+	if added == 0 {
+		return 0, errors.New("partition discovery found no added child")
+	}
+	return added, nil
 }
 
 // encodeProtectedSharedHvRequest fills a fresh zeroed header/native AMD64 frame
