@@ -309,6 +309,48 @@ func TestBenchmarkCPUValidationUsesPhysicalTopologyNotAdjacentLPs(t *testing.T) 
 	}
 }
 
+func TestBenchmarkMinRootRejectsRootAffinity(t *testing.T) {
+	for _, noSMT := range []bool{false, true} {
+		t.Run(strconv.FormatBool(noSMT), func(t *testing.T) {
+			topology := &hcsschema.ProcessorTopology{LogicalProcessors: []hcsschema.LogicalProcessor{
+				{LpIndex: 0, CoreId: 0, RootVpIndex: 0},
+				{LpIndex: 16, CoreId: 0, RootVpIndex: 1},
+				{LpIndex: 8, CoreId: 4, RootVpIndex: -1},
+				{LpIndex: 24, CoreId: 4, RootVpIndex: -1},
+				{LpIndex: 9, CoreId: 5, RootVpIndex: -1},
+				{LpIndex: 25, CoreId: 5, RootVpIndex: -1},
+			}}
+			if noSMT {
+				for i := range topology.LogicalProcessors {
+					topology.LogicalProcessors[i].CoreId = topology.LogicalProcessors[i].LpIndex
+				}
+			}
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}, {8, 24}}, noSMT); err != nil {
+				t.Fatalf("root-free placement rejected: %v", err)
+			}
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{0, 16}}, noSMT); err == nil ||
+				!strings.Contains(err.Error(), "root-partition LPs") {
+				t.Fatalf("root placement not rejected: %v", err)
+			}
+			topology.LogicalProcessors[3].RootVpIndex = 2
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err == nil ||
+				!strings.Contains(err.Error(), "root-partition LPs") {
+				t.Fatalf("partially root-owned placement not rejected: %v", err)
+			}
+			for i := range topology.LogicalProcessors {
+				topology.LogicalProcessors[i].RootVpIndex = int32(i)
+			}
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err != nil {
+				t.Fatalf("unrestricted-root placement rejected: %v", err)
+			}
+			topology.LogicalProcessors[0].RootVpIndex = -2
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err == nil {
+				t.Fatal("invalid root topology accepted")
+			}
+		})
+	}
+}
+
 func TestBenchmarkNoSMTRequiresIdenticalTwoCoreAffinities(t *testing.T) {
 	topology := &hcsschema.ProcessorTopology{LogicalProcessors: []hcsschema.LogicalProcessor{
 		{LpIndex: 0, CoreId: 0}, {LpIndex: 1, CoreId: 1},

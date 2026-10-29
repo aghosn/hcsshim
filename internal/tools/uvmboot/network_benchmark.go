@@ -26,6 +26,7 @@ const (
 	networkBenchmarkPortArgName    = "network-benchmark-port"
 	networkBenchmarkTimeoutArgName = "network-benchmark-timeout"
 	networkBenchmarkNoSMTArgName   = "network-benchmark-no-smt"
+	networkBenchmarkIdleArgName    = "network-benchmark-idle"
 )
 
 func validateNetworkBenchmarkServer(server string, addresses []net.Addr) (bool, error) {
@@ -52,10 +53,14 @@ func validateNetworkBenchmarkServer(server string, addresses []net.Addr) (bool, 
 func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
-			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) {
+			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
+			c.IsSet(networkBenchmarkIdleArgName) {
 			return errors.New("network benchmark server, port and timeout require --network-benchmark-script")
 		}
 		return nil
+	}
+	if idle := c.String(networkBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
+		return errors.New("network benchmark idle policy must be poll or halt")
 	}
 	addresses, err := net.InterfaceAddrs()
 	if err != nil {
@@ -106,7 +111,7 @@ func shareNetworkBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityV
 	return nil
 }
 
-func networkBenchmarkPreflight(role, server string, noSMT bool) string {
+func networkBenchmarkPreflight(role, server string, noSMT bool, idlePolicy string) string {
 	topologyCheck := `for c in 0 1; do s=$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list); ` +
 		`case "$s" in 0-1|0,1) :;; *) echo "network_benchmark: FAIL guest virtual SMT pair missing: cpu$c=$s" >&2; exit 1;; esac; done; `
 	topologyEvidence := "threads_per_core=2"
@@ -121,10 +126,12 @@ func networkBenchmarkPreflight(role, server string, noSMT bool) string {
 		`[ "$(cat /sys/devices/system/cpu/online)" = '0-1' ] || ` +
 		`{ echo 'network_benchmark: FAIL expected exactly two online VPs' >&2; exit 1; }; ` +
 		topologyCheck +
-		`case " $(cat /proc/cmdline) " in *' idle=poll '*) echo 'network_benchmark: FAIL idle=poll forbidden' >&2; exit 1;; esac; ` +
+		`idle=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^idle=/) print $i}' /proc/cmdline); ` +
+		`[ "$idle" = 'idle=` + idlePolicy + `' ] || ` +
+		`{ echo "network_benchmark: FAIL expected idle=` + idlePolicy + `, got: $idle" >&2; exit 1; }; ` +
 		`[ -x "$ipf" ] && "$ipf" --version 2>&1 | grep -F 'iperf version 2.2.1' || ` +
 		`{ echo 'network_benchmark: FAIL matching iperf2 not staged' >&2; exit 1; }; ` +
-		`echo 'network_benchmark: preflight role=` + role + ` snp=boot-evidence attestation=not-collected vcpus=2 ` + topologyEvidence + `'; ` +
+		`echo 'network_benchmark: preflight role=` + role + ` idle=` + idlePolicy + ` snp=boot-evidence attestation=not-collected vcpus=2 ` + topologyEvidence + `'; ` +
 		`uname -a; cat /proc/cmdline; cat /proc/cpuinfo; ip addr show; ip route; ` +
 		`ip route get ` + server + `; `
 }
@@ -141,7 +148,7 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 			`{ echo 'network_benchmark: FAIL baseline is not synthetic hv_netvsc' >&2; exit 1; }; `
 	}
 	script := "/run/network-benchmark/" + filepath.Base(c.String(networkBenchmarkScriptArgName))
-	return networkBenchmarkPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName)) + deviceCheck +
+	return networkBenchmarkPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		`cp ` + shellSingleQuote(script) + ` /run/dtb-exec/network-benchmark.sh; ` +
@@ -167,7 +174,7 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 	return command + siblingDiodeUplinkCommand(uplink, guestWaitFor) +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`"$ipt" iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE; ` +
-		networkBenchmarkPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName)) +
+		networkBenchmarkPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName)) +
 		`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 		`{ echo 'network_benchmark: FAIL diode uplink is not synthetic hv_netvsc' >&2; exit 1; }; ` +
 		`echo 'network_benchmark: diode forwarding ready'; ` +

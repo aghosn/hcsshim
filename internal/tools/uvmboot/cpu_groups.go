@@ -236,11 +236,16 @@ func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uin
 	}
 	byLP := map[uint32]hcsschema.LogicalProcessor{}
 	coreLPs := map[string][]uint32{}
+	rootPartitionRestricted := false
 	for _, lp := range topology.LogicalProcessors {
 		if _, exists := byLP[lp.LpIndex]; exists {
 			return fmt.Errorf("duplicate LP %d in host topology", lp.LpIndex)
 		}
 		byLP[lp.LpIndex] = lp
+		if lp.RootVpIndex < -1 {
+			return fmt.Errorf("invalid root VP index %d for LP %d", lp.RootVpIndex, lp.LpIndex)
+		}
+		rootPartitionRestricted = rootPartitionRestricted || lp.RootVpIndex == -1
 		key := fmt.Sprintf("%d:%d", lp.PackageId, lp.CoreId)
 		coreLPs[key] = append(coreLPs[key], lp.LpIndex)
 	}
@@ -268,6 +273,9 @@ func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uin
 		second, foundSecond := byLP[group[1]]
 		if !foundFirst || !foundSecond {
 			return fmt.Errorf("benchmark affinity %s includes a nonexistent LP", key)
+		}
+		if rootPartitionRestricted && (first.RootVpIndex != -1 || second.RootVpIndex != -1) {
+			return fmt.Errorf("MinRoot benchmark affinity %s includes root-partition LPs; select complete root-free cores (RootVpIndex=-1)", key)
 		}
 		if first.NodeNumber != second.NodeNumber {
 			return fmt.Errorf("benchmark affinity %s crosses NUMA nodes", key)

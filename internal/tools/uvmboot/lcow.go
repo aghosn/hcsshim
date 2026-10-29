@@ -285,6 +285,11 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkNoSMTArgName,
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
+		cli.StringFlag{
+			Name:  networkBenchmarkIdleArgName,
+			Value: "poll",
+			Usage: "Required guest boot idle policy for network benchmarks: poll or halt.",
+		},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)

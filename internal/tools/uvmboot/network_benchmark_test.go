@@ -209,7 +209,7 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 
 func TestNetworkBenchmarkNoSMTRecordsTopologyAndPreservesPreflight(t *testing.T) {
 	for _, role := range []string{"diode", "workload"} {
-		command := networkBenchmarkPreflight(role, "192.0.2.10", true)
+		command := networkBenchmarkPreflight(role, "192.0.2.10", true, "poll")
 		for _, required := range []string{"SEV-SNP", "expected exactly two online VPs",
 			"thread_siblings_list", "guest_topology", "host_smt=disabled", "idle=poll",
 			"iperf version 2.2.1", "ip route get 192.0.2.10"} {
