@@ -1000,6 +1000,31 @@ func (computeSystem *System) ModifyWithResources(ctx context.Context, config int
 	return nil
 }
 
+// SystemControl submits a URI-routed command with input and waits for the
+// actual HCS operation result, discarding any output document. It holds the
+// system handle read lock through submission/wait/operation close, excluding
+// concurrent Close, and reports a closed handle or operation error with system
+// context. Native calls are not abandoned on cancellation. Failure, timeout,
+// or cancellation does not prove that an irreversible command had no effect.
+func (computeSystem *System) SystemControl(ctx context.Context, uri, input string) error {
+	computeSystem.handleLock.RLock()
+	defer computeSystem.handleLock.RUnlock()
+
+	operation := "hcs::System::SystemControl"
+
+	if computeSystem.handle == 0 {
+		return makeSystemError(computeSystem, operation, ErrAlreadyClosed)
+	}
+
+	_, callErr := runOperation(ctx, func(op computecore.HcsOperation) error {
+		return computecore.HcsSystemControl(ctx, computeSystem.handle, op, uri, input)
+	})
+	if callErr != nil {
+		return makeSystemError(computeSystem, operation, callErr)
+	}
+	return nil
+}
+
 // SetCPUGroupAffinities pins the container's server silo to the given processor
 // group affinities. HCS does not expose a CPU-affinity field on the container Processor
 // schema, so for process-isolated (Argon) containers we set the affinity directly on the

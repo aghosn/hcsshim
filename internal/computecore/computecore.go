@@ -56,6 +56,10 @@ import (
 //sys hcsSaveComputeSystem(computeSystem HcsSystem, operation HcsOperation, options string) (hr error) = computecore.HcsSaveComputeSystem?
 //sys hcsGetComputeSystemProperties(computeSystem HcsSystem, operation HcsOperation, propertyQuery string) (hr error) = computecore.HcsGetComputeSystemProperties?
 //sys hcsModifyComputeSystem(computeSystem HcsSystem, operation HcsOperation, configuration string, identity syscall.Handle) (hr error) = computecore.HcsModifyComputeSystem?
+// hcsSystemControl borrows the system/operation handles and UTF-16 URI/input
+// through native submission. The optional existing export reports lookup or
+// HRESULT errors; completion is obtained from the supplied operation.
+//sys hcsSystemControl(computeSystem HcsSystem, operation HcsOperation, uri string, input string) (hr error) = computecore.HcsSystemControl?
 //sys hcsWaitForComputeSystemExit(computeSystem HcsSystem, timeoutMs uint32, result **uint16) (hr error) = computecore.HcsWaitForComputeSystemExit?
 //sys hcsSetComputeSystemCallback(computeSystem HcsSystem, callbackOptions uint32, context uintptr, callback uintptr) (hr error) = computecore.HcsSetComputeSystemCallback?
 
@@ -565,6 +569,22 @@ func HcsModifyComputeSystem(ctx gcontext.Context, computeSystem HcsSystem, opera
 
 	return execute(ctx, timeout.SyscallWatcher, func() error {
 		return hcsModifyComputeSystem(computeSystem, operation, configuration, identity)
+	})
+}
+
+// HcsSystemControl submits a URI-routed command with input (empty for no
+// payload). It returns the actual submission/optional-export error, not an
+// operation-completion receipt. The caller retains both handles through this
+// call and waits on operation for completion. execute keeps native-call
+// lifetimes intact even when ctx is cancelled or the watchdog expires.
+func HcsSystemControl(ctx gcontext.Context, computeSystem HcsSystem, operation HcsOperation, uri, input string) (hr error) {
+	ctx, span := ot.StartSpan(ctx, "HcsSystemControl")
+	defer span.End()
+	defer func() { ot.SetSpanStatus(span, hr) }()
+	span.SetAttributes(attribute.String("uri", uri))
+
+	return execute(ctx, timeout.SyscallWatcher, func() error {
+		return hcsSystemControl(computeSystem, operation, uri, input)
 	})
 }
 
