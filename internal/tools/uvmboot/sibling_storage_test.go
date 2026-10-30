@@ -42,6 +42,27 @@ func storagePlanJSON(t *testing.T, plan *siblingStoragePlan) string {
 	return string(data)
 }
 
+func TestSiblingRootRequiresReadOnlyLUNZero(t *testing.T) {
+	plan := storageTestPlan(t)
+	if err := validateSiblingRootPlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.Disks[0].Role = "data"
+	if err := validateSiblingRootPlan(plan); err == nil {
+		t.Fatal("accepted missing root")
+	}
+	plan.Disks[0].Role = "root"
+	*plan.Disks[0].ExportLUN = 4
+	if err := validateSiblingRootPlan(plan); err == nil {
+		t.Fatal("accepted a root outside LUN 0")
+	}
+	*plan.Disks[0].ExportLUN = 0
+	plan.Disks[0].Access = "read-write"
+	if err := validateSiblingRootPlan(plan); err == nil {
+		t.Fatal("accepted a writable root")
+	}
+}
+
 func TestSiblingStoragePlanValidation(t *testing.T) {
 	tests := []struct {
 		name   string

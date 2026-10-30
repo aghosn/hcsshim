@@ -22,6 +22,8 @@ import (
 const (
 	siblingStorageBackendsArgName  = "sibling-storage-backends"
 	validateStorageBackendsArgName = "validate-storage-backends"
+	siblingStorageRootArgName      = "sibling-storage-root"
+	siblingStorageRootVMGS         = "sibling-root.vmgs"
 )
 
 type siblingStoragePlan struct {
@@ -39,6 +41,9 @@ type siblingStorageDisk struct {
 
 func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 	if !c.IsSet(siblingStorageBackendsArgName) {
+		if c.Bool(siblingStorageRootArgName) {
+			return nil, fmt.Errorf("--%s requires --%s", siblingStorageRootArgName, siblingStorageBackendsArgName)
+		}
 		if c.Bool(validateStorageBackendsArgName) {
 			return nil, fmt.Errorf("--%s requires --%s", validateStorageBackendsArgName, siblingStorageBackendsArgName)
 		}
@@ -73,7 +78,29 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load sibling storage backend plan %q: %w", path, err)
 	}
+	if c.Bool(siblingStorageRootArgName) {
+		if !c.Bool(securityHardwareFlag) || c.IsSet(noVerityBoot) ||
+			!c.Bool(siblingInteractiveArgName) || c.String(networkBenchmarkScriptArgName) != "" ||
+			c.String(siblingOpenShellBundleArgName) != "" {
+			return nil, errors.New("sibling root requires an interactive SNP dm-verity pair without benchmarks or OpenShell")
+		}
+		if err := validateSiblingRootPlan(plan); err != nil {
+			return nil, err
+		}
+	}
 	return plan, nil
+}
+
+func validateSiblingRootPlan(plan *siblingStoragePlan) error {
+	for _, disk := range plan.Disks {
+		if disk.Role == "root" {
+			if disk.ExportLUN == nil || *disk.ExportLUN != 0 || disk.Access != "read-only" {
+				return errors.New("sibling root requires a read-only root export at LUN 0")
+			}
+			return nil
+		}
+	}
+	return errors.New("sibling root requires a root disk in the backend plan")
 }
 
 func decodeSiblingStoragePlan(reader io.Reader) (*siblingStoragePlan, error) {

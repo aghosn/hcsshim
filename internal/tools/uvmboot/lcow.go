@@ -220,6 +220,11 @@ var lcowCommand = cli.Command{
 				"The existing workload RP root stays unchanged; startup performs no test writes.",
 		},
 		cli.BoolFlag{
+			Name: siblingStorageRootArgName,
+			Usage: "Boot the workload from the plan's read-only root LUN 0 using sibling-root.vmgs; " +
+				"omit its direct RP root attachment. Requires an interactive SNP pair.",
+		},
+		cli.BoolFlag{
 			Name:  validateStorageBackendsArgName,
 			Usage: "Validate --sibling-storage-backends and exit without creating VMs.",
 		},
@@ -706,6 +711,11 @@ var lcowCommand = cli.Command{
 			}).Info("verified identical shared-memory mappings")
 		}
 
+		if c.Bool(siblingStorageRootArgName) {
+			// Root mode uses discovery and storage, not the marker/event proof.
+			return firstErr
+		}
+
 		markerVerified := false
 		if section != nil {
 			prefixLength := uint64(96)
@@ -958,6 +968,10 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 			options.DmVerityRootFsVhd = vmutils.DefaultDmVerityRootfsVhd
 			options.DmVerityMode = true
 		}
+		if c.Bool(siblingStorageRootArgName) && id == "uvmboot-1" {
+			options.SiblingRoot = true
+			options.GuestStateFilePath = siblingStorageRootVMGS
+		}
 	}
 
 	return options, nil
@@ -1121,6 +1135,7 @@ func runLCOW(
 		}
 	}
 
+	storageBootstrap := ""
 	if err := shareFiles(ctx, c, vm); err != nil {
 		return err
 	}
@@ -1166,6 +1181,14 @@ func runLCOW(
 		)
 		if err != nil {
 			return err
+		}
+		if c.Bool(siblingStorageRootArgName) {
+			// The diagnostic consumes the transport's event bit. Never run
+			// marker/event proofs while the same route carries root I/O.
+			execCommand = "set -eu; echo 'diode_storage: discovery bootstrap; shared-memory diagnostic disabled'"
+			if role == workloadRole {
+				execCommand += "; dmesg | grep -F 'hv_storvsc: pre-root sibling LUN 0 ready' || exit 1"
+			}
 		}
 		if busModulePath := c.String(siblingBusGuestModuleArgName); busModulePath != "" {
 			const busModuleRoot = "/run/sibling-bus-module"
@@ -1290,7 +1313,13 @@ func runLCOW(
 					if err != nil {
 						return err
 					}
-					execCommand += "; " + storageCommand
+					if role == diodeRole && c.Bool(siblingStorageRootArgName) {
+						storageBootstrap = siblingBusLoadCommand(
+							busModuleRoot+"/"+filepath.Base(busModulePath)) +
+							storageCommand + "; "
+					} else {
+						execCommand += "; " + storageCommand
+					}
 				}
 			}
 		}
@@ -1318,7 +1347,7 @@ func runLCOW(
 	}
 
 	if options.UseGuestConnection {
-		if err := execViaGCS(ctx, vm, c, execCommand); err != nil {
+		if err := execViaGCS(ctx, vm, c, storageBootstrap+execCommand); err != nil {
 			return err
 		}
 		if stopSampling != nil {
@@ -1718,11 +1747,16 @@ func siblingVsockProofCommand(role string) string {
 		`echo 'sibling_vmbus: stock hv_sock payload role=` + name + ` ok'; `
 }
 
+func siblingBusLoadCommand(modulePath string) string {
+	return "if [ ! -d /sys/bus/vmbus/drivers/sibling_bus ]; then insmod " +
+		shellSingleQuote(modulePath) + " || exit 1; fi; "
+}
+
 func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 	net siblingNetConfig, uplink *diodeUplink) string {
 	ifName := net.ifName
 	waitFor := guestWaitFor
-	cmd := "insmod " + shellSingleQuote(modulePath) + " || exit 1; "
+	cmd := siblingBusLoadCommand(modulePath)
 	if netModulePath != "" {
 		cmd += "insmod " + shellSingleQuote(netModulePath) + " || exit 1; "
 	}

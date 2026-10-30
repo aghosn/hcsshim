@@ -6,7 +6,36 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 )
+
+func TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment(t *testing.T) {
+	for _, siblingRoot := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "sibling"}[siblingRoot], func(t *testing.T) {
+			opts := NewDefaultOptionsLCOW(t.Name(), "")
+			opts.PreferredRootFSType, opts.DmVerityMode = PreferredRootFSTypeNA, true
+			opts.SiblingRoot = siblingRoot
+			vm := &UtilityVM{id: t.Name(), scsiControllerCount: 1}
+			doc := &hcsschema.ComputeSystem{VirtualMachine: &hcsschema.VirtualMachine{
+				Devices: &hcsschema.Devices{},
+			}}
+			applyLCOWVMGSStorage(doc, opts, vm, `C:\fixture\rootfs.vhd`)
+			controller := doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]]
+			attachment, attached := controller.Attachments["0"]
+			if attached == siblingRoot || (attached && !attachment.ReadOnly) {
+				t.Fatalf("RP root attachment=%v, read-only=%v, sibling=%v", attached, attachment.ReadOnly, siblingRoot)
+			}
+			if siblingRoot && (len(controller.Attachments) != 0 || len(vm.reservedSCSISlots) != 0) {
+				t.Fatal("sibling root retained direct RP storage or a reserved root slot")
+			}
+			if attached && attachment.Path != `C:\fixture\rootfs.vhd` {
+				t.Fatal("changed the ordinary root image")
+			}
+		})
+	}
+}
 
 // Unit tests for negative testing of input to uvm.Create()
 

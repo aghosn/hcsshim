@@ -69,6 +69,7 @@ type ConfidentialLCOWOptions struct {
 	UseGuestStateFile  bool   // Use a vmgs file that contains a kernel and initrd, required for SNP
 	DmVerityRootFsVhd  string // The VHD file (bound to the vmgs file via embedded dmverity hash data file) to load.
 	DmVerityMode       bool   // override to be able to turn off dmverity for debugging
+	SiblingRoot        bool   // Root is exported by the diode; never attach a direct RP root disk.
 	DmVerityCreateArgs string // set dm-verity args when booting with verity in non-SNP mode
 }
 
@@ -315,6 +316,9 @@ Example JSON document produced once the hcsschema.ComputeSytem returned by makeL
 
 // Make a hcsschema.ComputeSytem with the parts that target booting from a VMGS file.
 func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcsschema.ComputeSystem, err error) {
+	if opts.SiblingRoot && (!opts.DmVerityMode || uvm.scsiControllerCount == 0) {
+		return nil, errors.New("sibling root requires dm-verity and a SCSI-capable guest")
+	}
 	// Raise an error if instructed to use a particular sort of rootfs.
 	if opts.PreferredRootFSType != PreferredRootFSTypeNA {
 		return nil, errors.New("specifying a PreferredRootFSType is incompatible with SNP mode")
@@ -429,25 +433,7 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 		}
 	}
 
-	if uvm.scsiControllerCount > 0 {
-		logrus.Debug("makeLCOWVMGSDoc configuring scsi devices")
-		doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{}
-		for i := 0; i < int(uvm.scsiControllerCount); i++ {
-			doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[i]] = hcsschema.Scsi{
-				Attachments: make(map[string]hcsschema.Attachment),
-			}
-		}
-		if opts.DmVerityMode {
-			logrus.Debug("makeLCOWVMGSDoc DmVerityMode true")
-			scsiController0 := guestrequest.ScsiControllerGuids[0]
-			doc.VirtualMachine.Devices.Scsi[scsiController0].Attachments["0"] = hcsschema.Attachment{
-				Type_:    "VirtualDisk",
-				Path:     dmVerityRootFsFullPath,
-				ReadOnly: true,
-			}
-			uvm.reservedSCSISlots = append(uvm.reservedSCSISlots, scsi.Slot{Controller: 0, LUN: 0})
-		}
-	}
+	applyLCOWVMGSStorage(doc, opts, uvm, dmVerityRootFsFullPath)
 
 	// Required by HCS for the isolated boot scheme, see also https://docs.microsoft.com/en-us/windows-server/virtualization/hyper-v/learn-more/generation-2-virtual-machine-security-settings-for-hyper-v
 	// A complete explanation of the why's and wherefores of starting an encrypted, isolated VM are beond the scope of these comments.
@@ -465,6 +451,27 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 	}
 
 	return doc, nil
+}
+
+func applyLCOWVMGSStorage(doc *hcsschema.ComputeSystem, opts *OptionsLCOW, uvm *UtilityVM, rootPath string) {
+	if uvm.scsiControllerCount == 0 {
+		return
+	}
+	logrus.Debug("makeLCOWVMGSDoc configuring scsi devices")
+	doc.VirtualMachine.Devices.Scsi = map[string]hcsschema.Scsi{}
+	for i := 0; i < int(uvm.scsiControllerCount); i++ {
+		doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[i]] = hcsschema.Scsi{
+			Attachments: make(map[string]hcsschema.Attachment),
+		}
+	}
+	if opts.DmVerityMode && !opts.SiblingRoot {
+		logrus.Debug("makeLCOWVMGSDoc DmVerityMode true")
+		scsiController0 := guestrequest.ScsiControllerGuids[0]
+		doc.VirtualMachine.Devices.Scsi[scsiController0].Attachments["0"] = hcsschema.Attachment{
+			Type_: "VirtualDisk", Path: rootPath, ReadOnly: true,
+		}
+		uvm.reservedSCSISlots = append(uvm.reservedSCSISlots, scsi.Slot{Controller: 0, LUN: 0})
+	}
 }
 
 // Programatically make the hcsschema.ComputeSystem document for the SNP case.
