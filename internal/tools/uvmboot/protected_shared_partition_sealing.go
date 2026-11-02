@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"syscall"
 	"time"
@@ -23,9 +24,32 @@ import (
 // partitionSealStep describes only this experiment's serialized operations.
 // Lifetime is primary or late for region/page work, empty for discovery and
 // VM/driver ownership steps; Index/Count are 4-KiB pages, not byte ranges.
+// MappingPhase is a seal/control boundary, independent of lifetime/page identity;
+// MappingOperation selects a bounded map form, never an arbitrary hypercall.
+// Empty mapping fields are omitted from evidence to preserve flag-off records.
 type partitionSealStep struct {
 	proofStep
-	Lifetime string
+	Lifetime         string
+	MappingPhase     string                            `json:",omitempty"`
+	MappingOperation protectedSharedHvMappingOperation `json:",omitempty"`
+}
+
+// validateProtectedSharedMapOptions is a pure opt-in check of mode, hardware
+// security and section byte size before acquisition. Disabled inputs are not
+// interpreted: their existing mode-specific validation remains authoritative.
+// Enabled probes require plain partition-seal and three reserved padding pages.
+func validateProtectedSharedMapOptions(enabled bool, mode string, hardwareSecurity bool, size uint64) error {
+	if !enabled {
+		return nil
+	}
+	if mode != "partition-seal" || hardwareSecurity {
+		return errors.New("protected-shared-map-probes requires plain non-SNP partition-seal")
+	}
+	if size == 0 || size%4096 != 0 || size > 4096*4096 {
+		return errors.New("protected-shared-map-probes requires page-aligned 1..4096 section pages")
+	}
+	_, err := protectedSharedHvScratchPages(0, size/4096)
+	return err
 }
 
 // partitionSealResult carries acquired ownership and validated native progress
@@ -117,9 +141,16 @@ func (l *partitionSealLifetime) consumeControl(s partitionSealStep, r partitionS
 // each backing only after trusted reclaim/full-byte zero verification. Unknown
 // progress or detach failures retain necessary resources and fail the run.
 // This function never reopens a partition seal or emits a completion record.
-func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, pages uint64, cleanupTimeout time.Duration) (err error) {
+// mapProbes adds serialized special-zero admission steps and independent scratch
+// cleanup; false preserves the original exact sequence without scratch steps.
+func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, pages uint64, cleanupTimeout time.Duration, mapProbes bool) (err error) {
 	if pages == 0 || pages > 4096 || cleanupTimeout <= 0 || cleanupTimeout > 10*time.Minute {
 		return errors.New("invalid partition-seal experiment bounds")
+	}
+	if mapProbes {
+		if _, err := protectedSharedHvScratchPages(0, pages); err != nil {
+			return err
+		}
 	}
 	primary := &partitionSealLifetime{pages: pages}
 	late := &partitionSealLifetime{pages: 1}
@@ -183,6 +214,16 @@ func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, 
 			return e == nil
 		}
 		safe := map[string]bool{"primary": true, "late": true}
+		// Dirty scratch belongs to the VM, not either backing lifetime.
+		// Its errors remain sticky but cannot suppress region/VM cleanup.
+		if mapProbes {
+			for _, id := range []string{"a", "b"} {
+				if ownedVMs[id] {
+					call(partitionSealStep{proofStep: proofStep{Kind: "scratch-cleanup", Participant: id},
+						MappingPhase: "cleanup"})
+				}
+			}
+		}
 		for _, name := range []string{"primary", "late"} {
 			l := lifetimes[name]
 			for i := uint64(0); i < l.initialized; i += 4 {
@@ -301,10 +342,52 @@ func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, 
 			return err
 		}
 	}
+	// Each admitted outcome, including an expected denial, is followed by a
+	// whole-three-page unmap. Failures leave the concrete dirty ledger intact.
+	maps := func(id, phase string, negative bool) error {
+		kind := "hv-map-positive"
+		if negative {
+			kind = "hv-map-negative"
+		}
+		for _, operation := range []protectedSharedHvMappingOperation{protectedSharedHvMapContiguous, protectedSharedHvMapSparse} {
+			if e := call(partitionSealStep{proofStep: proofStep{Kind: kind, Participant: id},
+				MappingPhase: phase, MappingOperation: operation}); e != nil {
+				return e
+			}
+			if e := call(partitionSealStep{proofStep: proofStep{Kind: "hv-unmap", Participant: id},
+				MappingPhase: phase}); e != nil {
+				return e
+			}
+		}
+		return nil
+	}
+	if mapProbes {
+		for _, id := range []string{"a", "b"} {
+			if err = maps(id, "pre-seal", false); err != nil {
+				return err
+			}
+		}
+	}
 	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
 		for _, id := range []string{"a", "b"} {
 			if err = call(partitionSealStep{proofStep: proofStep{Kind: kind, Participant: id}, Lifetime: "primary"}); err != nil {
 				return err
+			}
+			if mapProbes {
+				phase := "post-first-seal"
+				if kind == "partition-seal-repeat" {
+					phase = "post-repeat-seal"
+				}
+				if err = maps(id, phase, true); err != nil {
+					return err
+				}
+				// B is the still-unsealed control only after A's completed
+				// first seal, before the next iteration submits B's seal.
+				if kind == "partition-seal" && id == "a" {
+					if err = maps("b", "b-after-a-seal", false); err != nil {
+						return err
+					}
+				}
 			}
 		}
 	}
@@ -348,6 +431,18 @@ type realPartitionSealProof struct {
 	after         map[string]protectedSharedHvSnapshot
 	targets       map[string]uint64
 	closedVMs     map[string]bool
+	scratch       map[string]*partitionSealScratch
+}
+
+// partitionSealScratch retains a validated primary-padding target and diagnostic
+// identity until VM termination. dirty is set before every map dispatch and is
+// cleared only by a full valid unmap or successful termination plus wait.
+// The concrete adapter alone mutates this ledger under serialized dispatch.
+type partitionSealScratch struct {
+	target        protectedSharedHvTarget
+	pages         [3]uint64
+	vmID, runtime string
+	dirty         bool
 }
 
 // EvidenceError returns sticky diagnostic failures without changing ownership
@@ -569,6 +664,143 @@ func (p *realPartitionSealProof) sealPartition(ctx context.Context, id string, r
 	return err
 }
 
+// mappingScratch validates current live primary ownership, plain effective boot
+// options, diagnostic correlation and actual section arithmetic before publishing
+// a scratch ledger. gpn is already a page index. It acquires nothing and returns
+// no usable target on error; existing dirty state must never be replaced.
+func (p *realPartitionSealProof) mappingScratch(id string) (*partitionSealScratch, error) {
+	q := p.primary
+	v := q.vms[id]
+	if (id != "a" && id != "b") || v == nil || v.vm == nil || v.terminated ||
+		v.removed || p.closedVMs[id] || !v.freshPrepared {
+		return nil, errors.New("mapping requires a live owned prepared primary VM")
+	}
+	o := v.options
+	if q.snp || o == nil || o.GuestStateFilePath != "" || o.UseGuestStateFile ||
+		o.BundleDirectory != "" || (o.HclEnabled != nil && *o.HclEnabled) ||
+		o.SecurityPolicyEnabled || o.DmVerityMode {
+		return nil, errors.New("mapping requires a plain non-isolated participant")
+	}
+	if v.vm.ID() != "protected-"+q.runID+"-"+id ||
+		!v.region.ProtectedShared || v.region.HiddenFromGuest ||
+		q.pages == 0 || q.pages > 4096 || v.region.Length <= 0 ||
+		uint64(v.region.Length) != q.pages*4096 {
+		return nil, errors.New("mapping primary identity, installation or section length mismatch")
+	}
+	partitionID := p.targets[id]
+	if partitionID == 0 || partitionID == math.MaxUint64 {
+		return nil, errors.New("mapping requires a correlated non-SELF diagnostic partition ID")
+	}
+	pages, err := protectedSharedHvScratchPages(v.gpn, uint64(v.region.Length)/4096)
+	if err != nil {
+		return nil, err
+	}
+	target := protectedSharedHvTarget{partitionID: partitionID, partitionIDValid: true, pageGPA: pages[0] * 4096}
+	if p.scratch == nil {
+		p.scratch = make(map[string]*partitionSealScratch)
+	}
+	if old := p.scratch[id]; old != nil {
+		if old.target != target || old.pages != pages || old.vmID != v.vm.ID() {
+			return nil, errors.New("mapping target changed; retain existing scratch ledger")
+		}
+		return old, nil
+	}
+	s := &partitionSealScratch{target: target, pages: pages,
+		vmID: v.vm.ID(), runtime: fmt.Sprint(v.vm.RuntimeID())}
+	p.scratch[id] = s
+	return s, nil
+}
+
+// mappingAttempt synchronously issues one S1 operation on a validated retained
+// scratch target and records metadata only, never memory bytes. Caller serializes
+// against VM termination/driver close. Every map dirties before dispatch even for
+// expected denial; transport, framing, validation, cancellation or evidence errors
+// stop forward work without erasing possible effects. Only a full valid unmap
+// clears dirty. Sticky diagnostics are returned but never gate native cleanup.
+func (p *realPartitionSealProof) mappingAttempt(ctx context.Context, id, phase string, s *partitionSealScratch,
+	operation protectedSharedHvMappingOperation, negative bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	flags, requested, expected := protectedSharedHvMappingFlags, uint32(2), uint32(2)
+	expectedStatus := uint16(0)
+	destinations := []uint64{s.pages[0], s.pages[1]}
+	name := "HvMapGpaPages"
+	if operation == protectedSharedHvUnmapScratch {
+		flags, requested, expected = 0, 3, 3
+		destinations = s.pages[:]
+		name = "HvUnmapGpaPages"
+	} else {
+		if operation == protectedSharedHvMapSparse {
+			destinations = []uint64{s.pages[0], s.pages[2]}
+			name = "HvMapSparseGpaPages"
+		}
+		if negative {
+			expected = 0
+			expectedStatus = protectedSharedHvMappingDenied
+		}
+		// Native failure cannot certify no effect, including on denied calls.
+		s.dirty = true
+	}
+	r := p.probe.mapping(s.target, operation)
+	var err error
+	if operation == protectedSharedHvUnmapScratch {
+		err = r.requireUnmapPositive()
+		if err == nil {
+			s.dirty = false
+		}
+	} else if negative {
+		err = r.requireMapDenial()
+	} else {
+		err = r.requireMapPositive()
+	}
+	p.primary.evidence.record("hv-map", map[string]any{
+		"Participant": id, "ID": s.vmID, "Runtime": s.runtime,
+		"HypervisorPartitionId": s.target.partitionID, "DiagnosticOnly": true,
+		"Operation": name, "OperationCode": uint16(operation), "Phase": phase,
+		"Flags": flags, "DestinationPageIndices": destinations, "Negative": negative,
+		"RequestedCount": requested, "ExpectedProcessed": expected,
+		"ExpectedRawStatus": expectedStatus,
+		"TransportError": proofErrorText(r.transportError), "ReturnedBytes": r.returnedBytes,
+		"FramingValid": r.framingValid, "RawStatusValid": r.rawStatusValid,
+		"RawStatus": r.rawStatus, "ElementsProcessed": r.elementsProcessed,
+		"ProtocolError": proofErrorText(r.protocolError), "ValidationError": proofErrorText(err),
+		"ContextError": proofErrorText(ctx.Err()),
+	})
+	return errors.Join(err, ctx.Err(), p.EvidenceError())
+}
+
+// probeMapping revalidates the live owned plain target before each forward map.
+// step selects one of the two bounded zero forms; errors leave any prior dirty
+// ledger owned for independent cleanup, without issuing a guessed-target call.
+func (p *realPartitionSealProof) probeMapping(ctx context.Context, step partitionSealStep) error {
+	if step.MappingOperation != protectedSharedHvMapContiguous && step.MappingOperation != protectedSharedHvMapSparse {
+		return errors.New("unsupported partition experiment map operation")
+	}
+	s, err := p.mappingScratch(step.Participant)
+	if err != nil {
+		return err
+	}
+	if s.dirty {
+		return errors.New("previous scratch interval still dirty")
+	}
+	return p.mappingAttempt(ctx, step.Participant, step.MappingPhase, s, step.MappingOperation, step.Kind == "hv-map-negative")
+}
+
+// cleanupScratch unmaps only a previously validated dirty interval. It uses the
+// retained ownership/correlation, never discovery or a fallback GPA after failed
+// preparation. Both normal and independent cleanup are serialized before native
+// lifetime teardown and VM termination; absent/clean ledgers do no native work.
+// Errors (including sticky evidence) preserve cleanup failure for the caller,
+// which must continue existing region/VM cleanup and driver closure regardless.
+func (p *realPartitionSealProof) cleanupScratch(ctx context.Context, id, phase string) error {
+	s := p.scratch[id]
+	if s == nil || !s.dirty {
+		return nil
+	}
+	return p.mappingAttempt(ctx, id, phase, s, protectedSharedHvUnmapScratch, false)
+}
+
 // probePages performs real HV-copy controls at offset 256 on every primary
 // page of id. Positive controls read HOSTKEEP, write/read a distinct known
 // VM/page-specific value, restore/read HOSTKEEP, after page locks but before seals.
@@ -684,6 +916,8 @@ func zeroLifetime(ctx context.Context, q *realProof) (proofResult, error) {
 // The late borrowed pointer is never passed here. Termination and Close have
 // separate ledgers so a close failure cannot become a skipped close success.
 // Failure retains backing and options; successful objects are never closed twice.
+// Successful Terminate plus Wait also ends VM-owned special scratch mappings,
+// independently of the subsequent Close outcome; no external backing is owned.
 func (p *realPartitionSealProof) terminateOwned(ctx context.Context, id string) error {
 	v := p.primary.vms[id]
 	if v == nil || v.vm == nil || p.closedVMs[id] {
@@ -697,6 +931,9 @@ func (p *realPartitionSealProof) terminateOwned(ctx context.Context, id string) 
 			return err
 		}
 		v.terminated = true
+		if s := p.scratch[id]; s != nil {
+			s.dirty = false
+		}
 	}
 	if err := v.vm.CloseCtx(ctx); err != nil {
 		return err
@@ -748,6 +985,8 @@ func (p *realPartitionSealProof) releaseLifetime(q *realProof) error {
 // Discovery brackets the entire existing preparation call, never just Start;
 // repeats submit VM-global seals without a region action or receipt query.
 // Cleanup steps observe only their supplied independent context, not forward ctx.
+// Mapping steps use separate phase/operation fields, retain dirty intervals on
+// failure, and never conflate scratch ownership with either backing lifetime.
 func (p *realPartitionSealProof) Run(ctx context.Context, s partitionSealStep) (out partitionSealResult, err error) {
 	q := p.primary
 	if s.Lifetime == "late" {
@@ -837,6 +1076,10 @@ func (p *realPartitionSealProof) Run(ctx context.Context, s partitionSealStep) (
 			"ReceiptError": proofErrorText(outcome.ReceiptError), "Error": proofErrorText(err)})
 	case "hv-positive", "hv-negative":
 		err = p.probePages(ctx, s.Participant, s.Kind == "hv-negative")
+	case "hv-map-positive", "hv-map-negative":
+		err = p.probeMapping(ctx, s)
+	case "hv-unmap", "scratch-cleanup":
+		err = p.cleanupScratch(ctx, s.Participant, s.MappingPhase)
 	case "partition-seal", "partition-seal-repeat":
 		err = p.sealPartition(ctx, s.Participant, s.Kind == "partition-seal-repeat")
 	case "late-prepare":

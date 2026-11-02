@@ -36,6 +36,7 @@ const (
 	protectedModeFlag         = "protected-shared-proof"
 	protectedTimeoutFlag      = "protected-shared-timeout"
 	protectedCleanupFlag      = "protected-shared-cleanup-timeout"
+	protectedMapProbesFlag    = "protected-shared-map-probes"
 	proofCopyAfterExitTimeout = 5 * time.Second
 	// Private VID v2 lifecycle opcodes; trusted HV lifecycle stays v1.
 	psInitialize = 1
@@ -1086,8 +1087,14 @@ func validateProtectedSharedNativeLayout() error {
 // cleanup, returning validation, operation, cleanup or evidence errors. It never
 // uses runMany/existing VM IDs or lets markers override lifecycle errors.
 // CLI/global settings remain serialized and immutable during the proof.
+// Optional map probes are plain partition-seal admission checks only; validation
+// precedes acquisition and disabled runs retain their original evidence fields.
 func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
+	mapProbes := c.Bool(protectedMapProbesFlag)
+	if err := validateProtectedSharedMapOptions(mapProbes, mode, c.Bool(securityHardwareFlag), c.Uint64(sharedMemorySizeArgName)); err != nil {
+		return err
+	}
 	if mode != "m1" && mode != "partition-seal" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
 	}
@@ -1153,14 +1160,19 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	if mode == "partition-seal" {
 		claim = "HV-COPY-AND-ADMISSION-NOT-ATTESTATION"
 	}
-	p.evidence.record("run", map[string]any{"Mode": mode, "GuestMode": p.guestMode(),
-		"Pages": p.pages, "Claim": claim})
+	run := map[string]any{"Mode": mode, "GuestMode": p.guestMode(),
+		"Pages": p.pages, "Claim": claim}
+	if mapProbes {
+		run["MapProbes"] = true
+		run["Coverage"] = "special-zero-admission-only"
+	}
+	p.evidence.record("run", run)
 	if err := p.evidence.failure(); err != nil {
 		return err
 	}
 	var err error
 	if mode == "partition-seal" {
-		err = executePartitionSealProof(ctx, &realPartitionSealProof{primary: p}, p.pages, cleanup)
+		err = executePartitionSealProof(ctx, &realPartitionSealProof{primary: p}, p.pages, cleanup, mapProbes)
 	} else {
 		err = executeProtectedProof(ctx, p, p.pages, cleanup)
 	}

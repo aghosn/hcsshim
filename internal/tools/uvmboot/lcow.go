@@ -68,6 +68,11 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name: protectedMapProbesFlag,
+			Usage: "Lab-only special zero-map admission probes for plain partition-seal VMs; requires installed matched hvtest.sys " +
+				"and 1..4096 section pages with at least three unused pages in the 512-page-rounded reservation. No RAM-backed coverage.",
+		},
 		cli.StringFlag{
 			Name: protectedModeFlag,
 			Usage: "Private manual lifecycle: m1 (three fresh VMs, page seals and C install denial) or " +
@@ -228,7 +233,13 @@ var lcowCommand = cli.Command{
 	},
 	// The private proof has its own phase/cleanup ledger and must return before
 	// any ordinary-mode host marker reads or success-overriding fallbacks.
+	// Enabled map probes are validated even without a proof mode, before any
+	// ordinary VM acquisition. Disabled inputs keep their existing handling.
 	Action: func(c *cli.Context) error {
+		if err := validateProtectedSharedMapOptions(c.Bool(protectedMapProbesFlag), c.String(protectedModeFlag),
+			c.Bool(securityHardwareFlag), c.Uint64(sharedMemorySizeArgName)); err != nil {
+			return err
+		}
 		if c.IsSet(protectedModeFlag) {
 			return runProtectedSharedCLI(c)
 		}
