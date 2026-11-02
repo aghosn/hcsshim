@@ -185,6 +185,10 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 // Buffer low-rate scheduled-CPU samples so stdout does not add VMBus traffic
 // to the measured interval. HCS runtime is CPU time, not wall time or LP usage.
 func sampleNetworkBenchmarkCPU(ctx context.Context, vm *uvm.UtilityVM) func() error {
+	return sampleBenchmarkCPU(ctx, vm, "network_benchmark_cpu")
+}
+
+func sampleBenchmarkCPU(ctx context.Context, vm *uvm.UtilityVM, prefix string) func() error {
 	type sample struct {
 		TimeUTC   time.Time `json:"time_utc"`
 		RuntimeNS uint64    `json:"runtime_ns"`
@@ -230,7 +234,7 @@ func sampleNetworkBenchmarkCPU(ctx context.Context, vm *uvm.UtilityVM) func() er
 				sampleErr = errors.Join(sampleErr, err)
 				return
 			}
-			fmt.Printf("network_benchmark_cpu: %s\n", data)
+			fmt.Printf("%s: %s\n", prefix, data)
 		})
 		return sampleErr
 	}

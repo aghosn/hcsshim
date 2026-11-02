@@ -304,6 +304,15 @@ var lcowCommand = cli.Command{
 			Value: "poll",
 			Usage: "Required guest boot idle policy for network benchmarks: poll or halt.",
 		},
+		cli.StringFlag{Name: storageBenchmarkScriptArgName, Usage: "Run the disposable ext4 fio experiment."},
+		cli.StringFlag{Name: storageBenchmarkDiskArgName, Usage: "New disposable benchmark VHDX copy."},
+		cli.StringFlag{Name: storageBenchmarkOutputArgName, Usage: "Empty result directory shared with the guests."},
+		cli.DurationFlag{Name: storageBenchmarkTimeoutArgName, Value: 6 * time.Hour},
+		cli.IntFlag{Name: storageBenchmarkIOArgName, Value: 10240},
+		cli.IntFlag{Name: storageBenchmarkSyncIOArgName, Value: 128},
+		cli.IntFlag{Name: storageBenchmarkSizeArgName, Value: 1024},
+		cli.BoolFlag{Name: storageBenchmarkSmokeArgName},
+		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)
@@ -349,9 +358,12 @@ var lcowCommand = cli.Command{
 		if err := validateNetworkBenchmark(c, cpuGroupLPs); err != nil {
 			return err
 		}
+		if err := validateStorageBenchmark(c, cpuGroupLPs, storagePlan); err != nil {
+			return err
+		}
 		benchmarkCtx := context.Background()
 		var cancelBenchmark context.CancelFunc
-		if c.String(networkBenchmarkScriptArgName) != "" {
+		if c.String(networkBenchmarkScriptArgName) != "" || c.String(storageBenchmarkScriptArgName) != "" {
 			topology, err := hostProcessorTopology(benchmarkCtx)
 			if err != nil {
 				return err
@@ -361,7 +373,11 @@ var lcowCommand = cli.Command{
 			}
 			siblingTests = map[string]bool{}
 			var cancel context.CancelFunc
-			benchmarkCtx, cancel = context.WithTimeout(benchmarkCtx, c.Duration(networkBenchmarkTimeoutArgName))
+			timeout := c.Duration(networkBenchmarkTimeoutArgName)
+			if c.String(storageBenchmarkScriptArgName) != "" {
+				timeout = c.Duration(storageBenchmarkTimeoutArgName)
+			}
+			benchmarkCtx, cancel = context.WithTimeout(benchmarkCtx, timeout)
 			cancelBenchmark = cancel
 			defer cancel()
 		}
@@ -711,7 +727,7 @@ var lcowCommand = cli.Command{
 			}).Info("verified identical shared-memory mappings")
 		}
 
-		if c.Bool(siblingStorageRootArgName) {
+		if c.Bool(siblingStorageRootArgName) || c.String(storageBenchmarkScriptArgName) != "" {
 			// Root mode uses discovery and storage, not the marker/event proof.
 			return firstErr
 		}
@@ -1023,7 +1039,12 @@ func runLCOW(
 	if err != nil {
 		return err
 	}
+	var storageReleases []func(context.Context) error
 	defer func() {
+		if c.String(storageBenchmarkScriptArgName) != "" {
+			resultErr = errors.Join(resultErr, closeStorageBenchmark(ctx, vm.CloseCtx, storageReleases))
+			return
+		}
 		if c.String(networkBenchmarkScriptArgName) == "" {
 			_ = vm.CloseCtx(ctx)
 			return
@@ -1066,6 +1087,13 @@ func runLCOW(
 		if err := shareNetworkBenchmark(ctx, c, vm); err != nil {
 			return err
 		}
+	}
+	if c.String(storageBenchmarkScriptArgName) != "" {
+		if vm.ProcessorCount() != 2 {
+			return fmt.Errorf("storage benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		}
+		stopSampling = sampleBenchmarkCPU(ctx, vm, "storage_benchmark_cpu")
+		defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
 	}
 
 	if len(options.SharedMemoryRegions) > 0 {
@@ -1122,9 +1150,13 @@ func runLCOW(
 	if err != nil {
 		return err
 	}
-	defer func() {
-		resultErr = errors.Join(resultErr, backends.close(ctx))
-	}()
+	if c.String(storageBenchmarkScriptArgName) != "" {
+		storageReleases = append(storageReleases, backends.close)
+	} else {
+		defer func() {
+			resultErr = errors.Join(resultErr, backends.close(ctx))
+		}()
+	}
 	for _, report := range backends.reports {
 		data, err := json.Marshal(report)
 		if err != nil {
@@ -1140,7 +1172,23 @@ func runLCOW(
 		return err
 	}
 
-	if modulePath := c.String(sharedMemoryGuestModuleArgName); modulePath != "" {
+	if c.String(storageBenchmarkScriptArgName) != "" {
+		eventArgs := ""
+		if len(options.SiblingCommunicationEndpoints) == 1 {
+			route, err := waitForSiblingCommunicationRoute(ctx, vm, options.SiblingCommunicationEndpoints[0])
+			if err != nil {
+				return err
+			}
+			eventArgs = siblingEventModuleArgs(route)
+		}
+		command, release, err := prepareStorageBenchmark(ctx, c, vm, storagePlan,
+			backends.reports, len(mappedRegions), eventArgs)
+		if err != nil {
+			return err
+		}
+		storageReleases = append(storageReleases, release)
+		execCommand = command
+	} else if modulePath := c.String(sharedMemoryGuestModuleArgName); modulePath != "" {
 		const guestModuleRoot = "/run/hcs-shmem-diag-module"
 
 		if err := vm.Share(ctx, modulePath, guestModuleRoot, true); err != nil {
@@ -1363,6 +1411,10 @@ func runLCOW(
 			if err := serveSiblingShells(ctx, vm, role); err != nil {
 				return err
 			}
+		}
+		if c.String(storageBenchmarkScriptArgName) != "" {
+			// Disk release needs live GCS; ordered cleanup shuts the VM down last.
+			return nil
 		}
 		_ = vm.Terminate(ctx)
 		_ = vm.WaitCtx(ctx)

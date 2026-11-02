@@ -284,6 +284,16 @@ func attachSiblingStorageDisk(ctx context.Context, vm *uvm.UtilityVM, disk sibli
 	}, nil
 }
 
+func storageRPDeviceCommand(controllerID string, lun uint) string {
+	id := strings.ToLower(strings.Trim(controllerID, "{}"))
+	match := fmt.Sprintf(`storage_dev=; storage_count=0; for p in /sys/class/block/*; do `+
+		`d=$(readlink -f "$p/device" 2>/dev/null) || continue; `+
+		`case "$d" in */%s/host*/target*/*:0:0:%d) `+
+		`storage_dev=/dev/${p##*/}; storage_count=$((storage_count+1));; esac; done; `+
+		`[ "$storage_count" -eq 1 ] && [ -b "$storage_dev" ]`, id, lun)
+	return guestWaitFor(match, "RP storage attachment")
+}
+
 func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePlan, reports []siblingStorageBackendReport) (string, error) {
 	if plan == nil {
 		return "", nil
@@ -300,13 +310,7 @@ func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePla
 		var luns, readOnly []string
 		for _, report := range reports {
 			// Resolve the RP controller identity, never an assumed sdX name.
-			controller := strings.ToLower(strings.Trim(report.ControllerID, "{}"))
-			match := fmt.Sprintf(`storage_dev=; storage_count=0; for p in /sys/class/block/*; do `+
-				`d=$(readlink -f "$p/device" 2>/dev/null) || continue; `+
-				`case "$d" in */%s/host*/target*/*:0:0:%d) `+
-				`storage_dev=/dev/${p##*/}; storage_count=$((storage_count+1));; esac; done; `+
-				`[ "$storage_count" -eq 1 ] && [ -b "$storage_dev" ]`, controller, report.LUN)
-			command += guestWaitFor(match, "diode storage "+report.DiskID)
+			command += storageRPDeviceCommand(report.ControllerID, report.LUN)
 			command += `storage_backends=${storage_backends:+$storage_backends,}$storage_dev; `
 			luns = append(luns, fmt.Sprint(report.ExportLUN))
 			readOnly = append(readOnly, fmt.Sprint(report.ReadOnly))
