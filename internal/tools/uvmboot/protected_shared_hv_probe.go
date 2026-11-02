@@ -91,14 +91,16 @@ type protectedSharedHvProbeResult struct {
 	data              [8]byte
 }
 
-// protectedSharedHvIOCTL is only a synchronous DeviceIoControl seam for the three
-// existing test cases. The function borrows aligned slices for the entire call,
-// may fill output, returns actual bytes, and must not retain buffers or handle.
+// protectedSharedHvIOCTL is a synchronous DeviceIoControl seam for the three
+// existing test cases and bounded utility mapping/unmapping. The function borrows
+// aligned slices for the entire call, may fill output, returns actual bytes, and
+// must not retain buffers or handle. Callers serialize all uses on the handle.
 type protectedSharedHvIOCTL func(windows.Handle, uint32, []byte, []byte) (uint32, error)
 
 // protectedSharedHvProbe exclusively owns an already installed driver's handle.
-// Callers serialize enumeration/reads/writes/Close and keep the VM/target alive
-// through each synchronous call. It does not own, create or configure driver/VM/backing.
+// Callers serialize enumeration/reads/writes/mapping/unmapping/Close and keep the
+// VM/target alive through each synchronous call. It does not own, create or
+// configure driver/VM/backing.
 type protectedSharedHvProbe struct {
 	handle windows.Handle
 	ioctl  protectedSharedHvIOCTL
@@ -171,8 +173,9 @@ func (p *protectedSharedHvProbe) Close() error {
 }
 
 // protectedSharedHvDeviceIOCTL borrows handle and nonempty buffers for one
-// synchronous existing test IOCTL, without overlapped completion or retention.
-// Its returned Win32 error and byte count describe transport only, not WinHv.
+// synchronous existing testcase or bounded utility map/unmap IOCTL, without
+// overlapped completion or retention. Callers serialize uses on the same owned
+// handle. Its Win32 error and byte count describe transport only, not HV status.
 func protectedSharedHvDeviceIOCTL(handle windows.Handle, code uint32, input, output []byte) (uint32, error) {
 	var returned uint32
 	err := windows.DeviceIoControl(handle, code, &input[0], uint32(len(input)),
