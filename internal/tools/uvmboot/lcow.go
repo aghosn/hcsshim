@@ -313,6 +313,8 @@ var lcowCommand = cli.Command{
 		cli.IntFlag{Name: storageBenchmarkSizeArgName, Value: 1024},
 		cli.BoolFlag{Name: storageBenchmarkSmokeArgName},
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
+		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
+		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)
@@ -1092,8 +1094,6 @@ func runLCOW(
 		if vm.ProcessorCount() != 2 {
 			return fmt.Errorf("storage benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
 		}
-		stopSampling = sampleBenchmarkCPU(ctx, vm, "storage_benchmark_cpu")
-		defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
 	}
 
 	if len(options.SharedMemoryRegions) > 0 {
@@ -1357,7 +1357,7 @@ func runLCOW(
 							return fmt.Errorf("share disposable storage test: %w", err)
 						}
 					}
-					storageCommand, err := siblingStorageGuestCommand(storageModulePath, role, storagePlan, backends.reports)
+					storageCommand, err := siblingStorageGuestCommand(storageModulePath, role, storagePlan, backends.reports, false)
 					if err != nil {
 						return err
 					}

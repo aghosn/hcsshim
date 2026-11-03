@@ -189,6 +189,7 @@ func TestStorageBenchmarkContentIndependentOfConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	second, err := prepareStorageBenchmarkContent(t.TempDir(), 32, 4)
 	if err != nil {
 		t.Fatal(err)
@@ -211,4 +212,66 @@ func TestStorageBenchmarkContentIndependentOfConfiguration(t *testing.T) {
 	if _, err := prepareStorageBenchmarkContent(filepath.Join(t.TempDir(), "missing"), 32, 4); err == nil {
 		t.Fatal("content preparation hid an output failure")
 	}
+}
+
+func TestStorageBenchmarkExperimentSelection(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "storage-benchmark.sh")
+	disk := filepath.Join(dir, "data.vhdx")
+	for _, path := range []string{script, disk, filepath.Join(dir, "diode_fio")} {
+		if err := os.WriteFile(path, []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+	}
+	oldGCS, oldDebug := useGCS, debug
+	useGCS, debug = true, false
+	t.Cleanup(func() { useGCS, debug = oldGCS, oldDebug })
+	for _, test := range []struct {
+		mode  string
+		size  string
+		smoke bool
+	}{
+		{mode: "latency", size: "64"}, {mode: "latency", size: "1", smoke: true},
+		{mode: "throughput", size: "1024"}, {mode: "throughput", size: "1", smoke: true},
+	} {
+		args := []string{"--storage-benchmark-script", script, "--storage-benchmark-disk", disk,
+			"--storage-benchmark-output", t.TempDir(), "--security-hardware",
+			"--storage-benchmark-" + test.mode, "--storage-benchmark-size-mib", test.size}
+		if test.smoke {
+			args = append(args, "--storage-benchmark-smoke")
+		}
+		c := benchmarkTestContext(t, args...)
+		if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err != nil {
+			t.Fatal(err)
+		}
+		if command := storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{}); !strings.HasSuffix(command, " "+test.mode+"; ") {
+			t.Fatalf("experiment selection was not forwarded: %s", command)
+		}
+		other := storageBenchmarkLatencyArgName
+		if test.mode == "latency" {
+			other = storageBenchmarkThroughputArgName
+		}
+		if err := c.Set(other, "true"); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err == nil {
+			t.Fatal("combined native experiments were accepted")
+		}
+		if err := c.Set(other, "false"); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Set(storageBenchmarkSizeArgName, "32"); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err == nil {
+			t.Fatal("experiment accepted an inconsistent working set")
+		}
+	}
+	for _, mode := range []string{"latency", "throughput"} {
+		if err := validateStorageBenchmark(benchmarkTestContext(t, "--storage-benchmark-"+mode), nil, nil); err == nil {
+			t.Fatal("experiment selection accepted without a benchmark")
+		}
+	}
+
 }

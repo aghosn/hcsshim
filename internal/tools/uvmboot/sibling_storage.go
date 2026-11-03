@@ -294,7 +294,7 @@ func storageRPDeviceCommand(controllerID string, lun uint) string {
 	return guestWaitFor(match, "RP storage attachment")
 }
 
-func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePlan, reports []siblingStorageBackendReport) (string, error) {
+func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePlan, reports []siblingStorageBackendReport, directIO bool) (string, error) {
 	if plan == nil {
 		return "", nil
 	}
@@ -315,7 +315,11 @@ func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePla
 			luns = append(luns, fmt.Sprint(report.ExportLUN))
 			readOnly = append(readOnly, fmt.Sprint(report.ReadOnly))
 		}
-		command += "insmod " + shellSingleQuote(modulePath) +
+		moduleArgs := ""
+		if directIO {
+			moduleArgs = " 'direct_io=1'"
+		}
+		command += "insmod " + shellSingleQuote(modulePath) + moduleArgs +
 			` "backends=$storage_backends" ` + shellSingleQuote("luns="+strings.Join(luns, ",")) +
 			" " + shellSingleQuote("read_only="+strings.Join(readOnly, ",")) + ` || exit 1; ` +
 			`echo 'diode_storage: provider registered'; `

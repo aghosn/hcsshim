@@ -324,7 +324,7 @@ func TestSiblingStorageGuestCommandsPreserveDiskIdentity(t *testing.T) {
 		{DiskID: "workload-root", ControllerID: "controller-a", LUN: 3, ExportLUN: 0, ReadOnly: true},
 		{DiskID: "workload-data", ControllerID: "controller-b", LUN: 7, ExportLUN: 1},
 	}
-	diode, err := siblingStorageGuestCommand("/run/provider.ko", diodeRole, plan, reports)
+	diode, err := siblingStorageGuestCommand("/run/provider.ko", diodeRole, plan, reports, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,11 @@ func TestSiblingStorageGuestCommandsPreserveDiskIdentity(t *testing.T) {
 			t.Errorf("diode mapping missing %q: %s", expected, diode)
 		}
 	}
-	workload, err := siblingStorageGuestCommand("", workloadRole, plan, nil)
+	direct, err := siblingStorageGuestCommand("/run/provider.ko", diodeRole, plan, reports, true)
+	if err != nil || !strings.Contains(direct, "'direct_io=1'") || strings.Contains(diode, "direct_io=") {
+		t.Fatalf("direct backend selection changed ordinary startup: %q, %v", direct, err)
+	}
+	workload, err := siblingStorageGuestCommand("", workloadRole, plan, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,13 +359,13 @@ func TestSiblingStorageGuestCommandsPreserveDiskIdentity(t *testing.T) {
 		strings.Contains(diode, "/dev/sda") || strings.Contains(workload, "/dev/sda") {
 		t.Fatal("startup writes disks or assumes disk enumeration order")
 	}
-	if _, err := siblingStorageGuestCommand("", diodeRole, plan, reports[:1]); err == nil {
+	if _, err := siblingStorageGuestCommand("", diodeRole, plan, reports[:1], false); err == nil {
 		t.Fatal("accepted incomplete backend mappings")
 	}
-	if _, err := siblingStorageGuestCommand("", "unknown", plan, nil); err == nil {
+	if _, err := siblingStorageGuestCommand("", "unknown", plan, nil, false); err == nil {
 		t.Fatal("accepted an unknown storage role")
 	}
-	if command, err := siblingStorageGuestCommand("", diodeRole, nil, nil); command != "" || err != nil {
+	if command, err := siblingStorageGuestCommand("", diodeRole, nil, nil, false); command != "" || err != nil {
 		t.Fatalf("storage changed default startup: %q, %v", command, err)
 	}
 }

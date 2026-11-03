@@ -21,15 +21,17 @@ import (
 )
 
 const (
-	storageBenchmarkScriptArgName  = "storage-benchmark-script"
-	storageBenchmarkDiskArgName    = "storage-benchmark-disk"
-	storageBenchmarkOutputArgName  = "storage-benchmark-output"
-	storageBenchmarkTimeoutArgName = "storage-benchmark-timeout"
-	storageBenchmarkIOArgName      = "storage-benchmark-io-mib"
-	storageBenchmarkSyncIOArgName  = "storage-benchmark-sync-io-mib"
-	storageBenchmarkSizeArgName    = "storage-benchmark-size-mib"
-	storageBenchmarkSmokeArgName   = "storage-benchmark-smoke"
-	storageBenchmarkStatsArgName   = "storage-benchmark-stats"
+	storageBenchmarkScriptArgName     = "storage-benchmark-script"
+	storageBenchmarkDiskArgName       = "storage-benchmark-disk"
+	storageBenchmarkOutputArgName     = "storage-benchmark-output"
+	storageBenchmarkTimeoutArgName    = "storage-benchmark-timeout"
+	storageBenchmarkIOArgName         = "storage-benchmark-io-mib"
+	storageBenchmarkSyncIOArgName     = "storage-benchmark-sync-io-mib"
+	storageBenchmarkSizeArgName       = "storage-benchmark-size-mib"
+	storageBenchmarkSmokeArgName      = "storage-benchmark-smoke"
+	storageBenchmarkStatsArgName      = "storage-benchmark-stats"
+	storageBenchmarkLatencyArgName    = "storage-benchmark-latency"
+	storageBenchmarkThroughputArgName = "storage-benchmark-throughput"
 )
 
 type storageBenchmarkContent struct {
@@ -106,7 +108,8 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	if c.String(storageBenchmarkScriptArgName) == "" {
 		for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 			storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
-			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName} {
+			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName,
+			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName} {
 			if c.IsSet(name) {
 				return errors.New("storage benchmark options require --storage-benchmark-script")
 			}
@@ -161,10 +164,28 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	if err != nil || len(entries) != 0 {
 		return errors.New("storage benchmark output directory must be empty")
 	}
+	latency := c.Bool(storageBenchmarkLatencyArgName)
+	throughput := c.Bool(storageBenchmarkThroughputArgName)
+	if latency && throughput {
+		return errors.New("select only one storage benchmark experiment per launch")
+	}
+	fileMiB := c.Int(storageBenchmarkSizeArgName)
+	if latency || throughput {
+		expected := 64
+		if throughput {
+			expected = 1024
+		}
+		if c.Bool(storageBenchmarkSmokeArgName) {
+			expected = 1
+		}
+		if fileMiB != expected {
+			return fmt.Errorf("selected storage experiment requires a %d-MiB common working set", expected)
+		}
+	}
 	if c.Duration(storageBenchmarkTimeoutArgName) <= 0 ||
 		c.Int(storageBenchmarkIOArgName) < 32 || c.Int(storageBenchmarkIOArgName) > 102400 ||
 		c.Int(storageBenchmarkSyncIOArgName) < 4 || c.Int(storageBenchmarkSyncIOArgName) > 1024 ||
-		c.Int(storageBenchmarkSizeArgName) < 32 || c.Int(storageBenchmarkSizeArgName) > 2048 {
+		fileMiB < 1 || fileMiB > 2048 || (!latency && !throughput && fileMiB < 32) {
 		return errors.New("storage benchmark IO budget, file size or deadline out of range")
 	}
 	if c.Int(storageBenchmarkIOArgName)%c.Int(storageBenchmarkSizeArgName) != 0 ||
@@ -188,14 +209,20 @@ func storageBenchmarkClient(c *cli.Context, device string, content storageBenchm
 	if c.Bool(storageBenchmarkSmokeArgName) {
 		smoke = 1
 	}
+	mode := ""
+	if c.Bool(storageBenchmarkLatencyArgName) {
+		mode = " latency"
+	} else if c.Bool(storageBenchmarkThroughputArgName) {
+		mode = " throughput"
+	}
 	return fmt.Sprintf(
 		`cp /run/storage-benchmark-tool/diode_fio /run/dtb-exec/diode_fio; `+
 			`chmod 755 /run/dtb-exec/diode_fio; `+
-			`/bin/sh %s %s /run/storage-benchmark-results %d %d %d %d %s %s %s %s; `,
+			`/bin/sh %s %s /run/storage-benchmark-results %d %d %d %d %s %s %s %s%s; `,
 		shellSingleQuote("/run/storage-benchmark-script/"+filepath.Base(c.String(storageBenchmarkScriptArgName))), device,
 		c.Int(storageBenchmarkIOArgName), c.Int(storageBenchmarkSyncIOArgName),
 		c.Int(storageBenchmarkSizeArgName), smoke,
-		content.ReadSHA256, content.WriteSHA256, content.SyncReadSHA, content.SyncWriteSHA)
+		content.ReadSHA256, content.WriteSHA256, content.SyncReadSHA, content.SyncWriteSHA, mode)
 }
 
 func storageBenchmarkPreflight() string {
@@ -275,22 +302,31 @@ func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.Utilit
 			return "", noCleanup, err
 		}
 	}
-	storageCommand, err := siblingStorageGuestCommand(provider, role, plan, reports)
+	storageCommand, err := siblingStorageGuestCommand(provider, role, plan, reports,
+		c.Bool(storageBenchmarkLatencyArgName) || c.Bool(storageBenchmarkThroughputArgName))
 	if err != nil {
 		return "", noCleanup, err
 	}
 	command += storageCommand + "; "
 	if role == workloadRole {
-		return command + guestWaitFor(`[ -f /run/storage-benchmark-results/provider-ready ]`, "provider snapshot") +
+		ready := `[ -f /run/storage-benchmark-results/provider-ready ]`
+		return command + guestWaitFor(ready, "provider snapshot") +
 			storageBenchmarkClient(c, "/run/diode-storage/fio-data", content), noCleanup, nil
 	}
 	if c.Bool(storageBenchmarkStatsArgName) {
 		command += `echo Y >/sys/module/diode_storvsp/parameters/stats_enabled; `
 	}
+	if c.Bool(storageBenchmarkLatencyArgName) || c.Bool(storageBenchmarkThroughputArgName) {
+		command += `[ "$(cat /sys/module/diode_storvsp/parameters/direct_io)" = Y ] || exit 1; ` +
+			`echo 'backend_direct_io=1' >/run/storage-benchmark-results/backend-policy.txt; `
+	}
 	command += `cat /sys/module/diode_storvsp/parameters/stats >/run/storage-benchmark-results/provider-before.txt; ` +
-		`touch /run/storage-benchmark-results/provider-ready; ` +
+		`cat /sys/module/diode_storvsp/parameters/pipeline_stats >/run/storage-benchmark-results/pipeline-before.txt; ` +
+		`touch /run/storage-benchmark-results/provider-ready; `
+	command +=
 		`until dmesg | grep -qF 'storage channel closed; worker quiesced'; do sleep 1; done; ` +
-		`cat /sys/module/diode_storvsp/parameters/stats >/run/storage-benchmark-results/provider-after.txt; ` +
-		`echo 'storage_benchmark: provider stopped'; `
+			`cat /sys/module/diode_storvsp/parameters/stats >/run/storage-benchmark-results/provider-after.txt; ` +
+			`cat /sys/module/diode_storvsp/parameters/pipeline_stats >/run/storage-benchmark-results/pipeline-after.txt; ` +
+			`echo 'storage_benchmark: provider stopped'; `
 	return command, noCleanup, nil
 }
