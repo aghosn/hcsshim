@@ -181,10 +181,17 @@ func TestSiblingStorageCLIRejectsInvalidModesBeforeHostWork(t *testing.T) {
 		append(append([]string{}, valid...), "--"+vpmemMountsArgName, "extra.vhd"),
 		append(append([]string{}, valid...), "--"+sharedMemoryMappingOnlyArgName),
 		append(append([]string{}, valid...), "--"+sharedMemoryGuestInventoryArgName),
-		append(append([]string{}, valid...), "--unikraft-diode-package", "optional-package"),
 	} {
 		if _, err := loadSiblingStoragePlan(storageTestContext(t, args...)); err == nil {
 			t.Fatalf("accepted invalid backend configuration: %v", args)
+		}
+		mixed := storageTestContext(t, append(append([]string{}, valid...), "--"+unikraftPackageArgName, "optional-package")...)
+		loaded, err := loadSiblingStoragePlan(mixed)
+		if err != nil || loaded == nil {
+			t.Fatalf("Unikraft must reuse storage plan validation: %v", err)
+		}
+		if _, err := loadUnikraftConfig(mixed, loaded); err == nil {
+			t.Fatal("accepted incomplete Unikraft package configuration")
 		}
 	}
 	wrongCount := storageTestContext(t, valid...)

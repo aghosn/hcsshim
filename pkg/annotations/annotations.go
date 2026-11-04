@@ -2,6 +2,10 @@ package annotations
 
 // General annotations.
 const (
+	// LCOWSiblingPair is an absolute host-side pair configuration file. Only a
+	// hypervisor-isolated LCOW sandbox may opt in; it owns both newly created VMs.
+	LCOWSiblingPair = "io.microsoft.virtualmachine.lcow.sibling-pair"
+
 	// KubernetesContainerType is the annotation used by CRI to define the `ContainerType`.
 	KubernetesContainerType = "io.kubernetes.cri.container-type"
 

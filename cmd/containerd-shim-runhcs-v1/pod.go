@@ -14,6 +14,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/layers"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/oci"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
@@ -162,6 +163,10 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 
 	owner := filepath.Base(os.Args[0])
 	isWCOW := oci.IsWCOW(s)
+	pairConfigPath := s.Annotations[annotations.LCOWSiblingPair]
+	if pairConfigPath != "" && (!oci.IsIsolated(s) || isWCOW) {
+		return nil, errors.New("sibling pair is supported only for an isolated LCOW sandbox")
+	}
 
 	p := pod{
 		events: events,
@@ -170,6 +175,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 	}
 
 	var parent *uvm.UtilityVM
+	var pair *sibling.Pair
 	var lopts *uvm.OptionsLCOW
 	if oci.IsIsolated(s) {
 		// Create the UVM parent
@@ -181,7 +187,18 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		case *uvm.OptionsLCOW:
 			lopts = (opts).(*uvm.OptionsLCOW)
 			lopts.BundleDirectory = req.Bundle
-			parent, err = uvm.CreateLCOW(ctx, lopts)
+			if pairConfigPath != "" {
+				config, configErr := sibling.LoadConfig(pairConfigPath)
+				if configErr != nil {
+					return nil, configErr
+				}
+				pair, err = sibling.Start(ctx, lopts, config)
+				if err == nil {
+					parent = pair.Workload
+				}
+			} else {
+				parent, err = uvm.CreateLCOW(ctx, lopts)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -197,10 +214,12 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 				return nil, err
 			}
 		}
-		err = parent.Start(ctx)
-		if err != nil {
-			parent.Close()
-			return nil, err
+		if pair == nil {
+			err = parent.Start(ctx)
+			if err != nil {
+				parent.Close()
+				return nil, err
+			}
 		}
 	} else if oci.IsJobContainer(s) {
 		// If we're making a job container fake a task (i.e reuse the wcowPodSandbox logic)
@@ -231,13 +250,17 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 
 	defer func() {
 		// clean up the uvm if we fail any further operations
-		if err != nil && parent != nil {
-			parent.Close()
+		if err != nil {
+			if pair != nil {
+				pair.Close()
+			} else if parent != nil {
+				parent.Close()
+			}
 		}
 	}()
 
 	p.host = parent
-	if parent != nil {
+	if parent != nil && pair == nil {
 		cid := req.ID
 		if id, ok := s.Annotations[annotations.NcproxyContainerID]; ok {
 			cid = id
@@ -309,7 +332,12 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		}
 		// LCOW (and WCOW Process Isolated for the time being) requires a real
 		// task for the sandbox.
-		lt, err := newHcsTask(ctx, events, parent, true, req, s)
+		var lt shimTask
+		if pair != nil {
+			lt, err = newHcsTask(ctx, events, parent, true, req, s, pair)
+		} else {
+			lt, err = newHcsTask(ctx, events, parent, true, req, s)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -349,6 +377,10 @@ func (p *pod) ID() string {
 }
 
 func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *specs.Spec) (_ shimTask, err error) {
+	if config := s.Annotations[annotations.LCOWSiblingPair]; config != "" &&
+		config != p.spec.Annotations[annotations.LCOWSiblingPair] {
+		return nil, errors.New("a workload cannot create or change its sandbox's sibling pair ownership")
+	}
 	if req.ID == p.id {
 		return nil, errors.Wrapf(errdefs.ErrAlreadyExists, "task with id: '%s' already exists", req.ID)
 	}

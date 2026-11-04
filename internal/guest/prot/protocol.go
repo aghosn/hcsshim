@@ -279,6 +279,7 @@ type GcsGuestCapabilities struct {
 	SignalProcessSupported        bool `json:",omitempty"`
 	DumpStacksSupported           bool `json:",omitempty"`
 	DeleteContainerStateSupported bool `json:",omitempty"`
+	SiblingSCSISupported          bool `json:",omitempty"`
 }
 
 // otelspancontext is the W3C TraceContext propagation headers used by

@@ -95,6 +95,7 @@ type CWCOWHostedSystem struct {
 type SCSIDevice struct {
 	Controller uint8 `json:"Controller,omitempty"`
 	Lun        uint8 `json:"Lun,omitempty"`
+	Sibling    bool  `json:"Sibling,omitempty"`
 }
 
 // LCOWMappedVirtualDisk represents a disk on the host which is mapped into a
@@ -108,6 +109,7 @@ type LCOWMappedVirtualDisk struct {
 	Encrypted  bool     `json:"Encrypted,omitempty"`
 	Options    []string `json:"Options,omitempty"`
 	BlockDev   bool     `json:"BlockDev,omitempty"`
+	Sibling    bool     `json:"Sibling,omitempty"`
 	// Deprecated: verity info is read by the guest
 	VerityInfo       *DeviceVerityInfo `json:"VerityInfo,omitempty"`
 	EnsureFilesystem bool              `json:"EnsureFilesystem,omitempty"`

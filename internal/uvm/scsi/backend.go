@@ -85,15 +85,52 @@ var _ mounter = &bridgeGuestBackend{}
 var _ unplugger = &bridgeGuestBackend{}
 
 type bridgeGuestBackend struct {
-	gc     *gcs.GuestConnection
-	osType string
+	gc      *gcs.GuestConnection
+	osType  string
+	sibling bool
 }
 
 // NewBridgeGuestBackend provides a [GuestBackend] using a [gcs.GuestConnection].
 //
 // osType should be either "windows" or "linux".
 func NewBridgeGuestBackend(gc *gcs.GuestConnection, osType string) GuestBackend {
-	return &bridgeGuestBackend{gc, osType}
+	return &bridgeGuestBackend{gc: gc, osType: osType}
+}
+
+// NewSiblingBridgeGuestBackend selects sibling devices without changing mount policy.
+func NewSiblingBridgeGuestBackend(gc *gcs.GuestConnection) GuestBackend {
+	return &bridgeGuestBackend{gc: gc, osType: "linux", sibling: true}
+}
+
+func (bgb *bridgeGuestBackend) modify(ctx context.Context, req guestrequest.ModificationRequest) error {
+	if bgb.sibling {
+		var err error
+		req, err = siblingRequest(req)
+		if err != nil {
+			return err
+		}
+	}
+	return bgb.gc.Modify(ctx, req)
+}
+
+func siblingRequest(req guestrequest.ModificationRequest) (guestrequest.ModificationRequest, error) {
+	switch settings := req.Settings.(type) {
+	case guestresource.LCOWMappedVirtualDisk:
+		if settings.Controller != 0 || settings.Lun == 0 {
+			return guestrequest.ModificationRequest{}, errors.New("invalid sibling disk location")
+		}
+		settings.Sibling = true
+		req.Settings = settings
+	case guestresource.SCSIDevice:
+		if settings.Controller != 0 || settings.Lun == 0 {
+			return guestrequest.ModificationRequest{}, errors.New("invalid sibling disk location")
+		}
+		settings.Sibling = true
+		req.Settings = settings
+	default:
+		return guestrequest.ModificationRequest{}, errors.New("unsupported sibling disk request")
+	}
+	return req, nil
 }
 
 func (bgb *bridgeGuestBackend) mount(ctx context.Context, controller, lun uint, path string, config *mountConfig) error {
@@ -101,7 +138,7 @@ func (bgb *bridgeGuestBackend) mount(ctx context.Context, controller, lun uint, 
 	if err != nil {
 		return err
 	}
-	return bgb.gc.Modify(ctx, req)
+	return bgb.modify(ctx, req)
 }
 
 func (bgb *bridgeGuestBackend) unmount(ctx context.Context, controller, lun uint, path string, config *mountConfig) error {
@@ -109,7 +146,7 @@ func (bgb *bridgeGuestBackend) unmount(ctx context.Context, controller, lun uint
 	if err != nil {
 		return err
 	}
-	return bgb.gc.Modify(ctx, req)
+	return bgb.modify(ctx, req)
 }
 
 func (bgb *bridgeGuestBackend) unplug(ctx context.Context, controller, lun uint) error {
@@ -120,7 +157,7 @@ func (bgb *bridgeGuestBackend) unplug(ctx context.Context, controller, lun uint)
 	if req.RequestType == "" {
 		return nil
 	}
-	return bgb.gc.Modify(ctx, req)
+	return bgb.modify(ctx, req)
 }
 
 var _ mounter = &hcsGuestBackend{}

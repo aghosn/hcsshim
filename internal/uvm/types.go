@@ -90,6 +90,7 @@ type UtilityVM struct {
 	SCSIManager         *scsi.Manager
 	scsiControllerCount uint32 // Number of SCSI controllers in the utility VM
 	reservedSCSISlots   []scsi.Slot
+	siblingStorage      bool
 
 	encryptScratch bool                         // Enable scratch encryption
 	vpciDevices    map[VPCIDeviceID]*VPCIDevice // map of device instance id to vpci device

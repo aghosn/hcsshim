@@ -98,6 +98,8 @@ func main() {
 		cwcowCommand,
 		siblingAttachCommand,
 		siblingStopCommand,
+		siblingContainerCommand,
+		siblingRuntimeConfigCommand,
 	}
 
 	app.Before = func(c *cli.Context) error {

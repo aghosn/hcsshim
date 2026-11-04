@@ -52,6 +52,9 @@ import (
 )
 
 func newHcsStandaloneTask(ctx context.Context, events publisher, req *task.CreateTaskRequest, s *specs.Spec) (shimTask, error) {
+	if s.Annotations[annotations.LCOWSiblingPair] != "" {
+		return nil, errors.New("sibling pair ownership requires a pod sandbox")
+	}
 	log.G(ctx).WithField("tid", req.ID).Debug("newHcsStandaloneTask")
 
 	ct, _, err := oci.GetSandboxTypeAndID(s.Annotations)
@@ -200,7 +203,8 @@ func newHcsTask(
 	parent *uvm.UtilityVM,
 	ownsParent bool,
 	req *task.CreateTaskRequest,
-	s *specs.Spec) (_ shimTask, err error) {
+	s *specs.Spec,
+	hostOwner ...interface{ Close() error }) (_ shimTask, err error) {
 	ctx, entry := log.SetEntry(ctx, logrus.Fields{logfields.TaskID: req.ID})
 	entry.WithFields(logrus.Fields{
 		"hasHost":      parent != nil,
@@ -257,6 +261,9 @@ func newHcsTask(
 		closed:         make(chan struct{}),
 		taskSpec:       s,
 		ioRetryTimeout: ioRetryTimeout,
+	}
+	if len(hostOwner) != 0 {
+		ht.hostOwner = hostOwner[0]
 	}
 	ht.init = newHcsExec(
 		ctx,
@@ -346,6 +353,9 @@ type hcsTask struct {
 	// NOTE: if `osversion.Build() < osversion.RS5` this will always be
 	// `nil`.
 	host *uvm.UtilityVM
+	// hostOwner closes companion resources together with the hosting VM.
+	// It is set before lifecycle goroutines start, and only the sandbox owns it.
+	hostOwner interface{ Close() error }
 
 	// ecl is the exec create lock for all non-init execs and MUST be held
 	// during create to prevent ID duplication.
@@ -469,7 +479,8 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 			return true
 		})
 	}
-	if signal == 0x9 && eid == "" && ht.host != nil {
+	if signal == 0x9 && eid == "" && ht.host != nil &&
+		(ht.ownsHost || !ht.host.UsesSiblingNetworking()) {
 		// If this is a SIGKILL against the init process we start a background
 		// timer and wait on either the timer expiring or the process exiting
 		// cleanly. If the timer expires first we forcibly close the UVM as we
@@ -487,7 +498,7 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 			case <-t.C:
 				// Safe to call multiple times if called previously on
 				// successful shutdown.
-				ht.host.Close()
+				ht.shutdownHost()
 			}
 		}()
 	}
@@ -787,7 +798,7 @@ func (ht *hcsTask) closeHost(ctx context.Context) {
 		entry.Debug("hcsTask::closeHostOnce")
 
 		if ht.ownsHost && ht.host != nil {
-			if err := ht.host.Close(); err != nil {
+			if err := ht.shutdownHost(); err != nil {
 				entry.WithError(err).Error("failed host vm shutdown")
 			}
 		}
@@ -808,6 +819,16 @@ func (ht *hcsTask) closeHost(ctx context.Context) {
 		}
 		close(ht.closed)
 	})
+}
+
+func (ht *hcsTask) shutdownHost() error {
+	if ht.hostOwner != nil {
+		return ht.hostOwner.Close()
+	}
+	if ht.host != nil {
+		return ht.host.Close()
+	}
+	return nil
 }
 
 func (ht *hcsTask) ExecInHost(ctx context.Context, req *shimdiag.ExecProcessRequest) (int, error) {
