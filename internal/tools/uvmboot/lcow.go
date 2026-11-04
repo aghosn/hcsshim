@@ -1621,7 +1621,11 @@ const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + siblingVsockSta
 // compares, over that window, the root VMBus channel interrupts with the
 // sibling doorbells. Nothing is printed inside the window because guest
 // output itself travels over VMBus (hvsock). It needs siblingWorkloadStage.
-const siblingNetRelayCheck = `snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
+const siblingNetRelayCheck = `( stats=/sys/module/sibling_bus/parameters/stats_enabled; ` +
+	`stats_was=$(cat "$stats") || { echo 'diode_net: cannot read diagnostic counter state' >&2; exit 1; }; ` +
+	`trap 'printf "%s" "$stats_was" >"$stats" || { echo "diode_net: cannot restore diagnostic counters" >&2; exit 1; }' EXIT; ` +
+	`printf Y >"$stats" || { echo 'diode_net: cannot enable diagnostic counters' >&2; exit 1; }; ` +
+	`snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; ` +
 	`ping -q -A -c 2000 -s 1400 10.200.0.1 >/tmp/dn-ping 2>&1 || ` +
 	`ping -q -c 300 -i 0.01 -s 1400 10.200.0.1 >>/tmp/dn-ping 2>&1; ` +
 	`snap; t1=$t b1=$b d1=$d m1=$m; ` +
@@ -1631,7 +1635,7 @@ const siblingNetRelayCheck = `snap; h0=$h c0=$c d0=$d g0=$g t0=$t b0=$b r0=$r; `
 	`echo "diode_net: relay check cs=$((t-t0)) vmbus_chan_irqs=$((c-c0)) hyp_irqs=$((h-h0)) ` +
 	`doorbells_rx=$((d-d0)) signals_tx=$((g-g0)) tx_bytes=$((b-b0)) rx_bytes=$((r-r0))"; ` +
 	`if [ $((d-d0)) -gt 100 ] && [ $(((c-c0)*100)) -lt $((d-d0)) ]; then echo 'diode_net: no-relay ok'; ` +
-	`else echo 'diode_net: no-relay inconclusive'; fi; `
+	`else echo 'diode_net: no-relay inconclusive'; fi; ) || exit $?; `
 
 // siblingDiodeUplinkCommand configures the diode's uplink NIC (the only
 // interface besides dvsp0 backed by a device). It needs the exec tmpfs from
@@ -1752,13 +1756,16 @@ func guestWaitFor(cond, what string) string {
 		"sleep 1; done; "
 }
 
+const siblingTransportVersion = 4
+
 func siblingInstanceCommand() string {
 	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
 		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +
 		`sb_instance=$1; ` +
 		guestWaitFor(`[ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance"`, "common peer instance") +
 		`set -- $(cat "$sb_instance"); sb_bus=${1#*=}; sb_local=${2#*=}; sb_peer=${3#*=}; ` +
-		`[ "${4#*=}" = 2 ] || { echo 'sibling_vmbus: protocol version mismatch' >&2; exit 1; }; `
+		fmt.Sprintf(`[ "${4#*=}" = %d ] || { echo "sibling_vmbus: protocol version mismatch expected=%d actual=${4#*=}" >&2; `+
+			`%sexit 1; }; `, siblingTransportVersion, siblingTransportVersion, siblingFailureDiagnosticsCommand())
 }
 
 func siblingStockNICCommand(name string) string {

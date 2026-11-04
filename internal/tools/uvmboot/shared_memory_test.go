@@ -3,11 +3,48 @@
 package main
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 )
+
+func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell is required to exercise the generated Linux startup command")
+	}
+	for _, test := range []struct {
+		name     string
+		instance string
+		wantFail bool
+	}{
+		{"current", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", false},
+		{"stale-v2", "bus_id=1 local_cid=3 peer_cid=4 version=2 ready=1", true},
+		{"stale-v3", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := strings.Replace(siblingInstanceCommand(),
+				"set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance;",
+				`fixture=$(mktemp); trap 'rm -f "$fixture"' EXIT; printf '%s\n' `+
+					shellSingleQuote(test.instance)+` >"$fixture"; set -- "$fixture";`, 1)
+			command += `echo "INSTANCE_ACCEPTED bus=$sb_bus local=$sb_local peer=$sb_peer"`
+			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
+			if (err != nil) != test.wantFail {
+				t.Fatalf("startup result=%v, want failure=%v:\n%s", err, test.wantFail, output)
+			}
+			if !test.wantFail && !strings.Contains(string(output),
+				"INSTANCE_ACCEPTED bus=1 local=3 peer=4") {
+				t.Fatalf("accepted instance lost its routing identity:\n%s", output)
+			}
+			if test.wantFail && (!strings.Contains(string(output), "protocol version mismatch expected=4") ||
+				strings.Contains(string(output), "INSTANCE_ACCEPTED")) {
+				t.Fatalf("incompatible transport was not explicitly rejected:\n%s", output)
+			}
+		})
+	}
+}
 
 func TestSharedMemorySectionNames(t *testing.T) {
 	win32Name, hcsName, err := sharedMemorySectionNames("hcsshim-test", 3)
@@ -23,6 +60,46 @@ func TestSharedMemorySectionNames(t *testing.T) {
 			hcsName,
 			`\Sessions\3\BaseNamedObjects\hcsshim-test`,
 		)
+	}
+}
+
+func TestSiblingRelayProofScopesDiagnosticCounters(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell is required to exercise the generated Linux proof command")
+	}
+	for _, test := range []struct {
+		name, initial string
+		fail          bool
+	}{
+		{"disabled", "N", false},
+		{"enabled", "Y", false},
+		{"failure", "N", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			proof := strings.ReplaceAll(siblingNetRelayCheck,
+				"/sys/module/sibling_bus/parameters/stats_enabled", `"$fixture"`)
+			proof = strings.ReplaceAll(proof, "/tmp/dn-ping", `"$fixture-ping"`)
+			proof = strings.ReplaceAll(proof, "/tmp/dn-tcp", `"$fixture-tcp"`)
+			snap := `snap() { [ "$(cat "$fixture")" = Y ] || exit 9; ` +
+				`h=0 c=0 d=$((${d:-0}+600)) g=0 m=0 t=0 b=0 r=0; }; `
+			if test.fail {
+				snap = `snap() { exit 17; }; `
+			}
+			command := `fixture=$(mktemp); trap 'rm -f "$fixture" "$fixture-ping" "$fixture-tcp"' EXIT; ` +
+				`printf %s ` + shellSingleQuote(test.initial) + ` >"$fixture"; ` +
+				`ping() { :; }; dtb=true; ` + snap +
+				`( ` + proof + `); rc=$?; echo "RESTORED=$(cat "$fixture")"; exit "$rc"`
+			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
+			if (err != nil) != test.fail ||
+				!strings.Contains(string(output), "RESTORED="+test.initial) {
+				t.Fatalf("proof result=%v, expected failure=%v and restored=%s:\n%s",
+					err, test.fail, test.initial, output)
+			}
+			if !test.fail && !strings.Contains(string(output), "diode_net: no-relay ok") {
+				t.Fatalf("proof did not observe enabled counters:\n%s", output)
+			}
+		})
 	}
 }
 
