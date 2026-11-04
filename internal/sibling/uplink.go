@@ -28,7 +28,8 @@ type Uplink struct {
 	MAC        string
 }
 
-func ensureUplinkNetwork() (*hcn.HostComputeNetwork, error) {
+// EnsureUplinkNetwork shares the validated NAT network with pre-boot appliances.
+func EnsureUplinkNetwork() (*hcn.HostComputeNetwork, error) {
 	network, err := hcn.GetNetworkByName(UplinkNetworkName)
 	if err == nil {
 		if network.Type != hcn.NAT || len(network.Ipams) != 1 || len(network.Ipams[0].Subnets) != 1 ||
@@ -56,7 +57,7 @@ func AttachUplink(ctx context.Context, vm *uvm.UtilityVM) (*Uplink, func() error
 	if vm.UsesSiblingNetworking() {
 		return nil, nil, errors.New("cannot attach an uplink to a sibling workload")
 	}
-	network, err := ensureUplinkNetwork()
+	network, err := EnsureUplinkNetwork()
 	if err != nil {
 		return nil, nil, err
 	}

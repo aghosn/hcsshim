@@ -25,7 +25,7 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 		{"stale-v3", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			command := strings.Replace(siblingInstanceCommand(),
+			command := strings.Replace(siblingInstanceDiscoveryCommand(),
 				"set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance;",
 				`fixture=$(mktemp); trap 'rm -f "$fixture"' EXIT; printf '%s\n' `+
 					shellSingleQuote(test.instance)+` >"$fixture"; set -- "$fixture";`, 1)

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -80,7 +81,7 @@ func siblingRoleName(role string) string {
 }
 
 // serveSiblingShells serves shells in vm until a stop request or vm exits.
-func serveSiblingShells(ctx context.Context, vm *uvm.UtilityVM, role string) error {
+func serveSiblingShells(ctx context.Context, vm *uvm.UtilityVM, role string, allowContainers bool) error {
 	if err := listenSiblingStop(); err != nil {
 		return err
 	}
@@ -104,10 +105,12 @@ func serveSiblingShells(ctx context.Context, vm *uvm.UtilityVM, role string) err
 			if err != nil {
 				return
 			}
-			go siblingShell(ctx, vm, name, conn)
+			go siblingShell(ctx, vm, name, conn, allowContainers)
 		}
 	}()
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-siblingStop:
 		fmt.Printf("sibling interactive: %s stopping\n", name)
 	case <-exited:
@@ -117,10 +120,16 @@ func serveSiblingShells(ctx context.Context, vm *uvm.UtilityVM, role string) err
 }
 
 // siblingShell runs a login shell with a TTY in vm for one client.
-func siblingShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn) {
+func siblingShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, allowContainers bool) {
 	defer conn.Close()
 	typ, payload, err := readFrame(conn)
 	if err == nil && (typ == frameHello || typ == frameImageHello) {
+		if !allowContainers {
+			response, _ := json.Marshal(siblingHelloResult{ExitCode: -1,
+				Error: "Unikraft supports workload attach and stop only; container commands require the containerd-owned Linux pair"})
+			_ = writeFrame(conn, typ, response)
+			return
+		}
 		serveSiblingHello(ctx, vm, name, conn, typ, payload)
 		return
 	}

@@ -117,6 +117,32 @@ possibly live export. LUN 0 cannot be dynamically added or removed.
 
 Without this annotation, the ordinary LCOW and demo paths are unchanged.
 
+### Optional Unikraft diode in the existing uvmboot pair
+
+The same `uvmboot-shmem.exe` retains its ordinary Linux runtime commands,
+`runtime-config` and shell attachment.
+Its `lcow --unikraft-diode-package <directory>` option replaces only
+the diode in the existing two-VM lifecycle, not the Linux workload or its GCS.
+The directory must contain `guest.vmgs` and `launch-manifest.json`.
+
+The appliance has no Linux rootfs, GCS, Plan9 or host socket initialization;
+its manifest-bound SCSI disks and optional uplink are attached before boot.
+Use `--cpus=1`, SNP, a 32 MiB shared section, the matching sibling-bus module,
+and either interactive mode or an explicit workload command. For root-only
+mode, use `--sibling-storage-root` and a read-only root export at LUN 0.
+The backend plan must exactly match all manifest exports and access modes.
+Transport-v4 startup checks remain enforced. The Unikraft runtime supports
+workload attach and stop only; the appliance has a serial console log, not
+a Linux shell. Packaged `container hello|hello-world` commands require normal
+CRI in the containerd-owned Linux pair. Unikraft does not provide a direct-GCS
+container fallback or the V1 shim's dynamic disk-export control protocol.
+
+Hardware checkpoint (2026-11-04): mixed-pair startup and read-only sibling
+root-storage integrity/bounds/write-protection checks passed. The Unikraft
+network provider still lacks ICMP support; ping is not functional. HTTP made
+progress before DNS resolution failed, so full network acceptance remains
+pending. These are bring-up results, not production security qualification.
+
 ### Containerd Shim V2
 
 The V2 shims are the rewrite of the Windows containerd shim. The V1 shim

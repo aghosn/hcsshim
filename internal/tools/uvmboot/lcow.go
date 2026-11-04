@@ -75,8 +75,9 @@ var lcowCommand = cli.Command{
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
 		cli.StringFlag{
-			Name:  unikraftPackageArgName,
-			Usage: "Replace only the diode with this direct-SNP Unikraft package; run the existing Linux sibling echo client, without networking.",
+			Name: unikraftPackageArgName,
+			Usage: "Replace only the diode with a standalone SNP VMGS package containing guest.vmgs and launch-manifest.json; " +
+				"use the existing pair lifecycle and an interactive workload or explicit workload test.",
 		},
 		cli.StringSliceFlag{
 			Name: annotationsArgName,
@@ -338,6 +339,10 @@ var lcowCommand = cli.Command{
 			_, err = fmt.Printf("storage_backend_plan: %s\n", data)
 			return err
 		}
+		unikraft, err := loadUnikraftConfig(c, storagePlan)
+		if err != nil {
+			return err
+		}
 		benchSeconds = c.Int(benchSecondsArgName)
 		if benchSeconds < 1 {
 			return fmt.Errorf("--%s must be at least 1", benchSecondsArgName)
@@ -370,6 +375,10 @@ var lcowCommand = cli.Command{
 		}
 		benchmarkCtx := context.Background()
 		var cancelBenchmark context.CancelFunc
+		if unikraft != nil {
+			benchmarkCtx, cancelBenchmark = context.WithCancel(benchmarkCtx)
+			defer cancelBenchmark()
+		}
 		if c.String(networkBenchmarkScriptArgName) != "" || c.String(storageBenchmarkScriptArgName) != "" {
 			topology, err := hostProcessorTopology(benchmarkCtx)
 			if err != nil {
@@ -468,8 +477,7 @@ var lcowCommand = cli.Command{
 			}
 		}
 		if c.IsSet(siblingBusGuestModuleArgName) {
-			if (!c.IsSet(sharedMemoryGuestModuleArgName) &&
-				c.String(unikraftPackageArgName) == "") ||
+			if (!c.IsSet(sharedMemoryGuestModuleArgName) && unikraft == nil) ||
 				!c.Bool(sharedMemoryTwoUVMArgName) {
 				return fmt.Errorf(
 					"--%s requires --%s and --%s",
@@ -481,9 +489,6 @@ var lcowCommand = cli.Command{
 			if _, err := os.Stat(c.String(siblingBusGuestModuleArgName)); err != nil {
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
-		}
-		if err := validateUnikraftPair(c); err != nil {
-			return err
 		}
 		for _, flag := range []struct {
 			name  string
@@ -519,7 +524,7 @@ var lcowCommand = cli.Command{
 				return fmt.Errorf("OpenShell bundle is not a regular file: %s", bundle)
 			}
 		}
-		if c.String(networkBenchmarkScriptArgName) == "" && (c.IsSet(baselineNICArgName) ||
+		if unikraft == nil && c.String(networkBenchmarkScriptArgName) == "" && (c.IsSet(baselineNICArgName) ||
 			(c.Bool(siblingDiodeUplinkArgName) && c.String(siblingOpenShellBundleArgName) == "")) {
 			stop, err := startHostEndpoint()
 			if err != nil {
@@ -559,7 +564,7 @@ var lcowCommand = cli.Command{
 					sharedMemoryTwoUVMArgName,
 				)
 			}
-			if !c.IsSet(sharedMemoryGuestModuleArgName) && c.String(unikraftPackageArgName) == "" &&
+			if unikraft == nil && !c.IsSet(sharedMemoryGuestModuleArgName) &&
 				c.Duration(sharedMemoryObserveArgName) < 6*time.Second {
 				return fmt.Errorf(
 					"--%s requires --%s of at least 6s",
@@ -625,11 +630,17 @@ var lcowCommand = cli.Command{
 					if cancelBenchmark != nil {
 						cancelBenchmark()
 					}
+				} else if unikraft != nil && id == "uvmboot-1" {
+					cancelBenchmark()
 				}
 			}()
 
-			if packageDir := c.String(unikraftPackageArgName); packageDir != "" && id == "uvmboot-0" {
-				return runUnikraftProvider(ctx, packageDir, siblingCommunicationGroupID, section)
+			if unikraft != nil && id == "uvmboot-0" {
+				cpuGroup, err := cpuGroups.groupForVM(id)
+				if err != nil {
+					return err
+				}
+				return runUnikraftProvider(ctx, c, unikraft, storagePlan, siblingCommunicationGroupID, cpuGroup, section)
 			}
 			options, err := createLCOWOptions(ctx, c, id)
 			if err != nil {
@@ -677,6 +688,7 @@ var lcowCommand = cli.Command{
 				options,
 				c,
 				storagePlan,
+				unikraft,
 				execCommand,
 				func(
 					uvmID string,
@@ -741,15 +753,7 @@ var lcowCommand = cli.Command{
 			}).Info("verified identical shared-memory mappings")
 		}
 
-		if c.String(unikraftPackageArgName) != "" {
-			if firstErr != nil {
-				return firstErr
-			}
-			fmt.Println("PASS: mixed Unikraft/Linux SNP sibling pair, 16 verified echoes and provider cleanup")
-			return nil
-		}
-
-		if c.Bool(siblingStorageRootArgName) || c.String(storageBenchmarkScriptArgName) != "" {
+		if unikraft != nil || c.Bool(siblingStorageRootArgName) || c.String(storageBenchmarkScriptArgName) != "" {
 			// Root mode uses discovery and storage, not the marker/event proof.
 			return firstErr
 		}
@@ -1051,6 +1055,7 @@ func runLCOW(
 	options *uvm.OptionsLCOW,
 	c *cli.Context,
 	storagePlan *siblingStoragePlan,
+	unikraft *unikraftConfig,
 	execCommand string,
 	mappingObserver func(
 		string,
@@ -1067,7 +1072,7 @@ func runLCOW(
 			resultErr = errors.Join(resultErr, closeStorageBenchmark(ctx, vm.CloseCtx, storageReleases))
 			return
 		}
-		if c.String(networkBenchmarkScriptArgName) == "" {
+		if c.String(networkBenchmarkScriptArgName) == "" && c.String(unikraftPackageArgName) == "" {
 			_ = vm.CloseCtx(ctx)
 			return
 		}
@@ -1209,12 +1214,21 @@ func runLCOW(
 		storageReleases = append(storageReleases, release)
 		execCommand = command
 	} else if c.String(unikraftPackageArgName) != "" {
-		const busModuleRoot = "/run/sibling-bus-module"
-		modulePath := c.String(siblingBusGuestModuleArgName)
-		if err := vm.Share(ctx, modulePath, busModuleRoot, true); err != nil {
-			return fmt.Errorf("share Linux sibling-bus module: %w", err)
+		module := c.String(siblingBusGuestModuleArgName)
+		if err := vm.Share(ctx, module, "/run/sibling-bus-module", true); err != nil {
+			return err
 		}
-		execCommand = unikraftWorkloadCommand(busModuleRoot + "/" + filepath.Base(modulePath))
+		if storagePlan != nil {
+			tool := filepath.Join(filepath.Dir(module), "diode_storage_test")
+			if err := vm.Share(ctx, tool, "/run/diode-storage-test", true); err != nil {
+				return err
+			}
+		}
+		execCommand, err = unikraftWorkloadCommand("/run/sibling-bus-module/"+filepath.Base(module),
+			unikraft, storagePlan, execCommand)
+		if err != nil {
+			return err
+		}
 	} else if modulePath := c.String(sharedMemoryGuestModuleArgName); modulePath != "" {
 		const guestModuleRoot = "/run/hcs-shmem-diag-module"
 
@@ -1435,7 +1449,7 @@ func runLCOW(
 			if err != nil {
 				return err
 			}
-			if err := serveSiblingShells(ctx, vm, role); err != nil {
+			if err := serveSiblingShells(ctx, vm, role, unikraft == nil); err != nil {
 				return err
 			}
 		}
@@ -1733,7 +1747,7 @@ func guestWaitFor(cond, what string) string {
 
 const siblingTransportVersion = 4
 
-func siblingInstanceCommand() string {
+func siblingInstanceDiscoveryCommand() string {
 	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
 		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +
 		`sb_instance=$1; ` +
@@ -1741,6 +1755,10 @@ func siblingInstanceCommand() string {
 		`set -- $(cat "$sb_instance"); sb_bus=${1#*=}; sb_local=${2#*=}; sb_peer=${3#*=}; ` +
 		fmt.Sprintf(`[ "${4#*=}" = %d ] || { echo "sibling_vmbus: protocol version mismatch expected=%d actual=${4#*=}" >&2; `+
 			`%sexit 1; }; `, siblingTransportVersion, siblingTransportVersion, siblingFailureDiagnosticsCommand())
+}
+
+func siblingInstanceCommand() string {
+	return siblingInstanceDiscoveryCommand()
 }
 
 func siblingStockNICCommand(name string) string {

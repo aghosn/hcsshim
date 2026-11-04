@@ -166,6 +166,16 @@ func verifyWCOWBootFiles(bootFiles *WCOWBootFiles) error {
 func VerifyOptions(_ context.Context, options interface{}) error {
 	switch opts := options.(type) {
 	case *OptionsLCOW:
+		if opts.Appliance != nil {
+			if opts.GuestStateFilePath == "" || !opts.SecurityPolicyEnabled ||
+				opts.HclEnabled == nil || *opts.HclEnabled ||
+				opts.UseGuestConnection || opts.ForwardStdout || opts.ForwardStderr ||
+				opts.DmVerityMode || opts.SiblingRoot || opts.PreferredRootFSType != PreferredRootFSTypeNA ||
+				opts.AllowOvercommit || opts.EnableDeferredCommit || opts.ConsolePipe == "" ||
+				opts.KernelBootOptions != "" {
+				return errors.New("VMGS appliance requires direct SNP, a console pipe, no Linux guest services/rootfs and no runtime kernel arguments")
+			}
+		}
 		if opts.EnableDeferredCommit && !opts.AllowOvercommit {
 			return errors.New("EnableDeferredCommit is not supported on physically backed VMs")
 		}

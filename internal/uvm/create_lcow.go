@@ -64,6 +64,13 @@ const (
 
 type LCOWSharedMemoryRegion = hcsschema.SharedMemoryRegion
 
+// LCOWApplianceOptions describes a VMGS guest with no Linux guest services.
+// Devices are provisioned at creation and remain attached until VM teardown.
+type LCOWApplianceOptions struct {
+	SCSI            map[string]hcsschema.Scsi
+	NetworkAdapters map[string]hcsschema.NetworkAdapter
+}
+
 type ConfidentialLCOWOptions struct {
 	*ConfidentialCommonOptions
 	UseGuestStateFile  bool   // Use a vmgs file that contains a kernel and initrd, required for SNP
@@ -106,6 +113,7 @@ type OptionsLCOW struct {
 	SiblingCommunicationEndpoints []hcsschema.SiblingCommunicationEndpoint // Direct sibling communication endpoint registrations
 	PolicyBasedRouting            bool                                     // Whether we should use policy based routing when configuring net interfaces in guest
 	WritableOverlayDirs           bool                                     // Whether init should create writable overlay mounts for /var and /etc
+	Appliance                     *LCOWApplianceOptions                    // Explicit no-GCS, standalone VMGS guest
 }
 
 // NewDefaultOptionsLCOW creates the default options for a bootable version of
@@ -332,8 +340,10 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 
 	// The root file system comes from the dmverity vhd file which is mounted by the initrd in the vmgs file.
 	dmVerityRootfsTemplatePath := filepath.Join(opts.BootFilesPath, opts.DmVerityRootFsVhd)
-	if _, err := os.Stat(dmVerityRootfsTemplatePath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("the DM Verity VHD file '%s' was not found", dmVerityRootfsTemplatePath)
+	if opts.Appliance == nil {
+		if _, err := os.Stat(dmVerityRootfsTemplatePath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("the DM Verity VHD file '%s' was not found", dmVerityRootfsTemplatePath)
+		}
 	}
 
 	var processor *hcsschema.VirtualMachineProcessor
@@ -341,7 +351,13 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 	if err != nil {
 		return nil, err
 	}
+	return makeLCOWVMGSBootDoc(ctx, opts, uvm, processor)
+}
 
+func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
+	processor *hcsschema.VirtualMachineProcessor) (_ *hcsschema.ComputeSystem, err error) {
+	vmgsTemplatePath := filepath.Join(opts.BootFilesPath, opts.GuestStateFilePath)
+	dmVerityRootfsTemplatePath := filepath.Join(opts.BootFilesPath, opts.DmVerityRootFsVhd)
 	vmgsFileFullPath := filepath.Join(opts.BundleDirectory, opts.GuestStateFilePath)
 	if err := copyfile.CopyFile(ctx, vmgsTemplatePath, vmgsFileFullPath, true); err != nil {
 		return nil, fmt.Errorf("failed to copy VMGS template file: %w", err)
@@ -353,19 +369,20 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 	}()
 
 	dmVerityRootFsFullPath := filepath.Join(opts.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd)
-	if err := copyfile.CopyFile(ctx, dmVerityRootfsTemplatePath, dmVerityRootFsFullPath, true); err != nil {
-		return nil, fmt.Errorf("failed to copy DM Verity rootfs template file: %w", err)
+	bootFiles := []string{vmgsFileFullPath}
+	if opts.Appliance == nil {
+		if err := copyfile.CopyFile(ctx, dmVerityRootfsTemplatePath, dmVerityRootFsFullPath, true); err != nil {
+			return nil, fmt.Errorf("failed to copy DM Verity rootfs template file: %w", err)
+		}
+		bootFiles = append(bootFiles, dmVerityRootFsFullPath)
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && opts.Appliance == nil {
 			os.Remove(dmVerityRootFsFullPath)
 		}
 	}()
 
-	for _, filename := range []string{
-		vmgsFileFullPath,
-		dmVerityRootFsFullPath,
-	} {
+	for _, filename := range bootFiles {
 		if err := security.GrantVmGroupAccessWithMask(filename, security.AccessMaskAll); err != nil {
 			return nil, fmt.Errorf("failed to grant VM group access ALL: %w", err)
 		}
@@ -408,20 +425,29 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 		},
 	}
 
-	maps.Copy(doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable, opts.AdditionalHyperVConfig)
+	if opts.Appliance != nil {
+		doc.VirtualMachine.Devices.HvSocket = nil
+		doc.VirtualMachine.Devices.Plan9 = nil
+		doc.VirtualMachine.Devices.NetworkAdapters = maps.Clone(opts.Appliance.NetworkAdapters)
+		doc.VirtualMachine.Devices.ComPorts = map[string]hcsschema.ComPort{
+			"0": {NamedPipe: opts.ConsolePipe},
+		}
+	} else {
+		maps.Copy(doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable, opts.AdditionalHyperVConfig)
 
-	// Set permissions for the VSock ports:
-	//		entropyVsockPort - 1 is the entropy port,
-	//		linuxLogVsockPort - 109 used by vsockexec to log stdout/stderr logging,
-	//		0x40000000 + 1 (LinuxGcsVsockPort + 1) is the bridge (see guestconnectiuon.go)
-	hvSockets := []uint32{vmutils.LinuxEntropyVsockPort, vmutils.LinuxLogVsockPort, prot.LinuxGcsVsockPort, prot.LinuxGcsVsockPort + 1}
-	hvSockets = append(hvSockets, opts.ExtraVSockPorts...)
-	for _, whichSocket := range hvSockets {
-		key := winio.VsockServiceID(whichSocket).String()
-		doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable[key] = hcsschema.HvSocketServiceConfig{
-			AllowWildcardBinds:        true,
-			BindSecurityDescriptor:    "D:P(A;;FA;;;WD)",
-			ConnectSecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+		// Set permissions for the VSock ports:
+		//		entropyVsockPort - 1 is the entropy port,
+		//		linuxLogVsockPort - 109 used by vsockexec to log stdout/stderr logging,
+		//		0x40000000 + 1 (LinuxGcsVsockPort + 1) is the bridge (see guestconnectiuon.go)
+		hvSockets := []uint32{vmutils.LinuxEntropyVsockPort, vmutils.LinuxLogVsockPort, prot.LinuxGcsVsockPort, prot.LinuxGcsVsockPort + 1}
+		hvSockets = append(hvSockets, opts.ExtraVSockPorts...)
+		for _, whichSocket := range hvSockets {
+			key := winio.VsockServiceID(whichSocket).String()
+			doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable[key] = hcsschema.HvSocketServiceConfig{
+				AllowWildcardBinds:        true,
+				BindSecurityDescriptor:    "D:P(A;;FA;;;WD)",
+				ConnectSecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+			}
 		}
 	}
 
@@ -454,6 +480,10 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 }
 
 func applyLCOWVMGSStorage(doc *hcsschema.ComputeSystem, opts *OptionsLCOW, uvm *UtilityVM, rootPath string) {
+	if opts.Appliance != nil {
+		doc.VirtualMachine.Devices.Scsi = maps.Clone(opts.Appliance.SCSI)
+		return
+	}
 	if uvm.scsiControllerCount == 0 {
 		return
 	}
@@ -987,7 +1017,7 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 
 	// vpmemMaxCount has been set to 0 which means we are going to need multiple SCSI controllers
 	// to support lots of layers.
-	if osversion.Build() >= osversion.RS5 && uvm.vpmemMaxCount == 0 {
+	if opts.Appliance == nil && osversion.Build() >= osversion.RS5 && uvm.vpmemMaxCount == 0 {
 		uvm.scsiControllerCount = 4
 	}
 
@@ -1026,9 +1056,11 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 	}
 
 	// Create a socket to inject entropy during boot.
-	uvm.entropyListener, err = uvm.listenVsock(vmutils.LinuxEntropyVsockPort)
-	if err != nil {
-		return nil, err
+	if opts.Appliance == nil {
+		uvm.entropyListener, err = uvm.listenVsock(vmutils.LinuxEntropyVsockPort)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create a socket that the executed program can send to. This is usually

@@ -50,14 +50,10 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 		}
 		return nil, nil
 	}
-	// Optional Unikraft support may be absent from this checkout.
-	if c.String("unikraft-diode-package") != "" {
-		return nil, fmt.Errorf("--%s requires a Linux diode", siblingStorageBackendsArgName)
-	}
 	if !c.Bool(validateStorageBackendsArgName) && (!useGCS || !c.Bool(sharedMemoryTwoUVMArgName) ||
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		c.String(siblingBusGuestModuleArgName) == "") {
-		return nil, fmt.Errorf("--%s requires a two-Linux-VM sibling pair with GCS and --%s",
+		return nil, fmt.Errorf("--%s requires a two-VM sibling pair with a GCS workload and --%s",
 			siblingStorageBackendsArgName, siblingBusGuestModuleArgName)
 	}
 	if c.IsSet(scsiMountsArgName) || c.IsSet(vpmemMountsArgName) ||
