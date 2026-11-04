@@ -27,11 +27,29 @@ import (
 // MappingPhase is a seal/control boundary, independent of lifetime/page identity;
 // MappingOperation selects a bounded map form, never an arbitrary hypercall.
 // Empty mapping fields are omitted from evidence to preserve flag-off records.
+// SealFlags is the immutable requested bitmap on each partition seal step,
+// including repeats; it is not a supported-bit mask or page-lifecycle flag.
 type partitionSealStep struct {
 	proofStep
 	Lifetime         string
+	SealFlags        uint64                            `json:",omitempty"`
 	MappingPhase     string                            `json:",omitempty"`
 	MappingOperation protectedSharedHvMappingOperation `json:",omitempty"`
+}
+
+// validateProtectedSharedSealOptions checks explicit option presence and mode
+// before filesystem/native acquisition. It deliberately takes no bitmap:
+// uint64 parsing owns representation/range and HV alone owns semantic validity.
+// M1/ordinary callers without the option retain their existing handling.
+func validateProtectedSharedSealOptions(mode string, supplied bool) error {
+	if mode == "partition-seal" {
+		if !supplied {
+			return errors.New("partition-seal requires explicit protected-shared-seal-flags")
+		}
+	} else if supplied {
+		return errors.New("protected-shared-seal-flags requires protected-shared-proof partition-seal")
+	}
+	return nil
 }
 
 // validateProtectedSharedMapOptions is a pure opt-in check of mode, hardware
@@ -145,7 +163,9 @@ func (l *partitionSealLifetime) consumeControl(s partitionSealStep, r partitionS
 // cleanup; false preserves the original exact sequence without scratch steps.
 // An optional PauseBeforeSeal adapter can replace the forward context with its
 // remaining budget after an operator pause; cleanup retains its separate budget.
-func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, pages uint64, cleanupTimeout time.Duration, mapProbes bool) (err error) {
+// sealFlags is copied unchanged into every initial/repeat seal submission,
+// including zero/future bits; HV, not this coordinator, validates the bitmap.
+func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, pages, sealFlags uint64, cleanupTimeout time.Duration, mapProbes bool) (err error) {
 	if pages == 0 || pages > 4096 || cleanupTimeout <= 0 || cleanupTimeout > 10*time.Minute {
 		return errors.New("invalid partition-seal experiment bounds")
 	}
@@ -382,7 +402,8 @@ func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, 
 	}
 	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
 		for _, id := range []string{"a", "b"} {
-			if err = call(partitionSealStep{proofStep: proofStep{Kind: kind, Participant: id}, Lifetime: "primary"}); err != nil {
+			if err = call(partitionSealStep{proofStep: proofStep{Kind: kind, Participant: id},
+				Lifetime: "primary", SealFlags: sealFlags}); err != nil {
 				return err
 			}
 			if mapProbes {
@@ -715,20 +736,21 @@ func (p *realPartitionSealProof) discover(ctx context.Context, id string, after 
 	return nil
 }
 
-// sealPartition submits the participant's VM-global, payload-free seal every
+// sealPartition submits the participant's explicit uint64 VM-global seal every
 // time, including repeats. It borrows the live owned VM, not region metadata or
 // a discovered numeric target. Evidence records the actual operation error and
-// repeat distinction, never a cached receipt. Failure/timeout/cancellation does
-// not prove that the irreversible native operation had no effect.
-func (p *realPartitionSealProof) sealPartition(ctx context.Context, id string, repeat bool) error {
+// requested bitmap/repeat distinction, never a cached receipt. Zero/future bits
+// reach HV unchanged. Failure/timeout/cancellation does not prove that the
+// irreversible native operation had no effect.
+func (p *realPartitionSealProof) sealPartition(ctx context.Context, id string, sealFlags uint64, repeat bool) error {
 	v := p.primary.vms[id]
 	if v == nil || v.vm == nil || v.terminated || p.closedVMs[id] {
 		return errors.New("partition seal requires a live owned participant VM")
 	}
-	err := v.vm.SealPartition(ctx)
+	err := v.vm.SealPartition(ctx, sealFlags)
 	p.primary.evidence.record("partition-seal", map[string]any{
 		"Participant": id, "ID": v.vm.ID(), "Runtime": fmt.Sprint(v.vm.RuntimeID()),
-		"URI": "hcs:/VirtualMachine/SealPartition", "Repeat": repeat,
+		"URI": "hcs:/VirtualMachine/SealPartition", "Repeat": repeat, "SealFlags": sealFlags,
 		"Error": proofErrorText(err), "ContextError": proofErrorText(ctx.Err()),
 		"FailureDoesNotEstablishUnsealed": true,
 	})
@@ -1055,6 +1077,7 @@ func (p *realPartitionSealProof) releaseLifetime(q *realProof) error {
 // preserved on failure. Driver/backing acquisition and all actions are serialized.
 // Discovery brackets the entire existing preparation call, never just Start;
 // repeats submit VM-global seals without a region action or receipt query.
+// Every initial/repeat seal forwards the step's full uint64 SealFlags unchanged.
 // Cleanup steps observe only their supplied independent context, not forward ctx.
 // Mapping steps use separate phase/operation fields, retain dirty intervals on
 // failure, and never conflate scratch ownership with either backing lifetime.
@@ -1152,7 +1175,7 @@ func (p *realPartitionSealProof) Run(ctx context.Context, s partitionSealStep) (
 	case "hv-unmap", "scratch-cleanup":
 		err = p.cleanupScratch(ctx, s.Participant, s.MappingPhase)
 	case "partition-seal", "partition-seal-repeat":
-		err = p.sealPartition(ctx, s.Participant, s.Kind == "partition-seal-repeat")
+		err = p.sealPartition(ctx, s.Participant, s.SealFlags, s.Kind == "partition-seal-repeat")
 	case "late-prepare":
 		err = p.prepareLate(ctx)
 	case "late-install-denial":

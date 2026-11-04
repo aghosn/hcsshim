@@ -38,6 +38,7 @@ const (
 	protectedCleanupFlag      = "protected-shared-cleanup-timeout"
 	protectedMapProbesFlag    = "protected-shared-map-probes"
 	protectedSealPauseFlag    = "protected-shared-seal-pause"
+	protectedSealFlagsFlag    = "protected-shared-seal-flags"
 	proofCopyAfterExitTimeout = 5 * time.Second
 	// Private VID v2 lifecycle opcodes; trusted HV lifecycle stays v1.
 	psInitialize = 1
@@ -1102,8 +1103,15 @@ func validateProtectedSharedNativeLayout() error {
 // CLI/global settings remain serialized and immutable during the proof.
 // Optional map probes are plain partition-seal admission checks only; validation
 // precedes acquisition and disabled runs retain their original evidence fields.
+// Partition-seal requires explicit SealFlags before filesystem/native work;
+// other modes reject that option. The uint64 is never semantically validated
+// here, and M1 without it retains its existing run evidence shape.
 func runProtectedSharedCLI(c *cli.Context) error {
 	mode := c.String(protectedModeFlag)
+	if err := validateProtectedSharedSealOptions(mode, c.IsSet(protectedSealFlagsFlag)); err != nil {
+		return err
+	}
+	sealFlags := c.Uint64(protectedSealFlagsFlag)
 	mapProbes := c.Bool(protectedMapProbesFlag)
 	if err := validateProtectedSharedMapOptions(mapProbes, mode, c.Bool(securityHardwareFlag), c.Uint64(sharedMemorySizeArgName)); err != nil {
 		return err
@@ -1195,6 +1203,9 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	}
 	run := map[string]any{"Mode": mode, "GuestMode": p.guestMode(),
 		"Pages": p.pages, "Claim": claim}
+	if mode == "partition-seal" {
+		run["SealFlags"] = sealFlags
+	}
 	if mapProbes {
 		run["MapProbes"] = true
 		run["Coverage"] = "special-zero-admission-only"
@@ -1205,7 +1216,7 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	}
 	var err error
 	if mode == "partition-seal" {
-		err = executePartitionSealProof(ctx, &realPartitionSealProof{primary: p}, p.pages, cleanup, mapProbes)
+		err = executePartitionSealProof(ctx, &realPartitionSealProof{primary: p}, p.pages, sealFlags, cleanup, mapProbes)
 	} else {
 		err = executeProtectedProof(ctx, p, p.pages, cleanup)
 	}

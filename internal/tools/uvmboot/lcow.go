@@ -68,6 +68,12 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.Uint64Flag{
+			Name: protectedSealFlagsFlag,
+			Usage: "Explicit uint64 bitmap required only for partition-seal (decimal or hex): " +
+				"1 restricts memory access/maps, 2 freezes host visibility changes, 3 selects both. " +
+				"Zero and future bits are forwarded unchanged; HV alone validates semantics.",
+		},
 		cli.StringFlag{
 			Name:  protectedSealPauseFlag,
 			Usage: "Lab-only partition-seal pause-file prefix; publish .ready before the first partition seal and wait for .resume containing continue. Pause time is excluded from the forward budget.",
@@ -239,7 +245,12 @@ var lcowCommand = cli.Command{
 	// any ordinary-mode host marker reads or success-overriding fallbacks.
 	// Enabled map probes are validated even without a proof mode, before any
 	// ordinary VM acquisition. Disabled inputs keep their existing handling.
+	// Explicit seal flags are required only in partition-seal; reject them in
+	// other modes before boot-file reads or any ordinary/proof acquisition.
 	Action: func(c *cli.Context) error {
+		if err := validateProtectedSharedSealOptions(c.String(protectedModeFlag), c.IsSet(protectedSealFlagsFlag)); err != nil {
+			return err
+		}
 		if c.String(protectedSealPauseFlag) != "" && c.String(protectedModeFlag) != "partition-seal" {
 			return fmt.Errorf("seal pause requires protected-shared-proof partition-seal")
 		}

@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,8 +24,157 @@ import (
 	"unsafe"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/urfave/cli"
 	"golang.org/x/sys/windows"
 )
+
+// newProtectedSharedSealTestContext applies the actual command flag definitions
+// to an isolated parser without dispatching actions or acquiring resources.
+// Only seal/mode/pause options are needed for these structural validation tests;
+// parse failures return no usable context and remain distinct from HV errors.
+func newProtectedSharedSealTestContext(t *testing.T, args ...string) (*cli.Context, error) {
+	t.Helper()
+	set := flag.NewFlagSet("partition-seal-options", flag.ContinueOnError)
+	set.SetOutput(io.Discard)
+	for _, option := range lcowCommand.Flags {
+		switch option.GetName() {
+		case protectedModeFlag, protectedSealFlagsFlag, protectedSealPauseFlag:
+			option.Apply(set)
+		}
+	}
+	if err := set.Parse(args); err != nil {
+		return nil, err
+	}
+	return cli.NewContext(cli.NewApp(), set, nil), nil
+}
+
+// TestProtectedSharedPartitionSealFlagsForwarding parses decimal/hex values
+// through the real uint64 flag definition and forwards zero/known/future/high
+// bitmaps unchanged into every synthetic initial/repeat seal. These are
+// orchestration checks, not native semantic validation or S5 probe expectations.
+func TestProtectedSharedPartitionSealFlagsForwarding(t *testing.T) {
+	for _, scenario := range []struct {
+		input string
+		want  uint64
+	}{
+		{"0", 0}, {"1", 1}, {"2", 2}, {"3", 3}, {"0x3", 3},
+		{"256", 1 << 8}, {"0x100", 1 << 8},
+		{"9223372036854775808", 1 << 63}, {"0x8000000000000000", 1 << 63},
+		{"18446744073709551615", math.MaxUint64}, {"0xffffffffffffffff", math.MaxUint64},
+	} {
+		t.Run(scenario.input, func(t *testing.T) {
+			c, err := newProtectedSharedSealTestContext(t, "-"+protectedModeFlag, "partition-seal",
+				"-"+protectedSealFlagsFlag, scenario.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateProtectedSharedSealOptions(c.String(protectedModeFlag), c.IsSet(protectedSealFlagsFlag)); err != nil {
+				t.Fatal(err)
+			}
+			flags := c.Uint64(protectedSealFlagsFlag)
+			if flags != scenario.want {
+				t.Fatalf("parsed bitmap=%d, want %d", flags, scenario.want)
+			}
+			f := newPartitionSealFake(t)
+			if err := executePartitionSealProof(context.Background(), f, 5, flags, time.Minute, false); err != nil {
+				t.Fatal(err)
+			}
+			seals := 0
+			for _, step := range f.steps {
+				if step.Kind == "partition-seal" || step.Kind == "partition-seal-repeat" {
+					seals++
+					if step.SealFlags != scenario.want {
+						t.Errorf("%s/%s bitmap=%d, want %d", step.Kind, step.Participant, step.SealFlags, scenario.want)
+					}
+				}
+			}
+			if seals != 4 {
+				t.Fatalf("got %d submissions, want independent initial/repeat A/B seals", seals)
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionSealFlagsSyntax rejects missing values, negative,
+// overflow, fractional and nonnumeric input in the actual flag parser before
+// any action/context can be dispatched. Full-width valid inputs are covered
+// separately so structural rejection cannot become a semantic bitmap allowlist.
+func TestProtectedSharedPartitionSealFlagsSyntax(t *testing.T) {
+	for _, input := range [][]string{
+		{"-" + protectedSealFlagsFlag},
+		{"-" + protectedSealFlagsFlag, "-1"},
+		{"-" + protectedSealFlagsFlag, "18446744073709551616"},
+		{"-" + protectedSealFlagsFlag, "0x10000000000000000"},
+		{"-" + protectedSealFlagsFlag, "not-a-number"},
+		{"-" + protectedSealFlagsFlag, "1.5"},
+	} {
+		t.Run(strings.Join(input, "="), func(t *testing.T) {
+			args := append([]string{"-" + protectedModeFlag, "partition-seal"}, input...)
+			c, err := newProtectedSharedSealTestContext(t, args...)
+			if err == nil || c != nil {
+				t.Fatal("invalid uint64 syntax returned a dispatchable context")
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionSealFlagsMode requires explicit presence only for
+// partition-seal, and rejects supplied zero/future/high values in M1/ordinary
+// modes. Both real entry points must return the option error before even pause
+// filesystem validation, protecting the pre-acquisition guard. M1/ordinary with
+// no option remain accepted by this pure guard and acquire nothing in this test.
+func TestProtectedSharedPartitionSealFlagsMode(t *testing.T) {
+	for _, scenario := range []struct {
+		name, mode, value string
+		supplied          bool
+		wantError         string
+	}{
+		{"missing partition bitmap", "partition-seal", "", false, "partition-seal requires explicit protected-shared-seal-flags"},
+		{"M1 omitted", "m1", "", false, ""},
+		{"ordinary omitted", "", "", false, ""},
+		{"M1 zero", "m1", "0", true, "protected-shared-seal-flags requires protected-shared-proof partition-seal"},
+		{"M1 future", "m1", "256", true, "protected-shared-seal-flags requires protected-shared-proof partition-seal"},
+		{"ordinary high", "", "0x8000000000000000", true, "protected-shared-seal-flags requires protected-shared-proof partition-seal"},
+		{"ordinary maximum", "", "18446744073709551615", true, "protected-shared-seal-flags requires protected-shared-proof partition-seal"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			var args []string
+			if scenario.mode != "" {
+				args = append(args, "-"+protectedModeFlag, scenario.mode)
+			}
+			if scenario.supplied {
+				args = append(args, "-"+protectedSealFlagsFlag, scenario.value)
+			}
+			// A later invalid pause must not mask the seal-option error or
+			// cause filesystem checks before explicit presence/mode checks.
+			if scenario.wantError != "" {
+				args = append(args, "-"+protectedSealPauseFlag, "relative-pause")
+			}
+			c, err := newProtectedSharedSealTestContext(t, args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.IsSet(protectedSealFlagsFlag) != scenario.supplied ||
+				(!scenario.supplied && c.Uint64(protectedSealFlagsFlag) != 0) {
+				t.Fatal("implicit bitmap default or incorrect explicit presence")
+			}
+			err = validateProtectedSharedSealOptions(c.String(protectedModeFlag), c.IsSet(protectedSealFlagsFlag))
+			if proofErrorText(err) != scenario.wantError {
+				t.Fatalf("option validation=%v, want %q", err, scenario.wantError)
+			}
+			if scenario.wantError != "" {
+				for name, entry := range map[string]func(*cli.Context) error{
+					"lcow": lcowCommand.Action.(func(*cli.Context) error),
+					"proof": runProtectedSharedCLI,
+				} {
+					if err := entry(c); proofErrorText(err) != scenario.wantError {
+						t.Errorf("%s entry passed early option guard: %v", name, err)
+					}
+				}
+			}
+		})
+	}
+}
 
 // TestProtectedSharedHvInterfacePath requires the active hvtest interface GUID
 // and returns the enumerated PnP path, not the nonexistent legacy alias. Missing,
@@ -688,7 +839,8 @@ func (f *partitionSealFake) Write(data []byte) (int, error) {
 // to have a fresh live deadline; releases/VM closes are recorded separately so
 // tests can detect forgotten partial owners, duplicate closes and unsafe frees.
 // Discovery feeds synthetic enumerations through the real selection adapter;
-// fake seal submissions record order only and do not simulate HCS or VID.
+// fake seal submissions record order and the exact requested bitmap without
+// interpreting it or simulating HCS, VID or HV bitmap validity.
 // Mapping steps record attempted dirty scratch only, not HV enforcement. Unmap
 // cleanup exercises the concrete ledger/diagnostic helper through the existing
 // IOCTL seam with synthetic success or transport failure; no VM/driver is opened.
@@ -857,6 +1009,7 @@ func (f *partitionSealPauseFake) PauseBeforeSeal(ctx context.Context) (context.C
 // TestProtectedSharedPartitionPauseBoundary requires a single pause after all
 // positive controls/maps, before either seal. Aborting must skip sealing/exchange
 // and still perform the existing independent VM/backing cleanup.
+// Explicit bitmap 3 preserves this existing full-policy ordering scenario.
 func TestProtectedSharedPartitionPauseBoundary(t *testing.T) {
 	for _, maps := range []bool{false, true} {
 		for _, abort := range []bool{false, true} {
@@ -881,7 +1034,7 @@ func TestProtectedSharedPartitionPauseBoundary(t *testing.T) {
 					}
 					return ctx, func() {}, nil
 				}
-				err := executePartitionSealProof(context.Background(), runner, 5, time.Minute, maps)
+				err := executePartitionSealProof(context.Background(), runner, 5, 3, time.Minute, maps)
 				sealAt := partitionStepPosition(f.steps, "partition-seal", "", "")
 				if calls != 1 || errors.Is(err, stop) != abort || (!abort && err != nil) ||
 					(abort && sealAt != -1) || (!abort && sealAt != pauseAt) {
@@ -969,9 +1122,10 @@ func TestProtectedSharedPartitionPauseBudget(t *testing.T) {
 // This protects orchestration only; synthetic steps do not prove HV behavior.
 // U2-c brackets each entire prepare boundary with discovery before B starts;
 // U3-a omits identity actions and requires fresh initial/repeat submissions.
+// Explicit bitmap 3 keeps these original full-policy expectations unchanged.
 func TestProtectedSharedPartitionOrder(t *testing.T) {
 	f := newPartitionSealFake(t)
-	if err := executePartitionSealProof(context.Background(), f, 5, time.Minute, false); err != nil {
+	if err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, false); err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
@@ -1032,6 +1186,7 @@ func TestProtectedSharedPartitionOrder(t *testing.T) {
 // stop B/probes as applicable, and independently clean every acquired VM and
 // known backing. Prepare errors still return ownership before cleanup decisions.
 // These order/correlation assertions are not real HCS or hypervisor evidence.
+// Explicit bitmap 3 retains the original full-policy failure scenario.
 func TestProtectedSharedPartitionDiscoveryFailures(t *testing.T) {
 	for _, scenario := range []struct {
 		name, kind, id      string
@@ -1077,7 +1232,7 @@ func TestProtectedSharedPartitionDiscoveryFailures(t *testing.T) {
 			if scenario.cancel {
 				f.cancel = cancel
 			}
-			err := executePartitionSealProof(ctx, f, 5, time.Minute, false)
+			err := executePartitionSealProof(ctx, f, 5, 3, time.Minute, false)
 			if err == nil || (scenario.operationErr && !errors.Is(err, f.failErr)) ||
 				(scenario.cancel && !errors.Is(err, context.Canceled)) {
 				t.Fatal("discovery/acquisition failure was not retained")
@@ -1130,6 +1285,7 @@ func TestProtectedSharedPartitionDiscoveryFailures(t *testing.T) {
 // Returned owners and valid prefixes must enter cleanup before forward work
 // stops. Fresh cleanup must still remove late's borrowed owner, close A only
 // once, and use each lease's actual prefix (including zero/no-init cases).
+// Explicit bitmap 3 retains these existing full-policy cleanup expectations.
 func TestProtectedSharedPartitionPartialAcquisition(t *testing.T) {
 	for _, scenario := range []struct {
 		name, kind, lifetime, vm string
@@ -1158,7 +1314,7 @@ func TestProtectedSharedPartitionPartialAcquisition(t *testing.T) {
 			if scenario.cancel {
 				f.cancel, f.failErr = cancel, nil
 			}
-			if err := executePartitionSealProof(ctx, f, 5, time.Minute, false); err == nil {
+			if err := executePartitionSealProof(ctx, f, 5, 3, time.Minute, false); err == nil {
 				t.Fatal("failed/cancelled forward operation passed")
 			}
 			failed := partitionStepPosition(f.steps, scenario.kind, scenario.lifetime, scenario.vm)
@@ -1208,6 +1364,7 @@ func TestProtectedSharedPartitionPartialAcquisition(t *testing.T) {
 // The affected lifetime must never be released, while independent safe owners
 // still get cleanup. In particular late uncertainty cannot be mistaken for
 // zero native initialization work or independent ownership of VM A.
+// Explicit bitmap 3 preserves the existing full-policy retention scenario.
 func TestProtectedSharedPartitionRetainsUncertain(t *testing.T) {
 	for _, scenario := range []struct {
 		name, kind, lifetime, vm  string
@@ -1233,7 +1390,7 @@ func TestProtectedSharedPartitionRetainsUncertain(t *testing.T) {
 			f.failKind, f.failLifetime, f.failVM = scenario.kind, scenario.lifetime, scenario.vm
 			f.unframed, f.uncertain = scenario.unframed, scenario.uncertain
 			f.failErr = errors.New("uncertain or failed cleanup operation")
-			if err := executePartitionSealProof(context.Background(), f, 5, time.Minute, false); err == nil {
+			if err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, false); err == nil {
 				t.Fatal("uncertain/failed operation passed")
 			}
 			for name, retain := range map[string]bool{"primary": scenario.retainPrimary, "late": scenario.retainLate} {
@@ -1258,6 +1415,7 @@ func TestProtectedSharedPartitionRetainsUncertain(t *testing.T) {
 // Every synthetic submission must stop later forward work on failure while
 // preserving independent two-VM teardown/reclaim/release. Neither cancellation
 // nor a fake submission proves native sealing had no effect or produced a receipt.
+// Explicit bitmap 3 preserves these original full-policy failure boundaries.
 func TestProtectedSharedPartitionPartialSealing(t *testing.T) {
 	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
 		for _, id := range []string{"a", "b"} {
@@ -1277,7 +1435,7 @@ func TestProtectedSharedPartitionPartialSealing(t *testing.T) {
 					case "sticky evidence":
 						f.evidenceOnFailure = true
 					}
-					err := executePartitionSealProof(ctx, f, 5, time.Minute, false)
+					err := executePartitionSealProof(ctx, f, 5, 3, time.Minute, false)
 					if err == nil || (f.failErr != nil && !errors.Is(err, f.failErr)) ||
 						(failure == "cancellation" && !errors.Is(err, context.Canceled)) ||
 						(failure == "sticky evidence" && !errors.Is(err, f.evidenceErr)) {
@@ -1315,22 +1473,23 @@ func TestProtectedSharedPartitionPartialSealing(t *testing.T) {
 // dispatch and exercises failed acquisition with no VM returned. Only actually
 // returned VM ownership permits termination; sticky evidence still closes an
 // acquired driver even though no backing or further forward work is allowed.
+// Explicit bitmap 3 changes neither acquisition bounds nor cleanup authority.
 func TestProtectedSharedPartitionNoPhantomOwner(t *testing.T) {
 	for _, pages := range []uint64{0, 4097} {
 		f := newPartitionSealFake(t)
-		if err := executePartitionSealProof(context.Background(), f, pages, time.Minute, false); err == nil || len(f.steps) != 0 {
+		if err := executePartitionSealProof(context.Background(), f, pages, 3, time.Minute, false); err == nil || len(f.steps) != 0 {
 			t.Error("invalid page bound acquired resources")
 		}
 	}
 	f := newPartitionSealFake(t)
 	f.failKind, f.failVM, f.omitVM, f.failErr = "prepare", "a", true, errors.New("no returned VM")
-	if err := executePartitionSealProof(context.Background(), f, 1, time.Minute, false); err == nil ||
+	if err := executePartitionSealProof(context.Background(), f, 1, 3, time.Minute, false); err == nil ||
 		partitionStepPosition(f.steps, "terminate", "", "") >= 0 || f.doubleClose {
 		t.Error("failed acquisition invented a VM owner")
 	}
 	f = newPartitionSealFake(t)
 	f.evidenceErr = errors.New("evidence write failed")
-	if err := executePartitionSealProof(context.Background(), f, 1, time.Minute, false); err == nil ||
+	if err := executePartitionSealProof(context.Background(), f, 1, 3, time.Minute, false); err == nil ||
 		partitionStepPosition(f.steps, "open", "", "") >= 0 ||
 		partitionStepPosition(f.steps, "close-driver", "", "") < 0 {
 		t.Error("sticky evidence failure hid acquisition or allowed forward progress")
@@ -1372,6 +1531,7 @@ func TestProtectedSharedPartitionNamedPreparation(t *testing.T) {
 // acquiring resources. Only plain partition-seal with eligible aligned section
 // bytes passes; disabled inputs are deliberately uninterpreted so ordinary/M1/
 // SNP handling and otherwise-supported sizes remain the existing paths' job.
+// The coordinator bound check supplies bitmap 3 explicitly, not as a default.
 func TestProtectedSharedPartitionMappingOptions(t *testing.T) {
 	for _, scenario := range []struct {
 		name, mode string
@@ -1408,7 +1568,7 @@ func TestProtectedSharedPartitionMappingOptions(t *testing.T) {
 		})
 	}
 	f := newPartitionSealFake(t)
-	if err := executePartitionSealProof(context.Background(), f, 510, time.Minute, true); err == nil || len(f.steps) != 0 {
+	if err := executePartitionSealProof(context.Background(), f, 510, 3, time.Minute, true); err == nil || len(f.steps) != 0 {
 		t.Fatal("ineligible coordinator bounds acquired resources")
 	}
 }
@@ -1417,10 +1577,11 @@ func TestProtectedSharedPartitionMappingOptions(t *testing.T) {
 // Enabled cleanup may schedule A, but the concrete adapter must issue no native
 // scratch call without a validated dirty target. Region/VM/driver cleanup still
 // runs; diagnostic discovery failure is not permission to guess a scratch GPA.
+// Explicit bitmap 3 retains the original full-policy mapping scenario.
 func TestProtectedSharedPartitionMappingNoTarget(t *testing.T) {
 	f := newPartitionSealFake(t)
 	f.failKind, f.failVM, f.failErr = "snapshot-after", "a", errors.New("discovery failed")
-	err := executePartitionSealProof(context.Background(), f, 5, time.Minute, true)
+	err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, true)
 	if !errors.Is(err, f.failErr) ||
 		partitionStepPosition(f.steps, "scratch-cleanup", "", "a") < 0 ||
 		partitionStepPosition(f.steps, "scratch-cleanup", "", "b") >= 0 ||
@@ -1436,6 +1597,7 @@ func TestProtectedSharedPartitionMappingNoTarget(t *testing.T) {
 // and repeated seal submissions with probes enabled. No negative map phase or
 // later forward work is authorized by an incomplete seal, and fresh independent
 // cleanup must still remove both attempted ownership records.
+// Explicit bitmap 3 preserves these full-policy failure expectations.
 func TestProtectedSharedPartitionMappingSealFailure(t *testing.T) {
 	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
 		for _, id := range []string{"a", "b"} {
@@ -1448,7 +1610,7 @@ func TestProtectedSharedPartitionMappingSealFailure(t *testing.T) {
 				f.failKind, f.failVM = kind, id
 				f.failErr = errors.New("incomplete seal submission")
 				f.cancel = cancel
-				err := executePartitionSealProof(ctx, f, 5, time.Minute, true)
+				err := executePartitionSealProof(ctx, f, 5, 3, time.Minute, true)
 				if !errors.Is(err, f.failErr) || !errors.Is(err, context.Canceled) {
 					t.Fatal("failed seal boundary was accepted")
 				}
@@ -1494,9 +1656,10 @@ func partitionMappingStepNames(steps []partitionSealStep) []string {
 // participant's completed first/repeat seal boundary. Existing copy, fresh late,
 // exchange and cleanup order must remain intact; no synthetic map enforces HV
 // policy, and clean deferred scratch steps must do no native work.
+// Explicit bitmap 3 retains the existing full-policy map sequence.
 func TestProtectedSharedPartitionMappingOrder(t *testing.T) {
 	f := newPartitionSealFake(t)
-	if err := executePartitionSealProof(context.Background(), f, 5, time.Minute, true); err != nil {
+	if err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, true); err != nil {
 		t.Fatal(err)
 	}
 	expected := []string{
@@ -1551,6 +1714,7 @@ func TestProtectedSharedPartitionMappingOrder(t *testing.T) {
 // while the real dirty-ledger unmap runs under fresh cleanup before teardown;
 // even a scratch cleanup error must not suppress existing cleanup/driver close.
 // The fake records attempts only, never simulating native seal enforcement.
+// Explicit bitmap 3 preserves these existing full-policy failure scenarios.
 func TestProtectedSharedPartitionMappingFailures(t *testing.T) {
 	for _, scenario := range []struct {
 		name, kind, id, phase, failure string
@@ -1586,7 +1750,7 @@ func TestProtectedSharedPartitionMappingFailures(t *testing.T) {
 			if scenario.cleanupFailure {
 				f.scratchCleanupErr = errors.New("independent unmap failed")
 			}
-			err := executePartitionSealProof(ctx, f, 5, time.Minute, true)
+			err := executePartitionSealProof(ctx, f, 5, 3, time.Minute, true)
 			if err == nil || (f.failErr != nil && !errors.Is(err, f.failErr)) ||
 				(scenario.failure == "cancel" && !errors.Is(err, context.Canceled)) ||
 				(scenario.failure == "evidence" && !errors.Is(err, f.evidenceErr)) ||
