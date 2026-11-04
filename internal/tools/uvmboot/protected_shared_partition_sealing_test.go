@@ -19,11 +19,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
+	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/urfave/cli"
 	"golang.org/x/sys/windows"
 )
@@ -792,6 +795,9 @@ type partitionSealFake struct {
 	discovery                         *realPartitionSealProof
 	snapshots                         map[string][]uint64
 	evidenceOnFailure                 bool
+	repeatSuccess                     bool
+	lateOutcome                       *uvm.ProtectedSharedModifyOutcome
+	lateInstalledBeforeError          bool
 }
 
 // newPartitionSealFake returns an empty receipt recorder with no real resource
@@ -840,7 +846,10 @@ func (f *partitionSealFake) Write(data []byte) (int, error) {
 // tests can detect forgotten partial owners, duplicate closes and unsafe frees.
 // Discovery feeds synthetic enumerations through the real selection adapter;
 // fake seal submissions record order and the exact requested bitmap without
-// interpreting it or simulating HCS, VID or HV bitmap validity.
+// interpreting it or simulating HCS, VID or HV bitmap validity. Repeats return
+// a typed duplicate for the real coordinator classifier, not a second success.
+// Late positive outcomes reuse the concrete ownership/receipt consumer; cached
+// Installed flags survive action/malformed failures until independent removal.
 // Mapping steps record attempted dirty scratch only, not HV enforcement. Unmap
 // cleanup exercises the concrete ledger/diagnostic helper through the existing
 // IOCTL seam with synthetic success or transport failure; no VM/driver is opened.
@@ -895,7 +904,32 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 	case "late-prepare":
 		f.leases["late"] = 22
 		f.events = append(f.events, "borrow-a")
-	case "hv-positive", "hv-negative":
+		f.discovery.late = &realProof{pages: 1, lease: 22, vms: map[string]*proofVM{
+			"a": {region: hcsschema.SharedMemoryRegion{Length: 4096,
+				HiddenFromGuest: true, ProtectedSharedLeaseId: 22}},
+		}}
+	case "late-install-positive":
+		outcome := uvm.ProtectedSharedModifyOutcome{Dispatched: true,
+			Receipt: &hcsschema.ProtectedSharedRegionInfo{
+				Version: 2, Prepared: true, Installed: true, LeaseId: 22, PageCount: 1,
+			}}
+		if f.lateOutcome != nil {
+			outcome = *f.lateOutcome
+		}
+		stepErr = acceptPartitionSealInstallation(f.discovery.late, "a", outcome)
+		f.lateInstalledBeforeError = !f.discovery.late.vms["a"].region.HiddenFromGuest
+		r.Uncertain = f.discovery.late.prepareUncertain
+	case "remove":
+		if s.Lifetime == "late" && f.discovery.late != nil {
+			var actionErr error
+			if fail {
+				actionErr = f.failErr
+			}
+			stepErr = f.discovery.late.vms["a"].acceptRemoval(&hcsschema.ProtectedSharedRegionInfo{
+				Version: 2, Removed: true, LeaseId: 22, PageCount: 1,
+			}, actionErr)
+		}
+	case "hv-positive", "hv-negative", "hv-post-positive":
 		if f.discovery.targets[s.Participant] == 0 {
 			stepErr = errors.New("fake probe lacks a validated discovery target")
 		}
@@ -934,9 +968,12 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 				binary.LittleEndian.PutUint32(output[4:8], 3)
 				return 4096, nil
 			}}
-		stepErr = f.discovery.cleanupScratch(ctx, s.Participant, s.MappingPhase)
+		stepErr = f.discovery.cleanupScratch(ctx, s.Participant, s.MappingPhase, s.SealFlags)
 	case "partition-seal", "partition-seal-repeat":
 		f.events = append(f.events, "submit-"+s.Kind+"-"+s.Participant)
+		if s.Kind == "partition-seal-repeat" && !(fail && f.repeatSuccess) {
+			stepErr = windows.ERROR_HV_INVALID_PARTITION_STATE
+		}
 	case "initialize", "seal", "teardown", "reclaim":
 		if s.Kind == "teardown" {
 			f.events = append(f.events, "native-teardown-"+s.Lifetime)
@@ -970,12 +1007,20 @@ func (f *partitionSealFake) Run(ctx context.Context, s partitionSealStep) (parti
 		r.LeaseId = f.leases[s.Lifetime]
 	}
 	if fail {
-		r.Uncertain = f.uncertain
+		r.Uncertain = r.Uncertain || f.uncertain
 		if f.evidenceOnFailure {
 			f.evidenceErr = errors.New("sticky evidence failure after synthetic submission")
 		}
 		if f.cancel != nil {
 			f.cancel()
+		}
+		// Native seal errors must remain a raw single-cause chain until the
+		// coordinator classifies them; do not manufacture a Join wrapper.
+		if s.Kind == "partition-seal" || s.Kind == "partition-seal-repeat" {
+			if f.failErr != nil {
+				return r, f.failErr
+			}
+			return r, stepErr
 		}
 		return r, errors.Join(stepErr, f.failErr)
 	}
@@ -1807,12 +1852,26 @@ func TestProtectedSharedPartitionMappingFailures(t *testing.T) {
 // dirty transition and metadata-only evidence using the existing IOCTL seam.
 // Transport failure/cancellation/failed evidence must preserve dirty state until
 // independent whole-range cleanup. Synthetic responses are not HV-policy proof;
-// U2 separately owns wire/progress classification.
+// wire/progress classification remains with the existing decoder tests.
+// Pre-seal mask-3 controls and post-seal mask-2/future positive controls must
+// retain the same dirty ownership and independent-cleanup guarantees.
 func TestProtectedSharedPartitionMappingLedger(t *testing.T) {
-	for _, failure := range []string{"transport", "cancellation", "evidence"} {
+	for _, scenario := range []struct {
+		failure, phase string
+		flags          uint64
+	}{
+		{"transport", "pre-seal", 3},
+		{"cancellation", "pre-seal", 3},
+		{"evidence", "pre-seal", 3},
+		{"transport", "post-repeat-seal", 2},
+		{"cancellation", "post-repeat-seal", 2},
+		{"evidence", "post-repeat-seal", 2},
+		{"transport", "post-repeat-seal", 1<<63 | 2},
+	} {
+		failure := scenario.failure
 		// The synthetic validated ledger owns no real VM or backing. Only the
 		// actual adapter's state transition and evidence writer are exercised.
-		t.Run(failure, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%x/%s/%s", scenario.flags, scenario.phase, failure), func(t *testing.T) {
 			f := newPartitionSealFake(t)
 			p := f.discovery
 			p.primary.evidence.writer = f
@@ -1847,7 +1906,7 @@ func TestProtectedSharedPartitionMappingLedger(t *testing.T) {
 					binary.LittleEndian.PutUint32(output[4:8], 2)
 					return 4096, nil
 				}}
-			err := p.mappingAttempt(ctx, "a", "pre-seal", s, protectedSharedHvMapContiguous, false)
+			err := p.mappingAttempt(ctx, "a", scenario.phase, s, protectedSharedHvMapContiguous, false, scenario.flags)
 			if err == nil || !s.dirty ||
 				(failure == "transport" && !errors.Is(err, transportErr)) ||
 				(failure == "cancellation" && !errors.Is(err, context.Canceled)) ||
@@ -1859,7 +1918,7 @@ func TestProtectedSharedPartitionMappingLedger(t *testing.T) {
 			f.evidenceWriteErr = nil
 			cleanupCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 			defer stop()
-			cleanupErr := p.cleanupScratch(cleanupCtx, "a", "cleanup")
+			cleanupErr := p.cleanupScratch(cleanupCtx, "a", "cleanup", scenario.flags)
 			if s.dirty || (failure == "evidence") != errors.Is(cleanupErr, writeErr) ||
 				(failure != "evidence" && cleanupErr != nil) {
 				t.Fatal("independent cleanup was suppressed or evidence failure was not sticky")
@@ -1878,7 +1937,7 @@ func TestProtectedSharedPartitionMappingLedger(t *testing.T) {
 				for _, field := range []string{"Participant", "ID", "Runtime", "HypervisorPartitionId", "Operation",
 					"OperationCode", "Phase", "Flags", "DestinationPageIndices", "RequestedCount", "ExpectedProcessed", "ExpectedRawStatus",
 					"TransportError", "ReturnedBytes", "FramingValid", "RawStatusValid", "RawStatus", "ElementsProcessed",
-					"ProtocolError", "ValidationError", "ContextError"} {
+					"ProtocolError", "ValidationError", "ContextError", "SealFlags", "ExpectedOutcome", "KnownProbeBitsOnly"} {
 					if _, present := record.Data[field]; !present {
 						t.Errorf("mapping evidence omitted %s", field)
 					}
@@ -1887,6 +1946,427 @@ func TestProtectedSharedPartitionMappingLedger(t *testing.T) {
 					if _, present := record.Data[forbidden]; present {
 						t.Error("mapping evidence exported memory/readback claims")
 					}
+				}
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionRepeatClassifier supplies raw and synthetic HCS
+// single-cause duplicate errors, plus misleading text/status/tree shapes.
+// Only exact typed duplicates with live contexts may pass; this protects the
+// expected-negative boundary without claiming native status-conversion coverage.
+func TestProtectedSharedPartitionRepeatClassifier(t *testing.T) {
+	duplicate := syscall.Errno(windows.ERROR_HV_INVALID_PARTITION_STATE)
+	wrapped := fmt.Errorf("seal: %w", &hcsv2.SystemError{
+		ID: "synthetic-a", HcsError: hcsv2.HcsError{Op: "SystemControl", Err: duplicate},
+	})
+	for _, scenario := range []struct {
+		name       string
+		actionErr  error
+		contextErr error
+		accept     bool
+	}{
+		{"raw", duplicate, nil, true},
+		{"wrapped HCS", wrapped, nil, true},
+		{"success", nil, nil, false},
+		{"text only", errors.New(duplicate.Error()), nil, false},
+		{"generic invalid state", hcsv2.ErrInvalidState, nil, false},
+		{"unrelated errno", windows.ERROR_HV_OPERATION_DENIED, nil, false},
+		{"HRESULT instead of errno", syscall.Errno(0x80350007), nil, false},
+		{"pointer not errno", &duplicate, nil, false},
+		{"single child tree", errors.Join(wrapped), nil, false},
+		{"duplicate and transport", errors.Join(wrapped, errors.New("transport")), nil, false},
+		{"duplicate and cancellation", errors.Join(wrapped, context.Canceled), nil, false},
+		{"buried tree", fmt.Errorf("outer: %w", &hcsv2.HcsError{
+			Op: "SystemControl", Err: errors.Join(wrapped, context.DeadlineExceeded),
+		}), nil, false},
+		{"cancelled", wrapped, context.Canceled, false},
+		{"expired", wrapped, context.DeadlineExceeded, false},
+	} {
+		// Each isolated shape is classified without joining away the native
+		// chain, dispatching resources, or interpreting diagnostic text.
+		t.Run(scenario.name, func(t *testing.T) {
+			err := validatePartitionSealRepeat(scenario.actionErr, scenario.contextErr)
+			if (err == nil) != scenario.accept {
+				t.Fatalf("accept=%t, error=%v", scenario.accept, err)
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionRepeatOutcomes exercises the real classifier
+// through the existing coordinator fake for both participants. Typed duplicate
+// failures continue to exchange; success, unrelated failures and multi-error
+// trees stop work but still remove/reclaim/zero/release all known owners.
+func TestProtectedSharedPartitionRepeatOutcomes(t *testing.T) {
+	wrapped := fmt.Errorf("seal: %w", &hcsv2.SystemError{
+		ID: "synthetic", HcsError: hcsv2.HcsError{
+			Op: "SystemControl", Err: windows.ERROR_HV_INVALID_PARTITION_STATE,
+		},
+	})
+	for _, id := range []string{"a", "b"} {
+		for _, scenario := range []struct {
+			name    string
+			raw     error
+			success bool
+			accept  bool
+		}{
+			{"typed duplicate", wrapped, false, true},
+			{"unexpected success", nil, true, false},
+			{"text duplicate", errors.New(wrapped.Error()), false, false},
+			{"unrelated failure", windows.ERROR_HV_OPERATION_DENIED, false, false},
+			{"single child join", errors.Join(wrapped), false, false},
+			{"joined failure", errors.Join(wrapped, context.DeadlineExceeded), false, false},
+		} {
+			// The fake returns the raw outcome before any coordinator joins;
+			// its repeated submission never pretends to apply native policy.
+			t.Run(id+"/"+scenario.name, func(t *testing.T) {
+				f := newPartitionSealFake(t)
+				f.failKind, f.failVM = "partition-seal-repeat", id
+				f.failErr, f.repeatSuccess = scenario.raw, scenario.success
+				err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, false)
+				if (err == nil) != scenario.accept ||
+					(partitionStepPosition(f.steps, "exchange", "", "") >= 0) != scenario.accept {
+					t.Fatalf("accept=%t, error=%v", scenario.accept, err)
+				}
+				if !scenario.accept {
+					failed := partitionStepPosition(f.steps, "partition-seal-repeat", "", id)
+					for _, s := range f.steps[failed+1:] {
+						switch s.Kind {
+						case "teardown", "remove", "terminate", "reclaim", "zero", "release", "close-driver":
+						default:
+							t.Errorf("unexpected repeat outcome allowed forward work: %s", s.Kind)
+						}
+					}
+				}
+				for _, owner := range []string{"a", "b"} {
+					if partitionStepPosition(f.steps, "remove", "primary", owner) < 0 ||
+						partitionStepPosition(f.steps, "terminate", "", owner) < 0 {
+						t.Error("repeat outcome lost a VM/region owner")
+					}
+				}
+				if partitionStepPosition(f.steps, "zero", "primary", "") < 0 ||
+					partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+					f.cleanupContextInvalid || f.doubleClose {
+					t.Error("repeat outcome changed independent cleanup")
+				}
+			})
+		}
+	}
+}
+
+// TestProtectedSharedPartitionInitialFailure fails an initial submission with
+// duplicate, timeout or lost-response errors. Each must remain fatal rather than
+// authorize a retry or post-seal probe: none proves that sealing did not commit.
+// Independent cleanup still consumes the original initialized lifetime.
+func TestProtectedSharedPartitionInitialFailure(t *testing.T) {
+	for _, id := range []string{"a", "b"} {
+		for _, scenario := range []struct {
+			name string
+			err  error
+		}{
+			{"duplicate", windows.ERROR_HV_INVALID_PARTITION_STATE},
+			{"timeout", context.DeadlineExceeded},
+			{"lost response", errors.New("native completion response lost")},
+		} {
+			// Each participant's initial failure is independent of the
+			// other's completion and is never the deliberate repeat.
+			t.Run(id+"/"+scenario.name, func(t *testing.T) {
+				f := newPartitionSealFake(t)
+				f.failKind, f.failVM, f.failErr = "partition-seal", id, scenario.err
+				err := executePartitionSealProof(context.Background(), f, 5, 3, time.Minute, false)
+				if !errors.Is(err, f.failErr) ||
+					partitionStepPosition(f.steps, "partition-seal-repeat", "", "") >= 0 ||
+					partitionStepPosition(f.steps, "hv-negative", "", "") >= 0 ||
+					partitionStepPosition(f.steps, "exchange", "", "") >= 0 ||
+					partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+					f.cleanupContextInvalid || f.doubleClose {
+					t.Fatal("initial error was normalized/retried or cleanup ownership lost")
+				}
+			})
+		}
+	}
+}
+
+// TestProtectedSharedPartitionProbeBitmap verifies U4 orchestration for all
+// known masks and future-bit combinations, including future-only/zero forwarding.
+// Only bit 0 selects denials; otherwise post-seal copy/maps and the independent
+// late Install must be positive operations. Fakes establish selection/ownership,
+// never whether HV accepts a future bitmap or enforces its unknown effects.
+func TestProtectedSharedPartitionProbeBitmap(t *testing.T) {
+	for _, flags := range []uint64{0, 1, 2, 3, 1 << 8, 1<<8 | 1, 1<<63 | 2, 1<<63 | 3, math.MaxUint64} {
+		for _, maps := range []bool{false, true} {
+			// Keep fresh synthetic owners for each flag/probe combination;
+			// expected steps are derived independently from literal bit 0.
+			t.Run(fmt.Sprintf("%x/maps=%t", flags, maps), func(t *testing.T) {
+				f := newPartitionSealFake(t)
+				if err := executePartitionSealProof(context.Background(), f, 5, flags, time.Minute, maps); err != nil {
+					t.Fatal(err)
+				}
+				denied := flags&1 != 0
+				copyKind, lateKind, mapKind := "hv-post-positive", "late-install-positive", "hv-map-positive"
+				otherCopy, otherLate := "hv-negative", "late-install-denial"
+				if denied {
+					copyKind, lateKind, mapKind = "hv-negative", "late-install-denial", "hv-map-negative"
+					otherCopy, otherLate = "hv-post-positive", "late-install-positive"
+				}
+				for _, id := range []string{"a", "b"} {
+					if partitionStepPosition(f.steps, "hv-positive", "primary", id) < 0 ||
+						partitionStepPosition(f.steps, copyKind, "primary", id) < 0 ||
+						partitionStepPosition(f.steps, otherCopy, "primary", id) >= 0 {
+						t.Error("known bit did not select the post-seal copy control")
+					}
+				}
+				if partitionStepPosition(f.steps, lateKind, "late", "a") < 0 ||
+					partitionStepPosition(f.steps, otherLate, "late", "a") >= 0 ||
+					partitionStepPosition(f.steps, "remove", "late", "a") < 0 ||
+					partitionStepPosition(f.steps, "zero", "late", "") < 0 ||
+					partitionStepPosition(f.steps, "release", "late", "") < 0 {
+					t.Fatal("late control was skipped/mislabeled or its ownership lost")
+				}
+				if !denied && (!f.lateInstalledBeforeError || !f.discovery.late.vms["a"].removed) {
+					t.Error("positive late control did not consume installed ownership and actual removal receipt")
+				}
+				controls, post, submissions := 0, 0, 0
+				for _, s := range f.steps {
+					if s.SealFlags != flags {
+						t.Error("step/evidence lost full-width immutable bitmap")
+					}
+					if s.Kind == "partition-seal" || s.Kind == "partition-seal-repeat" {
+						submissions++
+					}
+					if s.Kind == "hv-map-positive" || s.Kind == "hv-map-negative" {
+						switch s.MappingPhase {
+						case "pre-seal", "b-after-a-seal":
+							controls++
+							if s.Kind != "hv-map-positive" {
+								t.Error("unconfigured map control became negative")
+							}
+						case "post-first-seal", "post-repeat-seal":
+							post++
+							if s.Kind != mapKind {
+								t.Error("map expectation treated nonzero flags as full sealing")
+							}
+						default:
+							t.Error("unexpected map phase")
+						}
+					}
+				}
+				wantControls, wantPost := 0, 0
+				if maps {
+					wantControls, wantPost = 6, 8
+				}
+				if controls != wantControls || post != wantPost || submissions != 4 ||
+					f.cleanupContextInvalid || f.doubleClose {
+					t.Fatal("bitmap changed required controls, repeated submissions or cleanup")
+				}
+			})
+		}
+	}
+}
+
+// TestProtectedSharedPartitionLatePositiveOwnership feeds the shared real
+// Install receipt consumer through the existing fake. Installed flags must
+// precede action/partial/malformed errors; every attempted late region is still
+// removed, and only known ownership permits reclaim/zero/release. The primary
+// lifetime must remain independently cleanable even when late is uncertain.
+func TestProtectedSharedPartitionLatePositiveOwnership(t *testing.T) {
+	actionErr := errors.New("action failed after possible mapping")
+	receiptErr := errors.New("receipt observation failed")
+	for _, scenario := range []struct {
+		name                    string
+		installed, prepared     bool
+		nativePartial, noReceipt bool
+		actionErr, receiptErr    error
+		accept, retain           bool
+	}{
+		{name: "complete", installed: true, prepared: true, accept: true},
+		{name: "installed action failure", installed: true, prepared: true, actionErr: actionErr},
+		{name: "not installed action failure", prepared: true, actionErr: actionErr},
+		{name: "successful action without install", prepared: true},
+		{name: "partial native result", installed: true, prepared: true, nativePartial: true, actionErr: actionErr},
+		{name: "malformed installed owner", installed: true, actionErr: actionErr, retain: true},
+		{name: "installed receipt error", installed: true, prepared: true, receiptErr: receiptErr, retain: true},
+		{name: "missing receipt", noReceipt: true, actionErr: actionErr, retain: true},
+	} {
+		// The actual shared receipt consumer owns the transition, while the
+		// fake supplies only serialized outcomes and independent cleanup.
+		t.Run(scenario.name, func(t *testing.T) {
+			f := newPartitionSealFake(t)
+			info := &hcsschema.ProtectedSharedRegionInfo{
+				Version: 2, LeaseId: 22, PageCount: 1, InitializedPages: 1,
+				Prepared: scenario.prepared, Installed: scenario.installed,
+			}
+			if scenario.nativePartial {
+				info.OperationResultValid, info.PagesProcessed, info.OperationStatus = true, 1, psObjectInUse
+			}
+			if scenario.noReceipt {
+				info = nil
+			}
+			f.lateOutcome = &uvm.ProtectedSharedModifyOutcome{
+				Dispatched: true, Receipt: info, ActionError: scenario.actionErr, ReceiptError: scenario.receiptErr,
+			}
+			err := executePartitionSealProof(context.Background(), f, 5, 2, time.Minute, false)
+			if (err == nil) != scenario.accept ||
+				(scenario.actionErr != nil && !errors.Is(err, scenario.actionErr)) ||
+				(scenario.receiptErr != nil && !errors.Is(err, scenario.receiptErr)) {
+				t.Fatalf("late outcome lost its failure: %v", err)
+			}
+			if f.lateInstalledBeforeError != scenario.installed ||
+				f.discovery.late.prepareUncertain != scenario.retain ||
+				!f.discovery.late.vms["a"].removed {
+				t.Error("Install facts/errors were considered before ownership or removal was skipped")
+			}
+			if (partitionStepPosition(f.steps, "release", "late", "") < 0) != scenario.retain ||
+				partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+				partitionStepPosition(f.steps, "terminate", "", "a") < 0 ||
+				partitionStepPosition(f.steps, "terminate", "", "b") < 0 ||
+				f.cleanupContextInvalid || f.doubleClose {
+				t.Error("late failure changed conservative/independent cleanup")
+			}
+			if !scenario.retain && (partitionStepPosition(f.steps, "reclaim", "late", "") < 0 ||
+				partitionStepPosition(f.steps, "zero", "late", "") < 0) {
+				t.Error("installed late backing released without reclaim and full-byte zero check")
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionPositiveCleanupFailures requires independent
+// cleanup after mask-2 post-seal positive map/copy or installed late failures.
+// Dirty scratch must be unmapped before region teardown; failed detach,
+// partial reclaim and failed zero verification retain only unsafe backing.
+// These synthetic outcomes protect ledgers, not native enforcement policy.
+func TestProtectedSharedPartitionPositiveCleanupFailures(t *testing.T) {
+	for _, scenario := range []struct {
+		name, kind, lifetime, id, phase string
+		retainLate                     bool
+	}{
+		{"post-seal map", "hv-map-positive", "", "a", "post-repeat-seal", false},
+		{"post-seal copy", "hv-post-positive", "primary", "b", "", false},
+		{"late installed then error", "late-install-positive", "late", "a", "", false},
+		{"late detach", "remove", "late", "a", "", true},
+		{"late partial reclaim", "reclaim", "late", "", "", true},
+		{"late zero", "zero", "late", "", "", true},
+	} {
+		// Each failure returns any ownership before the coordinator stops;
+		// zero partial reclaim progress cannot authorize late release.
+		t.Run(scenario.name, func(t *testing.T) {
+			f := newPartitionSealFake(t)
+			f.failKind, f.failLifetime, f.failVM = scenario.kind, scenario.lifetime, scenario.id
+			f.failPhase, f.failErr = scenario.phase, errors.New("positive control/cleanup failed")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if scenario.kind == "late-install-positive" {
+				f.cancel = cancel
+			}
+			err := executePartitionSealProof(ctx, f, 5, 2, time.Minute, true)
+			if !errors.Is(err, f.failErr) ||
+				(scenario.kind == "late-install-positive" && !errors.Is(err, context.Canceled)) {
+				t.Fatal("positive failure/cancellation was lost")
+			}
+			for _, id := range []string{"a", "b"} {
+				if partitionStepPosition(f.steps, "remove", "primary", id) < 0 ||
+					partitionStepPosition(f.steps, "terminate", "", id) < 0 {
+					t.Error("positive failure lost independent primary/VM cleanup")
+				}
+			}
+			if scenario.kind == "hv-map-positive" {
+				unmap := strings.LastIndex(strings.Join(f.events, ","), "native-unmap-a")
+				teardown := strings.Index(strings.Join(f.events, ","), "native-teardown-primary")
+				if unmap < 0 || unmap > teardown || f.discovery.scratch["a"].dirty {
+					t.Error("post-seal positive map failure discarded dirty scratch")
+				}
+			}
+			if scenario.lifetime == "late" {
+				if !f.lateInstalledBeforeError ||
+					(partitionStepPosition(f.steps, "release", "late", "") < 0) != scenario.retainLate ||
+					partitionStepPosition(f.steps, "remove", "late", "a") < 0 {
+					t.Error("installed late ownership was inferred away or released unsafely")
+				}
+			}
+			if partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+				partitionStepPosition(f.steps, "close-driver", "", "") < 0 ||
+				f.cleanupContextInvalid || f.doubleClose {
+				t.Error("positive failure suppressed safe independent cleanup")
+			}
+		})
+	}
+}
+
+// TestProtectedSharedPartitionMappingBitmapEvidence exercises real map/unmap
+// validation and dirty transitions through the existing IOCTL fake. Known bit 0
+// determines exact expected status/progress; every accepted outcome still needs
+// a full unmap. Evidence must retain full-width flags, post-seal phase and
+// positive/denial expectation, with no guest bytes or future-coverage claim.
+func TestProtectedSharedPartitionMappingBitmapEvidence(t *testing.T) {
+	for _, flags := range []uint64{1, 2, 3, 1 << 63, 1<<63 | 1, 1<<63 | 2} {
+		// Native responses here are synthetic admission outcomes; they check
+		// the adapter's validation/evidence, not whether HV enforces a bitmap.
+		t.Run(fmt.Sprintf("%x", flags), func(t *testing.T) {
+			f := newPartitionSealFake(t)
+			p := f.discovery
+			p.primary.evidence.writer = f
+			s := &partitionSealScratch{
+				target: protectedSharedHvTarget{partitionID: 42, partitionIDValid: true, pageGPA: 105 * 4096},
+				pages: [3]uint64{105, 106, 107}, vmID: "synthetic-a",
+			}
+			p.scratch = map[string]*partitionSealScratch{"a": s}
+			negative := flags&1 != 0
+			unmaps := 0
+			// The synchronous callback observes ownership before dispatch and
+			// supplies exact raw status/progress without retaining any buffer.
+			p.probe = &protectedSharedHvProbe{handle: 123,
+				ioctl: func(_ windows.Handle, _ uint32, input, output []byte) (uint32, error) {
+					if !s.dirty {
+						t.Error("map/unmap dispatched without dirty ownership")
+					}
+					if binary.LittleEndian.Uint16(input[8:10]) == uint16(protectedSharedHvUnmapScratch) {
+						unmaps++
+						binary.LittleEndian.PutUint32(output[4:8], 3)
+					} else if negative {
+						binary.LittleEndian.PutUint16(output[0:2], protectedSharedHvMappingDenied)
+					} else {
+						binary.LittleEndian.PutUint32(output[4:8], 2)
+					}
+					return 4096, nil
+				}}
+			for _, op := range []protectedSharedHvMappingOperation{protectedSharedHvMapContiguous, protectedSharedHvMapSparse} {
+				if err := p.mappingAttempt(context.Background(), "a", "post-repeat-seal", s, op, negative, flags); err != nil || !s.dirty {
+					t.Fatalf("map outcome failed or lost ownership: %v", err)
+				}
+				if err := p.cleanupScratch(context.Background(), "a", "post-repeat-seal", flags); err != nil || s.dirty {
+					t.Fatalf("full scratch cleanup failed: %v", err)
+				}
+			}
+			if unmaps != 2 {
+				t.Fatal("map outcome skipped whole-range cleanup")
+			}
+			for _, line := range strings.Split(strings.TrimSpace(f.evidenceBuffer.String()), "\n") {
+				var record struct {
+					Kind string
+					Data struct {
+						SealFlags          uint64
+						Phase              string
+						OperationCode      uint16
+						Negative           bool
+						ExpectedOutcome    string
+						KnownProbeBitsOnly bool
+					}
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "PROTECTED-EVIDENCE ")), &record); err != nil {
+					t.Fatal(err)
+				}
+				wantOutcome := "positive"
+				wantNegative := negative && record.Data.OperationCode != uint16(protectedSharedHvUnmapScratch)
+				if wantNegative {
+					wantOutcome = "denial"
+				}
+				if record.Kind != "hv-map" || record.Data.SealFlags != flags ||
+					record.Data.Phase != "post-repeat-seal" || !record.Data.KnownProbeBitsOnly ||
+					record.Data.Negative != wantNegative || record.Data.ExpectedOutcome != wantOutcome {
+					t.Error("mapping evidence lost bitmap/expected outcome/coverage boundary")
 				}
 			}
 		})
