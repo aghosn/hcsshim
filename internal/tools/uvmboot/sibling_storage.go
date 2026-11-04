@@ -16,6 +16,7 @@ import (
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
@@ -285,12 +286,10 @@ func attachSiblingStorageDisk(ctx context.Context, vm *uvm.UtilityVM, disk sibli
 }
 
 func storageRPDeviceCommand(controllerID string, lun uint) string {
-	id := strings.ToLower(strings.Trim(controllerID, "{}"))
-	match := fmt.Sprintf(`storage_dev=; storage_count=0; for p in /sys/class/block/*; do `+
-		`d=$(readlink -f "$p/device" 2>/dev/null) || continue; `+
-		`case "$d" in */%s/host*/target*/*:0:0:%d) `+
-		`storage_dev=/dev/${p##*/}; storage_count=$((storage_count+1));; esac; done; `+
-		`[ "$storage_count" -eq 1 ] && [ -b "$storage_dev" ]`, id, lun)
+	match, err := sibling.RPDeviceIdentityMatch(controllerID, lun)
+	if err != nil {
+		return "echo 'invalid RP storage attachment' >&2; exit 1; "
+	}
 	return guestWaitFor(match, "RP storage attachment")
 }
 

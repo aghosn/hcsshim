@@ -190,7 +190,7 @@ func addLCOWLayer(ctx context.Context, vm *uvm.UtilityVM, layer *LCOWLayer) (uvm
 	// Don't add as VPMEM when we want additional devices on the UVM to be fully physically backed.
 	// Also don't use VPMEM when we need to mount a specific partition of the disk, as this is only
 	// supported for SCSI.
-	if !vm.DevicesPhysicallyBacked() && layer.Partition == 0 {
+	if !vm.SiblingStorageEnabled() && !vm.DevicesPhysicallyBacked() && layer.Partition == 0 {
 		// We first try vPMEM and if it is full or the file is too large we
 		// fall back to SCSI.
 		mount, err := vm.AddVPMem(ctx, layer.VHDPath)

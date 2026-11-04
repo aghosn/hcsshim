@@ -99,8 +99,8 @@ func (mm *mountManager) unmount(ctx context.Context, path string) error {
 		}
 	}
 
-	mount.refCount--
-	if mount.refCount > 0 {
+	if mount.refCount > 1 {
+		mount.refCount--
 		return nil
 	}
 

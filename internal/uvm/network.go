@@ -169,6 +169,9 @@ var ErrNoNetworkSetup = errors.New("no network setup present for UVM")
 //
 // `addr` is an optional parameter
 func (uvm *UtilityVM) CreateAndAssignNetworkSetup(ctx context.Context, addr, containerID string) (err error) {
+	if uvm.UsesSiblingNetworking() {
+		return errors.New("cannot replace diode-mediated network setup")
+	}
 	entry := log.G(ctx).WithFields(logrus.Fields{
 		logfields.UVMID:       uvm.ID(),
 		logfields.ContainerID: containerID,
@@ -640,6 +643,9 @@ func getNetworkModifyRequest(adapterID string, requestType guestrequest.RequestT
 
 // addNIC adds a nic to the Utility VM.
 func (uvm *UtilityVM) addNIC(ctx context.Context, id string, endpoint *hcn.HostComputeEndpoint) error {
+	if uvm.UsesSiblingNetworking() {
+		return errors.New("direct RP NIC attachment is forbidden on a sibling workload")
+	}
 	log.G(ctx).WithFields(logrus.Fields{
 		logfields.UVMID: uvm.ID(),
 		"nic-id":        id,

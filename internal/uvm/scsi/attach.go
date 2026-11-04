@@ -46,6 +46,7 @@ type attachment struct {
 	waitErr    error
 	waitCh     chan struct{}
 	refCount   uint
+	removing   bool
 }
 
 type attachConfig struct {
@@ -98,11 +99,19 @@ func (am *attachManager) detach(ctx context.Context, controller, lun uint) (bool
 	}
 
 	att := am.slots[controller][lun]
-	att.refCount--
-	if att.refCount > 0 {
+	if att.refCount > 1 {
+		att.refCount--
 		return false, nil
 	}
+	att.removing = true
 
+	if prepare, ok := am.attacher.(interface {
+		beforeUnplug(context.Context, uint, uint) error
+	}); ok {
+		if err := prepare.beforeUnplug(ctx, controller, lun); err != nil {
+			return false, err
+		}
+	}
 	if err := am.unplugger.unplug(ctx, controller, lun); err != nil {
 		return false, fmt.Errorf("unplug controller %d lun %d: %w", controller, lun, err)
 	}
@@ -134,6 +143,9 @@ func (am *attachManager) trackAttachment(c *attachConfig) (*attachment, bool, er
 					// this attachment.
 				}
 			} else if reflect.DeepEqual(c, attachment.config) {
+				if attachment.removing {
+					return nil, false, fmt.Errorf("attachment at controller %d lun %d is awaiting removal", controller, lun)
+				}
 				attachment.refCount++
 				return attachment, true, nil
 			}

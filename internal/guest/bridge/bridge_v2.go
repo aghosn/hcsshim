@@ -41,6 +41,7 @@ var capabilities = prot.GcsCapabilities{
 		SignalProcessSupported:        true,
 		DumpStacksSupported:           true,
 		DeleteContainerStateSupported: true,
+		SiblingSCSISupported:          true,
 	},
 }
 

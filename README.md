@@ -68,6 +68,55 @@ To trial using the shim out with ctr.exe:
 C:\> ctr.exe run --runtime io.containerd.runhcs.v1 --rm mcr.microsoft.com/windows/nanoserver:2004 windows-test cmd /c "echo Hello World!"
 ```
 
+### Experimental sibling workload/diode sandbox (V1 shim)
+
+An isolated Linux sandbox can explicitly set
+`io.microsoft.virtualmachine.lcow.sibling-pair` to an **absolute host path**
+containing this JSON:
+
+```json
+{
+  "version": 1,
+  "module_directory": "C:\\SiblingRuntime\\modules",
+  "shared_memory_bytes": 16777216,
+  "workload_guest_state_file": "sibling-root.vmgs"
+}
+```
+
+For CRI, include this key in the runtime's `pod_annotations` allowlist so
+containerd forwards it to the sandbox OCI spec. The configuration is host-side
+and is read only when creating the sandbox, not for individual workload tasks.
+
+The module directory must contain matching `sibling_bus.ko`,
+`diode_storvsp.ko`, `diode_netvsp.ko` and `diode_iptables`. The existing boot
+directory must contain the matching sibling-root VMGS and verified rootfs.
+The verified root VHD must contain an updated GCS that understands sibling
+SCSI mount/unplug requests, with matching dm-verity boot images. The runtime
+builder replaces GCS in a copy of the supplied root and preserves its original
+startup; no measured-initramfs bootstrap is used. An older GCS lacking the
+sibling capability fails explicitly.
+Modified HCS/VID and SNP support are
+required. Existing sandbox policy, layer integrity, SNP and dm-verity settings
+remain enforced; the shim does not enable host networking or relax policy.
+
+The sandbox shim creates and owns both VMs and one uniquely named shared
+section in-process. Workload root LUN 0 is bootstrapped on the diode before
+network setup, and stays attached for the entire sandbox lifetime. Later
+image and scratch VHDs attach only to the diode and are hot-exported to the
+running workload. Additional containers use ordinary runhcs task APIs and the
+same workload VM; deleting a workload task does not stop either VM.
+Sandbox shutdown (or a failed diode) closes the workload, diode, uplink and
+shared section, in that order. Existing HCS systems are never imported or borrowed.
+
+Networking registers the discovered stock sibling `hv_netvsc` NIC directly
+with GCS for the sandbox namespace. Only the diode receives an HNS NAT uplink.
+The workload cannot attach an RP NIC or fall back to ordinary HNS setup.
+Dynamic disk removal requires confirmed export absence with a matching token;
+timeouts or ambiguous GCS replies retain the backing rather than detaching a
+possibly live export. LUN 0 cannot be dynamically added or removed.
+
+Without this annotation, the ordinary LCOW and demo paths are unchanged.
+
 ### Containerd Shim V2
 
 The V2 shims are the rewrite of the Windows containerd shim. The V1 shim

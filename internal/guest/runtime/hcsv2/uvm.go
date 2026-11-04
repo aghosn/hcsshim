@@ -997,7 +997,10 @@ func (h *Host) modifyHostSettings(ctx context.Context, containerID string, req *
 		mvd := req.Settings.(*guestresource.LCOWMappedVirtualDisk)
 		// find the actual controller number on the bus and update the incoming request.
 		var cNum uint8
-		cNum, err := scsi.ActualControllerNumber(ctx, mvd.Controller)
+		if mvd.Sibling && mvd.Lun == 0 {
+			return errors.New("sibling root LUN 0 is not a container disk")
+		}
+		cNum, err := scsi.ResolveControllerNumber(ctx, mvd.Controller, mvd.Sibling)
 		if err != nil {
 			return err
 		}
@@ -1419,7 +1422,10 @@ func modifySCSIDevice(
 ) error {
 	switch rt {
 	case guestrequest.RequestTypeRemove:
-		cNum, err := scsi.ActualControllerNumber(ctx, msd.Controller)
+		if msd.Sibling && msd.Lun == 0 {
+			return errors.New("cannot unplug sibling root LUN 0")
+		}
+		cNum, err := scsi.ResolveControllerNumber(ctx, msd.Controller, msd.Sibling)
 		if err != nil {
 			return err
 		}

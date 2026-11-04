@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Microsoft/hcsshim/internal/wclayer"
 )
@@ -29,6 +30,7 @@ var (
 type Manager struct {
 	attachManager *attachManager
 	mountManager  *mountManager
+	grantVMAccess func(context.Context, string, string) error
 }
 
 // Slot represents a single SCSI slot, consisting of a controller and LUN.
@@ -58,7 +60,7 @@ func NewManager(
 	}
 	am := newAttachManager(hb, gb, numControllers, numLUNsPerController, reservedSlots)
 	mm := newMountManager(gb, guestMountFmt)
-	return &Manager{am, mm}, nil
+	return &Manager{attachManager: am, mountManager: mm, grantVMAccess: wclayer.GrantVmAccess}, nil
 }
 
 // MountConfig specifies the options to apply for mounting a SCSI device in
@@ -94,11 +96,13 @@ type MountConfig struct {
 // Mount represents a SCSI device that has been attached to a VM, and potentially
 // also mounted into the guest OS.
 type Mount struct {
-	mgr         *Manager
-	controller  uint
-	lun         uint
-	guestPath   string
-	releaseOnce sync.Once
+	mgr        *Manager
+	controller uint
+	lun        uint
+	guestPath  string
+	releaseMu  sync.Mutex
+	released   bool
+	unmounted  bool
 }
 
 // Controller returns the controller number that the SCSI device is attached to.
@@ -121,12 +125,23 @@ func (m *Mount) GuestPath() string {
 // of the same attachment or mount are used. If the refcount for the guest OS mount
 // reaches 0, the guest OS mount is removed. If the refcount for the SCSI attachment
 // reaches 0, the SCSI attachment is removed.
-func (m *Mount) Release(ctx context.Context) (err error) {
-	err = ErrAlreadyReleased
-	m.releaseOnce.Do(func() {
-		err = m.mgr.remove(ctx, m.controller, m.lun, m.guestPath)
-	})
-	return
+func (m *Mount) Release(ctx context.Context) error {
+	m.releaseMu.Lock()
+	defer m.releaseMu.Unlock()
+	if m.released {
+		return ErrAlreadyReleased
+	}
+	if !m.unmounted && m.guestPath != "" {
+		if err := m.mgr.mountManager.unmount(ctx, m.guestPath); err != nil {
+			return err
+		}
+		m.unmounted = true
+	}
+	if _, err := m.mgr.attachManager.detach(ctx, m.controller, m.lun); err != nil {
+		return err
+	}
+	m.released = true
+	return nil
 }
 
 // AddVirtualDisk attaches and mounts a VHD on the host to the VM. If the same
@@ -150,8 +165,9 @@ func (m *Manager) AddVirtualDisk(
 	if m == nil {
 		return nil, ErrNotInitialized
 	}
-	if vmID != "" {
-		if err := wclayer.GrantVmAccess(ctx, vmID, hostPath); err != nil {
+	_, sibling := m.attachManager.attacher.(*siblingHostBackend)
+	if vmID != "" && !sibling {
+		if err := m.grantVMAccess(ctx, vmID, hostPath); err != nil {
 			return nil, err
 		}
 	}
@@ -281,7 +297,10 @@ func (m *Manager) add(ctx context.Context, attachConfig *attachConfig, guestPath
 	}
 	defer func() {
 		if err != nil {
-			_, _ = m.attachManager.detach(ctx, controller, lun)
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 35*time.Second)
+			defer cancel()
+			_, cleanupErr := m.attachManager.detach(cleanupCtx, controller, lun)
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 

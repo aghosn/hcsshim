@@ -36,8 +36,10 @@ const (
 // The client sends frames: a type byte, a little-endian uint16 length, then
 // the payload. The server sends raw terminal output.
 const (
-	frameInput  = 0 // payload: terminal input
-	frameResize = 1 // payload: uint16 width, uint16 height
+	frameInput      = 0 // payload: terminal input
+	frameResize     = 1 // payload: uint16 width, uint16 height
+	frameHello      = 2 // empty request; response is a JSON container result
+	frameImageHello = 3 // empty request; pull and run official hello-world
 )
 
 // siblingInteractive is set from --sibling-interactive.
@@ -118,6 +120,10 @@ func serveSiblingShells(ctx context.Context, vm *uvm.UtilityVM, role string) err
 func siblingShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn) {
 	defer conn.Close()
 	typ, payload, err := readFrame(conn)
+	if err == nil && (typ == frameHello || typ == frameImageHello) {
+		serveSiblingHello(ctx, vm, name, conn, typ, payload)
+		return
+	}
 	if err != nil || typ != frameResize || len(payload) != 4 {
 		return
 	}

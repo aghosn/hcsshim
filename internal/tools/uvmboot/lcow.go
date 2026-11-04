@@ -27,6 +27,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/memory"
 	"github.com/Microsoft/hcsshim/internal/oci"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
@@ -1458,35 +1459,11 @@ func siblingCommunicationEndpoint(
 	uvmID string,
 	groupID string,
 ) (hcsschema.SiblingCommunicationEndpoint, error) {
-	const (
-		targetSINT        = 3
-		backendEventFlag  = 11
-		workloadEventFlag = 12
-	)
-
-	switch uvmID {
-	case "uvmboot-0":
-		return hcsschema.SiblingCommunicationEndpoint{
-			GroupID:         groupID,
-			Role:            hcsschema.SiblingCommunicationEndpointRoleBackend,
-			TargetVP:        0,
-			TargetSINT:      targetSINT,
-			EventFlagNumber: backendEventFlag,
-		}, nil
-	case "uvmboot-1":
-		return hcsschema.SiblingCommunicationEndpoint{
-			GroupID:         groupID,
-			Role:            hcsschema.SiblingCommunicationEndpointRoleWorkload,
-			TargetVP:        0,
-			TargetSINT:      targetSINT,
-			EventFlagNumber: workloadEventFlag,
-		}, nil
-	default:
-		return hcsschema.SiblingCommunicationEndpoint{}, fmt.Errorf(
-			"cannot assign sibling communication endpoint to UVM %q",
-			uvmID,
-		)
+	role, err := sharedMemoryProofRole(uvmID)
+	if err != nil {
+		return hcsschema.SiblingCommunicationEndpoint{}, err
 	}
+	return sibling.Endpoint(sibling.Role(role), groupID)
 }
 
 // waitForSiblingCommunicationRoute polls until HCS reports the outbound
@@ -1496,42 +1473,14 @@ func waitForSiblingCommunicationRoute(
 	vm *uvm.UtilityVM,
 	endpoint hcsschema.SiblingCommunicationEndpoint,
 ) (hcsschema.SiblingCommunicationRouteInfo, error) {
-	const (
-		timeout  = 30 * time.Second
-		interval = 100 * time.Millisecond
-	)
-
-	deadline := time.Now().Add(timeout)
-	for {
-		routes, err := vm.SiblingCommunicationRoutes(ctx)
-		if err != nil {
-			return hcsschema.SiblingCommunicationRouteInfo{}, err
-		}
-		for _, route := range routes {
-			if strings.EqualFold(route.GroupID, endpoint.GroupID) &&
-				route.OutboundConnectionID != 0 {
-				logrus.WithFields(logrus.Fields{
-					"uvm":                  vm.ID(),
-					"groupId":              route.GroupID,
-					"role":                 route.Role,
-					"outboundConnectionId": fmt.Sprintf("%#x", route.OutboundConnectionID),
-				}).Info("sibling communication route ready")
-				return route, nil
-			}
-		}
-		if time.Now().After(deadline) {
-			return hcsschema.SiblingCommunicationRouteInfo{}, fmt.Errorf(
-				"sibling communication group %s has no outbound connection after %v",
-				endpoint.GroupID,
-				timeout,
-			)
-		}
-		select {
-		case <-ctx.Done():
-			return hcsschema.SiblingCommunicationRouteInfo{}, ctx.Err()
-		case <-time.After(interval):
-		}
+	route, err := sibling.WaitForRoute(ctx, vm, endpoint)
+	if err == nil {
+		logrus.WithFields(logrus.Fields{
+			"uvm": vm.ID(), "groupId": route.GroupID, "role": route.Role,
+			"outboundConnectionId": fmt.Sprintf("%#x", route.OutboundConnectionID),
+		}).Info("sibling communication route ready")
 	}
+	return route, err
 }
 
 func siblingEventModuleArgs(route hcsschema.SiblingCommunicationRouteInfo) string {
@@ -1807,8 +1756,7 @@ func siblingVsockProofCommand(role string) string {
 }
 
 func siblingBusLoadCommand(modulePath string) string {
-	return "if [ ! -d /sys/bus/vmbus/drivers/sibling_bus ]; then insmod " +
-		shellSingleQuote(modulePath) + " || exit 1; fi; "
+	return sibling.BusLoadCommand(modulePath)
 }
 
 func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,

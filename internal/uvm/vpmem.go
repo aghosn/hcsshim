@@ -183,6 +183,9 @@ func (uvm *UtilityVM) removeVPMemDefault(ctx context.Context, hostPath string) e
 }
 
 func (uvm *UtilityVM) AddVPMem(ctx context.Context, hostPath string) (*VPMEMMount, error) {
+	if uvm.siblingStorage {
+		return nil, fmt.Errorf("direct vPMEM attachments are disabled for sibling storage")
+	}
 	if uvm.operatingSystem != "linux" {
 		return nil, errNotSupported
 	}
