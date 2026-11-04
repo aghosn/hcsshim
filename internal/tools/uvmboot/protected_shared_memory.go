@@ -37,6 +37,7 @@ const (
 	protectedTimeoutFlag      = "protected-shared-timeout"
 	protectedCleanupFlag      = "protected-shared-cleanup-timeout"
 	protectedMapProbesFlag    = "protected-shared-map-probes"
+	protectedSealPauseFlag    = "protected-shared-seal-pause"
 	proofCopyAfterExitTimeout = 5 * time.Second
 	// Private VID v2 lifecycle opcodes; trusted HV lifecycle stays v1.
 	psInitialize = 1
@@ -711,9 +712,10 @@ func validatePostSealInstallDenial(outcome uvm.ProtectedSharedModifyOutcome, lea
 }
 
 // hostProbe tests the existing host mapping with fault-reporting Windows APIs.
-// After revocation ONLY named negative probes may attempt access. Both denial
-// statuses and zero byte counts are required on every page. Positive controls
-// seed/check offset 256 in each page; probe output never formats protected data.
+// After revocation ONLY named negative probes may attempt access. Expected denial
+// statuses and zero byte counts are required except for the known Windows write
+// count defect below, which establishes API denial only, not zero bytes written.
+// Positive controls seed/check offset 256; output never formats protected data.
 func (p *realProof) hostProbe(negative bool) error {
 	if p.section == nil || p.section.view == 0 || p.pages == 0 ||
 		p.pages > 4096 || p.section.size != p.pages*4096 ||
@@ -735,15 +737,18 @@ func (p *realProof) hostProbe(negative bool) error {
 		var read, written uintptr
 		readErr := windows.ReadProcessMemory(process, address, &data[0], 8, &read)
 		writeErr := windows.WriteProcessMemory(process, address, &writeData[0], 8, &written)
+		writeCountUnreliable := negative && proofHostWriteCountUnreliable(address, written, writeErr)
 		p.evidence.record("host", map[string]any{"Negative": negative, "PageIndex": page, "Offset": offset,
+			"Address": fmt.Sprintf("%#x", address),
 			"ReadStatus": proofWin32Status(readErr), "ReadBytes": read,
-			"WriteStatus": proofWin32Status(writeErr), "WriteBytes": written})
+			"WriteStatus": proofWin32Status(writeErr), "WriteBytes": written,
+			"WriteBytesUnreliable": writeCountUnreliable})
 		if negative {
 			// Unrelated setup failures cannot stand in for direct CPU denial.
 			denied := func(e error) bool {
 				return errors.Is(e, windows.ERROR_PARTIAL_COPY) || errors.Is(e, windows.ERROR_NOACCESS)
 			}
-			if !denied(readErr) || !denied(writeErr) || read != 0 || written != 0 {
+			if !denied(readErr) || !denied(writeErr) || read != 0 || (written != 0 && !writeCountUnreliable) {
 				return fmt.Errorf("direct host negative probe failed acceptance on page %d", page)
 			}
 			continue
@@ -757,6 +762,14 @@ func (p *realProof) hostProbe(negative bool) error {
 		}
 	}
 	return nil
+}
+
+// proofHostWriteCountUnreliable recognizes the Windows copy-fault workaround for
+// this eight-byte probe: an unknown fault VA (-1) is subtracted from the destination
+// without a runtime bounds check. Accept only ERROR_PARTIAL_COPY with that exact
+// impossible count, preserving raw evidence rather than claiming zero bytes written.
+func proofHostWriteCountUnreliable(address, written uintptr, err error) bool {
+	return errors.Is(err, windows.ERROR_PARTIAL_COPY) && written > 8 && written == ^uintptr(0)-address
 }
 
 // proofWin32Status preserves the raw unsigned Windows error for probe evidence.
@@ -1097,6 +1110,26 @@ func runProtectedSharedCLI(c *cli.Context) error {
 	}
 	if mode != "m1" && mode != "partition-seal" {
 		return fmt.Errorf("unknown protected proof mode %q", mode)
+	}
+	if pausePath := c.String(protectedSealPauseFlag); pausePath != "" {
+		if mode != "partition-seal" || !filepath.IsAbs(pausePath) {
+			return errors.New("seal pause requires partition-seal mode and an absolute fresh pause-file prefix")
+		}
+		info, err := os.Stat(filepath.Dir(pausePath))
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return errors.New("seal pause parent must be an existing directory")
+		}
+		for _, suffix := range []string{".ready", ".resume", ".resume.tmp"} {
+			if _, err := os.Lstat(pausePath + suffix); !os.IsNotExist(err) {
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("seal pause file already exists: %s", pausePath+suffix)
+			}
+		}
 	}
 	// The command defaults to warning-only logs; retain startup progress without
 	// requiring -debug or reducing an explicitly enabled trace level.

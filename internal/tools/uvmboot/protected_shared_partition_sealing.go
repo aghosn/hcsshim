@@ -143,6 +143,8 @@ func (l *partitionSealLifetime) consumeControl(s partitionSealStep, r partitionS
 // This function never reopens a partition seal or emits a completion record.
 // mapProbes adds serialized special-zero admission steps and independent scratch
 // cleanup; false preserves the original exact sequence without scratch steps.
+// An optional PauseBeforeSeal adapter can replace the forward context with its
+// remaining budget after an operator pause; cleanup retains its separate budget.
 func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, pages uint64, cleanupTimeout time.Duration, mapProbes bool) (err error) {
 	if pages == 0 || pages > 4096 || cleanupTimeout <= 0 || cleanupTimeout > 10*time.Minute {
 		return errors.New("invalid partition-seal experiment bounds")
@@ -368,6 +370,16 @@ func executePartitionSealProof(ctx context.Context, runner partitionSealRunner, 
 			}
 		}
 	}
+	if pauser, ok := runner.(interface {
+		PauseBeforeSeal(context.Context) (context.Context, context.CancelFunc, error)
+	}); ok {
+		var cancel context.CancelFunc
+		ctx, cancel, err = pauser.PauseBeforeSeal(ctx)
+		defer cancel()
+		if err != nil {
+			return err
+		}
+	}
 	for _, kind := range []string{"partition-seal", "partition-seal-repeat"} {
 		for _, id := range []string{"a", "b"} {
 			if err = call(partitionSealStep{proofStep: proofStep{Kind: kind, Participant: id}, Lifetime: "primary"}); err != nil {
@@ -432,6 +444,65 @@ type realPartitionSealProof struct {
 	targets       map[string]uint64
 	closedVMs     map[string]bool
 	scratch       map[string]*partitionSealScratch
+}
+
+// PauseBeforeSeal optionally waits for the wrapper's operator gate, after all
+// positive controls and before either VM is sealed. Empty CLI input is a no-op.
+func (p *realPartitionSealProof) PauseBeforeSeal(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return waitPartitionSealResume(ctx, p.primary.cli.String(protectedSealPauseFlag), p.primary.evidence)
+}
+
+// waitPartitionSealResume publishes a fresh ready marker and waits for an
+// atomically published continue/abort file. No guest/native request is in flight.
+// Only this private CLI's forward deadline is suspended; the returned context
+// restores its remaining budget, never a new full budget. The caller cancels it.
+// Markers and waiting/resumed evidence remain in the run's evidence directory.
+func waitPartitionSealResume(ctx context.Context, path string, evidence *proofEvidence) (context.Context, context.CancelFunc, error) {
+	noCancel := func() {}
+	if path == "" {
+		return ctx, noCancel, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return ctx, noCancel, err
+	}
+	deadline, bounded := ctx.Deadline()
+	remaining := time.Until(deadline)
+	if !bounded || remaining <= 0 {
+		return ctx, noCancel, errors.New("seal pause requires a live forward deadline")
+	}
+	evidence.record("seal-pause", map[string]any{
+		"Stage": "waiting", "TimeUTC": time.Now().UTC().Format(time.RFC3339Nano),
+		"RemainingBudget": remaining.String(), "TimeoutSuspended": true,
+	})
+	if err := evidence.failure(); err != nil {
+		return ctx, noCancel, err
+	}
+	ready, err := os.OpenFile(path+".ready", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return ctx, noCancel, err
+	}
+	if err = ready.Close(); err != nil {
+		return ctx, noCancel, err
+	}
+	for {
+		data, err := os.ReadFile(path + ".resume")
+		if err == nil {
+			if string(bytes.TrimSpace(data)) != "continue" {
+				return ctx, noCancel, errors.New("partition seal cancelled at operator pause")
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return ctx, noCancel, err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	resumed, cancel := context.WithTimeout(context.WithoutCancel(ctx), remaining)
+	evidence.record("seal-pause", map[string]any{
+		"Stage": "resumed", "TimeUTC": time.Now().UTC().Format(time.RFC3339Nano),
+		"RemainingBudget": remaining.String(), "TimeoutSuspended": false,
+	})
+	return resumed, cancel, evidence.failure()
 }
 
 // partitionSealScratch retains a validated primary-padding target and diagnostic

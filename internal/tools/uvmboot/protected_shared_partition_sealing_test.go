@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -838,6 +840,125 @@ func partitionStepPosition(steps []partitionSealStep, kind, lifetime, participan
 		}
 	}
 	return -1
+}
+
+// partitionSealPauseFake adds only the optional operator boundary to the
+// existing synthetic coordinator runner; it never pauses real guest execution.
+type partitionSealPauseFake struct {
+	*partitionSealFake
+	pause func(context.Context) (context.Context, context.CancelFunc, error)
+}
+
+// PauseBeforeSeal invokes the test boundary without acquiring native resources.
+func (f *partitionSealPauseFake) PauseBeforeSeal(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	return f.pause(ctx)
+}
+
+// TestProtectedSharedPartitionPauseBoundary requires a single pause after all
+// positive controls/maps, before either seal. Aborting must skip sealing/exchange
+// and still perform the existing independent VM/backing cleanup.
+func TestProtectedSharedPartitionPauseBoundary(t *testing.T) {
+	for _, maps := range []bool{false, true} {
+		for _, abort := range []bool{false, true} {
+			t.Run(fmt.Sprintf("maps=%t/abort=%t", maps, abort), func(t *testing.T) {
+				f := newPartitionSealFake(t)
+				pauseAt, calls := -1, 0
+				stop := errors.New("operator cancelled")
+				runner := &partitionSealPauseFake{partitionSealFake: f}
+				runner.pause = func(ctx context.Context) (context.Context, context.CancelFunc, error) {
+					calls++
+					pauseAt = len(f.steps)
+					if partitionStepPosition(f.steps, "hv-positive", "primary", "b") < 0 ||
+						partitionStepPosition(f.steps, "partition-seal", "", "") >= 0 {
+						t.Error("pause is not between positive controls and partition sealing")
+					}
+					if maps && (f.steps[pauseAt-1].Kind != "hv-unmap" ||
+						f.steps[pauseAt-1].Participant != "b" || f.steps[pauseAt-1].MappingPhase != "pre-seal") {
+						t.Error("pre-seal map controls did not finish before pausing")
+					}
+					if abort {
+						return ctx, func() {}, stop
+					}
+					return ctx, func() {}, nil
+				}
+				err := executePartitionSealProof(context.Background(), runner, 5, time.Minute, maps)
+				sealAt := partitionStepPosition(f.steps, "partition-seal", "", "")
+				if calls != 1 || errors.Is(err, stop) != abort || (!abort && err != nil) ||
+					(abort && sealAt != -1) || (!abort && sealAt != pauseAt) {
+					t.Fatalf("calls=%d pause=%d seal=%d error=%v", calls, pauseAt, sealAt, err)
+				}
+				if f.cleanupContextInvalid || partitionStepPosition(f.steps, "terminate", "", "b") < 0 ||
+					partitionStepPosition(f.steps, "release", "primary", "") < 0 ||
+					(abort && partitionStepPosition(f.steps, "exchange", "", "") >= 0) {
+					t.Fatal("pause changed cleanup or allowed exchange after abort")
+				}
+			})
+		}
+	}
+}
+
+// TestProtectedSharedPartitionPauseBudget lets the original deadline expire
+// while the operator gate is waiting. Continue must return a live bounded
+// context; abort must fail instead of allowing the caller to submit seals.
+func TestProtectedSharedPartitionPauseBudget(t *testing.T) {
+	for _, decision := range []string{"continue", "abort"} {
+		t.Run(decision, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "seal")
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			type result struct {
+				ctx    context.Context
+				cancel context.CancelFunc
+				err    error
+			}
+			done := make(chan result, 1)
+			go func() {
+				resumed, stop, err := waitPartitionSealResume(ctx, path, &proofEvidence{writer: &bytes.Buffer{}})
+				done <- result{resumed, stop, err}
+			}()
+			// A deferred abort also releases the waiter on an assertion failure.
+			defer func() {
+				_ = os.WriteFile(path+".resume.tmp", []byte("abort"), 0600)
+				_ = os.Rename(path+".resume.tmp", path+".resume")
+			}()
+			until := time.Now().Add(5 * time.Second)
+			for {
+				if _, err := os.Stat(path + ".ready"); err == nil {
+					break
+				} else if !os.IsNotExist(err) || time.Now().After(until) {
+					t.Fatalf("ready marker missing: %v", err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			<-ctx.Done()
+			select {
+			case r := <-done:
+				r.cancel()
+				t.Fatalf("gate returned before an operator decision: %v", r.err)
+			default:
+			}
+			if err := os.WriteFile(path+".resume.tmp", []byte(decision), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(path+".resume.tmp", path+".resume"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case r := <-done:
+				defer r.cancel()
+				if decision == "abort" {
+					if r.err == nil {
+						t.Fatal("abort accepted as continuation")
+					}
+				} else if deadline, bounded := r.ctx.Deadline(); r.err != nil || r.ctx.Err() != nil ||
+					!bounded || time.Until(deadline) <= 0 || time.Until(deadline) > time.Second {
+					t.Fatalf("forward budget did not resume: %v, %v", r.err, r.ctx.Err())
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("gate did not consume the operator decision")
+			}
+		})
+	}
 }
 
 // TestProtectedSharedPartitionOrder records a five-page 4+1 run. Both installed

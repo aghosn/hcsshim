@@ -68,6 +68,10 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  protectedSealPauseFlag,
+			Usage: "Lab-only partition-seal pause-file prefix; publish .ready before the first partition seal and wait for .resume containing continue. Pause time is excluded from the forward budget.",
+		},
 		cli.BoolFlag{
 			Name: protectedMapProbesFlag,
 			Usage: "Lab-only special zero-map admission probes for plain partition-seal VMs; requires installed matched hvtest.sys " +
@@ -236,6 +240,9 @@ var lcowCommand = cli.Command{
 	// Enabled map probes are validated even without a proof mode, before any
 	// ordinary VM acquisition. Disabled inputs keep their existing handling.
 	Action: func(c *cli.Context) error {
+		if c.String(protectedSealPauseFlag) != "" && c.String(protectedModeFlag) != "partition-seal" {
+			return fmt.Errorf("seal pause requires protected-shared-proof partition-seal")
+		}
 		if err := validateProtectedSharedMapOptions(c.Bool(protectedMapProbesFlag), c.String(protectedModeFlag),
 			c.Bool(securityHardwareFlag), c.Uint64(sharedMemorySizeArgName)); err != nil {
 			return err
