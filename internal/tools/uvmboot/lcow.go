@@ -1375,6 +1375,12 @@ func runLCOW(
 				}
 				// Interactive demo helpers, staged on both roles (the diode runs
 				// capture/filter/smooth, the workload runs the covert client).
+				if role == diodeRole {
+					controllerPath := filepath.Join(filepath.Dir(busModulePath), "diode-controller")
+					if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
+						return fmt.Errorf("share diode-controller: %w", err)
+					}
+				}
 				for shareName, guestDir := range map[string]string{
 					"demo.sh":       "/run/diode-demo",
 					"covert_udp":    "/run/diode-covert",
@@ -1630,10 +1636,11 @@ func siblingNetModuleName(role string) string {
 // before the relay-check window. $dtb is the binary to run; iperfStage adds
 // $ipf and ipbench.
 const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run/dtb-exec && ` +
-	`mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec 2>/dev/null && ` +
+	`mount -t tmpfs -o exec,size=32m tmpfs /run/dtb-exec 2>/dev/null && ` +
 	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; ` +
 	`for m in demo.sh:demo.sh:/run/diode-demo covert:covert_udp:/run/diode-covert ` +
-	`tcpdump:diode_tcpdump:/run/diode-tcpdump tc:diode_tc:/run/diode-tc; do ` +
+	`tcpdump:diode_tcpdump:/run/diode-tcpdump tc:diode_tc:/run/diode-tc ` +
+	`diode-controller:diode-controller:/run/diode-controller; do ` +
 	`d=${m%%:*}; r=${m#*:}; s=${r#*:}/${r%%:*}; ` +
 	`if [ -f "$s" ]; then cp "$s" /run/dtb-exec/$d && chmod 755 /run/dtb-exec/$d; fi; done; ` +
 	iperfStage

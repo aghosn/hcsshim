@@ -150,7 +150,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
-	for _, module := range []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables"} {
+	for _, module := range []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "demo.sh", "diode-controller"} {
 		info, err := os.Stat(filepath.Join(config.ModuleDirectory, module))
 		if err != nil {
 			return nil, fmt.Errorf("sibling pair input %s is unavailable: %w", module, err)
@@ -215,7 +215,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		}
 		// Root0 remains attached until both guests are stopped; never release it
 		// under a live provider, even on a failed or canceled bootstrap.
-		for _, name := range []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables"} {
+		for _, name := range []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "demo.sh", "diode-controller"} {
 			if err := pair.Diode.Share(bootCtx, filepath.Join(config.ModuleDirectory, name), "/run/sibling/"+name, true); err != nil {
 				return err
 			}
@@ -319,6 +319,8 @@ func diodeNetworkCommand(uplink *Uplink) string {
 		"ip route replace default via " + Quote(uplink.Gateway) + ` dev "$up"; ` +
 		`mkdir -p /run/sibling-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/sibling-exec; ` +
 		`cp /run/sibling/diode_iptables/diode_iptables /run/sibling-exec/ipt; chmod 755 /run/sibling-exec/ipt; ` +
+		`for tool in demo.sh diode-controller; do ` +
+		`cp /run/sibling/$tool/$tool /run/sibling-exec/$tool && chmod 755 /run/sibling-exec/$tool || exit 1; done; ` +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`/run/sibling-exec/ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE`
 }
