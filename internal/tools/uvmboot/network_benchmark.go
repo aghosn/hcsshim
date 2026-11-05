@@ -21,13 +21,21 @@ import (
 )
 
 const (
-	networkBenchmarkScriptArgName  = "network-benchmark-script"
-	networkBenchmarkServerArgName  = "network-benchmark-server"
-	networkBenchmarkPortArgName    = "network-benchmark-port"
-	networkBenchmarkTimeoutArgName = "network-benchmark-timeout"
-	networkBenchmarkNoSMTArgName   = "network-benchmark-no-smt"
-	networkBenchmarkIdleArgName    = "network-benchmark-idle"
+	networkBenchmarkScriptArgName   = "network-benchmark-script"
+	networkBenchmarkServerArgName   = "network-benchmark-server"
+	networkBenchmarkPortArgName     = "network-benchmark-port"
+	networkBenchmarkTimeoutArgName  = "network-benchmark-timeout"
+	networkBenchmarkNoSMTArgName    = "network-benchmark-no-smt"
+	networkBenchmarkIdleArgName     = "network-benchmark-idle"
+	networkBenchmarkSingleVPArgName = "network-benchmark-single-vp"
 )
+
+func networkBenchmarkProcessors(c *cli.Context) uint64 {
+	if c.Bool(networkBenchmarkSingleVPArgName) {
+		return 1
+	}
+	return 2
+}
 
 func validateNetworkBenchmarkServer(server string, addresses []net.Addr) (bool, error) {
 	ip, err := netip.ParseAddr(server)
@@ -54,7 +62,7 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
 			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
-			c.IsSet(networkBenchmarkIdleArgName) {
+			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkSingleVPArgName) {
 			return errors.New("network benchmark server, port and timeout require --network-benchmark-script")
 		}
 		return nil
@@ -79,14 +87,22 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.Duration(networkBenchmarkTimeoutArgName) <= 0 {
 		return errors.New("network benchmark timeout must be positive")
 	}
-	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != 2 ||
+	processors := networkBenchmarkProcessors(c)
+	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != processors ||
 		c.GlobalInt(countArgName) != c.GlobalInt(parallelArgName) ||
 		len(groups) != c.GlobalInt(countArgName) {
-		return errors.New("network benchmark requires SNP, GCS, --cpus 2 and one explicit affinity pair per concurrently launched VM")
+		return fmt.Errorf("network benchmark requires SNP, GCS, --cpus %d and one explicit affinity pair per concurrently launched VM", processors)
 	}
 	baseline := c.IsSet(baselineNICArgName) && c.GlobalInt(countArgName) == 1
 	sibling := c.IsSet(siblingBusGuestModuleArgName) && c.Bool(sharedMemoryTwoUVMArgName) &&
 		c.Bool(siblingDiodeUplinkArgName) && c.GlobalInt(countArgName) == 2
+	unikraft := c.String(unikraftPackageArgName) != ""
+	if c.Bool(networkBenchmarkSingleVPArgName) && !baseline && !unikraft {
+		return errors.New("single-VP network benchmarks support only the Unikraft pair or its standalone reference; Linux pair experiments are unchanged")
+	}
+	if unikraft && !c.Bool(networkBenchmarkSingleVPArgName) {
+		return errors.New("Unikraft network benchmarks require --network-benchmark-single-vp")
+	}
 	if (!baseline && !sibling) || c.IsSet(baselinePairArgName) ||
 		c.String(siblingOpenShellBundleArgName) != "" || siblingInteractive || debug ||
 		c.IsSet(execCommandLineArgName) || c.IsSet(execFileArgName) {
@@ -112,6 +128,10 @@ func shareNetworkBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityV
 }
 
 func networkBenchmarkPreflight(role, server string, noSMT bool, idlePolicy string) string {
+	return networkBenchmarkVPPreflight(role, server, noSMT, idlePolicy, false)
+}
+
+func networkBenchmarkVPPreflight(role, server string, noSMT bool, idlePolicy string, singleVP bool) string {
 	topologyCheck := `for c in 0 1; do s=$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list); ` +
 		`case "$s" in 0-1|0,1) :;; *) echo "network_benchmark: FAIL guest virtual SMT pair missing: cpu$c=$s" >&2; exit 1;; esac; done; `
 	topologyEvidence := "threads_per_core=2"
@@ -120,18 +140,25 @@ func networkBenchmarkPreflight(role, server string, noSMT bool, idlePolicy strin
 			`echo "network_benchmark: guest_topology cpu$c thread_siblings=$s"; done; `
 		topologyEvidence = "host_smt=disabled guest_topology=recorded"
 	}
+	online, expected, processors := "0-1", "two", "2"
+	if singleVP {
+		online, expected, processors = "0", "one", "1"
+		topologyCheck = `s=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list); ` +
+			`echo "network_benchmark: guest_topology cpu0 thread_siblings=$s"; `
+		topologyEvidence = "single_vp=true guest_topology=recorded"
+	}
 	return `set -eu; ` +
 		`dmesg | grep -F 'Memory Encryption Features active:' | grep -qw 'SEV-SNP' || ` +
 		`{ echo 'network_benchmark: FAIL SNP boot evidence missing' >&2; exit 1; }; ` +
-		`[ "$(cat /sys/devices/system/cpu/online)" = '0-1' ] || ` +
-		`{ echo 'network_benchmark: FAIL expected exactly two online VPs' >&2; exit 1; }; ` +
+		`[ "$(cat /sys/devices/system/cpu/online)" = '` + online + `' ] || ` +
+		`{ echo 'network_benchmark: FAIL expected exactly ` + expected + ` online VPs' >&2; exit 1; }; ` +
 		topologyCheck +
 		`idle=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^idle=/) print $i}' /proc/cmdline); ` +
 		`[ "$idle" = 'idle=` + idlePolicy + `' ] || ` +
 		`{ echo "network_benchmark: FAIL expected idle=` + idlePolicy + `, got: $idle" >&2; exit 1; }; ` +
 		`[ -x "$ipf" ] && "$ipf" --version 2>&1 | grep -F 'iperf version 2.2.1' || ` +
 		`{ echo 'network_benchmark: FAIL matching iperf2 not staged' >&2; exit 1; }; ` +
-		`echo 'network_benchmark: preflight role=` + role + ` idle=` + idlePolicy + ` snp=boot-evidence attestation=not-collected vcpus=2 ` + topologyEvidence + `'; ` +
+		`echo 'network_benchmark: preflight role=` + role + ` idle=` + idlePolicy + ` snp=boot-evidence attestation=not-collected vcpus=` + processors + ` ` + topologyEvidence + `'; ` +
 		`uname -a; cat /proc/cmdline; cat /proc/cpuinfo; ip addr show; ip route; ` +
 		`ip route get ` + server + `; `
 }
@@ -148,7 +175,7 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 			`{ echo 'network_benchmark: FAIL baseline is not synthetic hv_netvsc' >&2; exit 1; }; `
 	}
 	script := "/run/network-benchmark/" + filepath.Base(c.String(networkBenchmarkScriptArgName))
-	return networkBenchmarkPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName)) + deviceCheck +
+	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		`cp ` + shellSingleQuote(script) + ` /run/dtb-exec/network-benchmark.sh; ` +

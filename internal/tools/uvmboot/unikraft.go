@@ -163,7 +163,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 		defer connection.Close()
 		stopRead := context.AfterFunc(consoleCtx, func() { _ = connection.Close() })
 		defer stopRead()
-		consoleDone <- captureUnikraftConsole(connection, io.MultiWriter(log, os.Stdout), ready)
+		consoleDone <- captureUnikraftConsole(connection, io.MultiWriter(log, os.Stdout), ready, cfg.idle)
 	}()
 	defer func() {
 		cancelConsole()
@@ -188,6 +188,13 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	if err := vm.Start(ctx); err != nil {
 		return err
 	}
+	if c.String(networkBenchmarkScriptArgName) != "" {
+		if vm.ProcessorCount() != 1 {
+			return fmt.Errorf("Unikraft network benchmark expected one VP, HCS assigned %d", vm.ProcessorCount())
+		}
+		stopSampling := sampleNetworkBenchmarkCPU(context.Background(), vm)
+		defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
+	}
 	for _, report := range reports {
 		data, err := json.Marshal(report)
 		if err != nil {
@@ -211,6 +218,9 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 			return fmt.Errorf("write Unikraft boot timing: %w", err)
 		}
 		fmt.Println("Unikraft diode: direct SNP/provider startup observed; dataplane tests run in the workload")
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			fmt.Printf("network_benchmark: preflight role=diode implementation=unikraft snp=boot-evidence attestation=not-collected vcpus=1 scheduler=cooperative idle=not-linux worker_idle=%s\n", cfg.idle)
+		}
 	case <-ctx.Done():
 		return fmt.Errorf("unikraft stopped before SNP/provider startup was observed: %w", ctx.Err())
 	case <-timer.C:
@@ -235,10 +245,11 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	}
 }
 
-func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time) error {
+func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time, expectedIdle string) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 65536)
 	snp, offers, provider, reported := false, false, false, false
+	idleVerified := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		if _, err := fmt.Fprintln(output, line); err != nil {
@@ -246,6 +257,13 @@ func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- tim
 		}
 		snp = snp || strings.Contains(line, "hyperv: isolation type 2 (SNP), paravisor absent")
 		offers = offers || strings.Contains(line, "vmbus: all offers delivered")
+		if _, value, ok := strings.Cut(line, "vmbus: idle="); ok {
+			fields := strings.Fields(value)
+			if len(fields) == 0 || fields[0] != expectedIdle {
+				return fmt.Errorf("unikraft idle policy mismatch: expected=%s reported=%q", expectedIdle, value)
+			}
+			idleVerified = true
+		}
 		if _, version, ok := strings.Cut(line, "sibling: provider ready protocol="); ok {
 			fields := strings.Fields(version)
 			if len(fields) == 0 {
@@ -257,7 +275,7 @@ func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- tim
 			}
 			provider = true
 		}
-		if snp && offers && provider && !reported {
+		if snp && offers && provider && idleVerified && !reported {
 			ready <- time.Now()
 			reported = true
 		}

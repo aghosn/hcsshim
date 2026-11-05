@@ -33,6 +33,7 @@ type unikraftLUN struct {
 }
 
 type unikraftConfig struct {
+	idle       string
 	memoryMB   uint64
 	controller string
 	luns       []unikraftLUN
@@ -91,6 +92,13 @@ func parseUnikraftManifest(reader io.Reader) (*unikraftConfig, error) {
 		value := params[key]
 		delete(params, key)
 		return value
+	}
+	cfg.idle = take("idle")
+	if cfg.idle == "" {
+		cfg.idle = "halt"
+	}
+	if cfg.idle != "halt" && cfg.idle != "poll" {
+		return nil, errors.New("unikraft idle policy must be halt or poll")
 	}
 	controller, luns := take("storage_controller"), take("storage_luns")
 	if controller != "" || luns != "" {
@@ -187,12 +195,13 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	}
 	for _, flag := range []string{sharedMemoryGuestModuleArgName, sharedMemoryMappingOnlyArgName,
 		sharedMemoryGuestInventoryArgName, siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName,
-		networkBenchmarkScriptArgName, storageBenchmarkScriptArgName, scsiMountsArgName, vpmemMountsArgName} {
+		storageBenchmarkScriptArgName, scsiMountsArgName, vpmemMountsArgName} {
 		if c.IsSet(flag) {
 			return nil, fmt.Errorf("unikraft diode does not support --%s", flag)
 		}
 	}
-	if !c.Bool(siblingInteractiveArgName) && !c.IsSet(execCommandLineArgName) && !c.IsSet(execFileArgName) {
+	if !c.Bool(siblingInteractiveArgName) && !c.IsSet(execCommandLineArgName) && !c.IsSet(execFileArgName) &&
+		c.String(networkBenchmarkScriptArgName) == "" {
 		return nil, errors.New("unikraft pair requires --sibling-interactive or an explicit workload --exec/--exec-file test")
 	}
 	file, err := os.Open(filepath.Join(directory, "launch-manifest.json"))
@@ -219,6 +228,12 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	}
 	if c.Bool(siblingDiodeUplinkArgName) != (cfg.network != nil) {
 		return nil, errors.New("--sibling-diode-uplink must match networking in the Unikraft manifest")
+	}
+	if c.String(networkBenchmarkScriptArgName) != "" && (cfg.network == nil || !c.Bool(networkBenchmarkSingleVPArgName)) {
+		return nil, errors.New("Unikraft network benchmark requires networking and --network-benchmark-single-vp")
+	}
+	if c.String(networkBenchmarkScriptArgName) != "" && cfg.idle != c.String(networkBenchmarkIdleArgName) {
+		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark idle=%s", cfg.idle, c.String(networkBenchmarkIdleArgName))
 	}
 	if _, _, err := cfg.storageDevices(plan); err != nil {
 		return nil, err

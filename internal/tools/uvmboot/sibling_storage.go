@@ -76,8 +76,11 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 		return nil, fmt.Errorf("load sibling storage backend plan %q: %w", path, err)
 	}
 	if c.Bool(siblingStorageRootArgName) {
+		unikraftBenchmark := c.String(unikraftPackageArgName) != "" &&
+			c.String(networkBenchmarkScriptArgName) != "" && c.Bool(networkBenchmarkSingleVPArgName)
 		if !c.Bool(securityHardwareFlag) || c.IsSet(noVerityBoot) ||
-			!c.Bool(siblingInteractiveArgName) || c.String(networkBenchmarkScriptArgName) != "" ||
+			(!c.Bool(siblingInteractiveArgName) && !unikraftBenchmark) ||
+			(c.String(networkBenchmarkScriptArgName) != "" && !unikraftBenchmark) ||
 			c.String(siblingOpenShellBundleArgName) != "" {
 			return nil, errors.New("sibling root requires an interactive SNP dm-verity pair without benchmarks or OpenShell")
 		}

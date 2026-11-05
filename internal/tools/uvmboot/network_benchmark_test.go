@@ -138,6 +138,62 @@ func TestNetworkBenchmarkValidationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNetworkBenchmarkSingleVPIsScopedToUnikraftCampaign(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "bench.sh")
+	if err := os.WriteFile(script, []byte("exit 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldGCS, oldInteractive, oldDebug := useGCS, siblingInteractive, debug
+	useGCS, siblingInteractive, debug = true, false, false
+	t.Cleanup(func() { useGCS, siblingInteractive, debug = oldGCS, oldInteractive, oldDebug })
+	base := []string{"--network-benchmark-script", script,
+		"--network-benchmark-server", "192.0.2.10", "--security-hardware",
+		"--network-benchmark-single-vp"}
+	for _, tc := range []struct {
+		name      string
+		flags     []string
+		count     string
+		wantError bool
+	}{
+		{"Unikraft pair", []string{"--unikraft-diode-package", "bundle", "--sibling-bus-guest-module", "bus.ko",
+			"--shared-memory-two-uvm-proof", "--sibling-diode-uplink"}, "2", false},
+		{"standalone reference", []string{"--baseline-nic-tcpbulk", "tool"}, "1", false},
+		{"Linux pair unchanged", []string{"--sibling-bus-guest-module", "bus.ko",
+			"--shared-memory-two-uvm-proof", "--sibling-diode-uplink"}, "2", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := benchmarkTestContext(t, append(append([]string{}, base...), tc.flags...)...)
+			for key, value := range map[string]string{cpusArgName: "1", countArgName: tc.count, parallelArgName: tc.count} {
+				if err := c.GlobalSet(key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			groups := [][]uint32{{8, 24}}
+			if tc.count == "2" {
+				groups = append(groups, []uint32{9, 25})
+			}
+			if err := validateNetworkBenchmark(c, groups); (err != nil) != tc.wantError {
+				t.Fatalf("validation=%v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+	c := benchmarkTestContext(t, "--network-benchmark-single-vp")
+	if err := validateNetworkBenchmark(c, nil); err == nil {
+		t.Fatal("accepted flag without benchmark")
+	}
+	for _, single := range []bool{false, true} {
+		command := networkBenchmarkVPPreflight("workload", "192.0.2.10", false, "poll", single)
+		want := "vcpus=2"
+		if single {
+			want = "vcpus=1"
+		}
+		if !strings.Contains(command, want) || !strings.Contains(command, "SEV-SNP") ||
+			strings.Contains(command, "guest virtual SMT pair missing") == single {
+			t.Fatalf("wrong VP/SNP/SMT requirements: %s", command)
+		}
+	}
+}
+
 func TestNetworkBenchmarkHostGateway(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

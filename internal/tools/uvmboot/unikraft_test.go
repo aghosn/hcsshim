@@ -75,6 +75,23 @@ func TestUnikraftManifestAndStorageAssignments(t *testing.T) {
 	}
 }
 
+func TestUnikraftIdleManifest(t *testing.T) {
+	for _, mode := range []string{"halt", "poll"} {
+		cfg, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(
+			unikraftTestParams() + " libukbus_vmbus.idle=" + mode + " --")))
+		if err != nil || cfg.idle != mode {
+			t.Fatalf("idle mode %s: cfg=%+v err=%v", mode, cfg, err)
+		}
+	}
+	for _, mode := range []string{"spin", "0", "HALT"} {
+		_, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(
+			unikraftTestParams() + " libukbus_vmbus.idle=" + mode + " --")))
+		if err == nil {
+			t.Fatalf("accepted invalid idle mode %q", mode)
+		}
+	}
+}
+
 func TestUnikraftManifestRejectsUnusableBootConfiguration(t *testing.T) {
 	base := unikraftTestParams()
 	for name, command := range map[string]string{
@@ -149,6 +166,7 @@ func TestUnikraftIndependentServicesAndWorkloadBootstrap(t *testing.T) {
 
 func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 	lines := []string{
+		"vmbus: idle=halt scheduler=cooperative",
 		"hyperv: isolation type 2 (SNP), paravisor absent",
 		"vmbus: all offers delivered, 2 channel(s)",
 		"sibling: provider ready protocol=4; waiting for Linux workload",
@@ -163,7 +181,7 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 		ready := make(chan time.Time, 1)
 		var log bytes.Buffer
 		before := time.Now()
-		err := captureUnikraftConsole(strings.NewReader(strings.Join(input, "\n")), &log, ready)
+		err := captureUnikraftConsole(strings.NewReader(strings.Join(input, "\n")), &log, ready, "halt")
 		if !errors.Is(err, io.EOF) {
 			t.Fatal(err)
 		}
@@ -184,7 +202,7 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 	for _, version := range []string{"2", "3", "40", ""} {
 		input := strings.Replace(strings.Join(lines, "\n"), "protocol=4", "protocol="+version, 1)
 		ready := make(chan time.Time, 1)
-		err := captureUnikraftConsole(strings.NewReader(input), io.Discard, ready)
+		err := captureUnikraftConsole(strings.NewReader(input), io.Discard, ready, "halt")
 		if err == nil || errors.Is(err, io.EOF) {
 			t.Fatalf("accepted incompatible provider version %q: %v", version, err)
 		}
@@ -194,15 +212,27 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 		default:
 		}
 	}
+	input := strings.Replace(strings.Join(lines, "\n"), "idle=halt", "idle=poll", 1)
+	if err := captureUnikraftConsole(strings.NewReader(input), io.Discard, make(chan time.Time, 1), "halt"); err == nil || errors.Is(err, io.EOF) {
+		t.Fatal("accepted firmware reporting a different idle policy")
+	}
+	pollReady := make(chan time.Time, 1)
+	if err := captureUnikraftConsole(strings.NewReader(input), io.Discard, pollReady, "poll"); !errors.Is(err, io.EOF) {
+		t.Fatalf("rejected matching poll firmware: %v", err)
+	}
+	if len(pollReady) != 1 {
+		t.Fatal("matching poll firmware did not satisfy startup readiness")
+	}
 }
 
 func TestUnikraftConsoleTimestampsReadinessOnlyOnce(t *testing.T) {
-	input := "hyperv: isolation type 2 (SNP), paravisor absent\n" +
+	input := "vmbus: idle=halt scheduler=cooperative\n" +
+		"hyperv: isolation type 2 (SNP), paravisor absent\n" +
 		"vmbus: all offers delivered\n" +
 		"sibling: provider ready protocol=4; waiting for Linux workload\n"
 	ready := make(chan time.Time, 1)
 	var output bytes.Buffer
-	err := captureUnikraftConsole(strings.NewReader(input+input), &output, ready)
+	err := captureUnikraftConsole(strings.NewReader(input+input), &output, ready, "halt")
 	if !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
@@ -326,9 +356,10 @@ func TestUnikraftPairPreflight(t *testing.T) {
 		}
 	}
 	for name, contents := range map[string]string{
-		"launch-manifest.json": unikraftTestManifest(strings.Join(network, " ")),
+		"launch-manifest.json": unikraftTestManifest(strings.Join(network, " ") + " libukbus_vmbus.idle=poll"),
 		"guest.vmgs":           "fixture",
 		"sibling_bus.ko":       "fixture",
+		"bench.sh":             "exit 0\n",
 	} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0600); err != nil {
 			t.Fatal(err)
@@ -364,5 +395,26 @@ func TestUnikraftPairPreflight(t *testing.T) {
 			(err != nil && !strings.Contains(err.Error(), test.error)) {
 			t.Fatalf("preflight error = %v, cpus = %s, extra = %v", err, test.cpus, test.extra)
 		}
+	}
+	benchmarkArgs := append(append([]string{}, args[:len(args)-2]...),
+		"--network-benchmark-script", filepath.Join(directory, "bench.sh"),
+		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-single-vp")
+	c := benchmarkTestContext(t, benchmarkArgs...)
+	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+		if err := c.GlobalSet(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := loadUnikraftConfig(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateNetworkBenchmark(c, [][]uint32{{8, 24}, {9, 25}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(networkBenchmarkIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, nil); err == nil || !strings.Contains(err.Error(), "does not match benchmark") {
+		t.Fatalf("mismatched benchmark firmware was accepted: %v", err)
 	}
 }

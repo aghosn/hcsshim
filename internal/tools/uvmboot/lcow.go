@@ -305,6 +305,10 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkNoSMTArgName,
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
+		cli.BoolFlag{
+			Name:  networkBenchmarkSingleVPArgName,
+			Usage: "Use one VP for the Unikraft network pair or its standalone reference (Linux pair default remains two)",
+		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
 			Value: "poll",
@@ -1133,8 +1137,8 @@ func runLCOW(
 	}
 	var stopSampling func() error
 	if c.String(networkBenchmarkScriptArgName) != "" {
-		if vm.ProcessorCount() != 2 {
-			return fmt.Errorf("network benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != networkBenchmarkProcessors(c) {
+			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", networkBenchmarkProcessors(c), vm.ProcessorCount())
 		}
 		stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
 		defer func() {
@@ -1252,6 +1256,15 @@ func runLCOW(
 			if err := vm.Share(ctx, tool, "/run/diode-storage-test", true); err != nil {
 				return err
 			}
+		}
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			iperfPath := filepath.Join(filepath.Dir(module), iperfGuestName)
+			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
+				return fmt.Errorf("share %s: %w", iperfGuestName, err)
+			}
+			execCommand = iperfStage + "set -eu; " +
+				`ping -c 3 -W 3 ` + unikraft.network.provider.String() + `; ` +
+				networkBenchmarkClient(c, "workload")
 		}
 		execCommand, err = unikraftWorkloadCommand("/run/sibling-bus-module/"+filepath.Base(module),
 			unikraft, storagePlan, execCommand)
