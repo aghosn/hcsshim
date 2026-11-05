@@ -54,9 +54,9 @@ type protectedSiblingService struct {
 
 // protectedSiblingPair is the sole serial owner of the two attempts, backing,
 // boot copies and host network releases. Only cancellation/watchers and GCS
-// commands run concurrently; they never mutate lifecycle progress. cleanup has
-// its own independent budget. S6 adds optional masks/pause at the post-admission
-// boundary; no partition seal is issued here.
+// commands run concurrently; they never mutate lifecycle progress. forwardMu
+// serializes cancellation with seal-attempt commitment, not native execution.
+// cleanup has its own independent budget and joins shell/command borrowers.
 type protectedSiblingPair struct {
 	memory      *protectedSiblingMemory
 	workers     []*protectedSiblingVM
@@ -69,6 +69,121 @@ type protectedSiblingPair struct {
 	watchers    sync.WaitGroup
 	services    []*protectedSiblingService
 	shells      *protectedSiblingShellServer
+	parent      context.Context
+	forwardMu   sync.Mutex
+	run         string
+	seals       [2]protectedPartitionSeal
+}
+
+// protectedPartitionSeal is serial-owner evidence, not native partition state.
+// selected distinguishes omission from zero. Times are UTC wall-clock strings
+// for HV-event correlation; dispatched is learned only from S4's actual outcome.
+// A committed attempt can be canceled before submission, and any dispatched
+// error leaves effects uncertain. No retry, rollback or pair atomicity exists.
+type protectedPartitionSeal struct {
+	role       string
+	vmID       string
+	selected   bool
+	mask       uint64
+	state      string
+	attemptAt  string
+	finishedAt string
+	dispatched bool
+	err        error
+}
+
+// validateProtectedPartitionCLI rejects protected-only flags on ordinary runs
+// and invalid pause combinations before any resource acquisition. cli.Uint64Flag
+// parsing owns malformed/overflow rejection; IsSet independently owns selection,
+// so explicit zero and all future bits remain intact. Marker preflight uses
+// Lstat, including dangling links, but does not claim either path yet.
+func validateProtectedPartitionCLI(c *cli.Context) error {
+	selected := c.IsSet(diodePartitionSealMaskArgName) || c.IsSet(workloadPartitionSealMaskArgName)
+	pause := c.IsSet(partitionSealPausePrefixArgName)
+	if !c.Bool(protectedSharedMemoryArgName) && (selected || pause) {
+		return errors.New("partition seal masks/pause require --protected-shared-memory")
+	}
+	if pause {
+		if !selected || c.String(partitionSealPausePrefixArgName) == "" {
+			return errors.New("--partition-seal-pause-prefix requires a nonempty prefix and at least one selected partition mask")
+		}
+		return preflightProtectedSiblingPause(c.String(partitionSealPausePrefixArgName))
+	}
+	return nil
+}
+
+// stop completes a sticky forward-cancellation transition under the dispatch
+// gate. Once it returns, no later attempt can commit. An already committed
+// synchronous native operation remains owned until return and may have effects;
+// this lock is never held across native/GCS work, close, or watcher joins.
+func (p *protectedSiblingPair) stop(cause error) {
+	p.forwardMu.Lock()
+	p.cancel(cause)
+	p.forwardMu.Unlock()
+}
+
+// reportSeal emits an observation with exact decimal/hex mask and run/VM role
+// identity, plus attempted/completed UTC times. Omitted masks are not meaningful.
+// The serial pair owner alone reads/writes evidence; output is not HV inventory.
+func (p *protectedSiblingPair) reportSeal(s *protectedPartitionSeal) {
+	fmt.Printf("protected partition seal: run=%s role=%s vm=%s selected=%t mask=%d mask_hex=%#016x state=%s dispatched=%t attempt_at=%q finished_at=%q observed_at=%s error=%q\n",
+		p.run, s.role, s.vmID, s.selected, s.mask, s.mask, s.state, s.dispatched,
+		s.attemptAt, s.finishedAt, time.Now().UTC().Format(time.RFC3339Nano), fmt.Sprint(s.err))
+}
+
+// sealPartitions attempts selected diode then workload, after the optional pause.
+// Each operation receives a fresh budget excluding pause wall time. The gate
+// checks parent/pair liveness immediately before committing an attempt; stop or
+// exit completed before that gate prevents it. Cancellation after commitment
+// can race native submission: S4 checks ctx again and reports actual dispatch.
+// No native syscall is abandoned for a timeout; callers retain both VM owners
+// through return. First error (even pre-dispatch) prevents every later call.
+func (p *protectedSiblingPair) sealPartitions() error {
+	for i := range p.seals {
+		s := &p.seals[i]
+		if !s.selected {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(p.ctx, protectedSetupBudget)
+		p.forwardMu.Lock()
+		if err := p.parent.Err(); err != nil {
+			p.cancel(context.Cause(p.parent))
+		}
+		if err := p.ctx.Err(); err != nil {
+			p.forwardMu.Unlock()
+			cancel()
+			return context.Cause(p.ctx)
+		}
+		s.attemptAt = time.Now().UTC().Format(time.RFC3339Nano)
+		p.forwardMu.Unlock()
+		// Commitment is NOT evidence of native dispatch. Only the return
+		// contract below can distinguish no submission from unknown effects.
+		err := p.workers[i].vm.SealPartition(ctx, s.mask)
+		cancel()
+		s.finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		fmt.Printf("protected partition seal attempt: run=%s role=%s vm=%s mask=%d mask_hex=%#016x at=%s returned_at=%s\n",
+			p.run, s.role, s.vmID, s.mask, s.mask, s.attemptAt, s.finishedAt)
+		s.err = err
+		var sealErr *uvm.PartitionSealError
+		s.dispatched = err == nil || (errors.As(err, &sealErr) && sealErr.Dispatched)
+		if s.dispatched {
+			s.state = "dispatched"
+			p.reportSeal(s)
+		}
+		s.state = "completed"
+		if err != nil {
+			s.state = "failed"
+			if s.dispatched || !errors.As(err, &sealErr) {
+				s.state = "uncertain"
+			}
+		}
+		p.reportSeal(s)
+		if err != nil {
+			return fmt.Errorf("protected partition seal run=%s role=%s vm=%s mask=%#016x state=%s (no retry/rollback): %w",
+				p.run, s.role, s.vmID, s.mask, s.state, err)
+		}
+	}
+	return nil
 }
 
 // Retention deliberately has no finalizer or implicit Close. This preserves
@@ -145,8 +260,13 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 // cleanup. CLI access and backing state remain serial; both successful starts
 // precede concurrent guest transport setup. Signals, VM exits and service exits
 // cancel ongoing work. Primary and cleanup errors are joined, never suppressed
-// by markers. Compilation and lab execution are separate manual prerequisites.
+// by markers. Independent optional masks follow checked networking/backing seal
+// and optional cancellable pause, with per-call budgets starting after resume.
+// Compilation and lab execution are separate manual prerequisites.
 func runProtectedSibling(c *cli.Context) (resultErr error) {
+	if err := validateProtectedPartitionCLI(c); err != nil {
+		return err
+	}
 	if err := validateProtectedSiblingCLI(c); err != nil {
 		return err
 	}
@@ -155,17 +275,72 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	_ = c.GlobalIsSet("help")
 	parent, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopSignals()
-	ctx, cancel := context.WithCancelCause(parent)
+	ctx, cancel := context.WithCancelCause(context.Background())
 	watchCtx, stopWatch := context.WithCancel(context.Background())
-	p := &protectedSiblingPair{ctx: ctx, cancel: cancel, watchCtx: watchCtx, stopWatch: stopWatch}
+	group, err := guid.NewV4()
+	if err != nil {
+		cancel(nil)
+		stopWatch()
+		return err
+	}
+	p := &protectedSiblingPair{
+		ctx: ctx, cancel: cancel, parent: parent, watchCtx: watchCtx, stopWatch: stopWatch,
+		run: group.String(),
+	}
+	for i, name := range []string{diodePartitionSealMaskArgName, workloadPartitionSealMaskArgName} {
+		role := diodeRole
+		if i == 1 {
+			role = workloadRole
+		}
+		p.seals[i] = protectedPartitionSeal{
+			role: role, vmID: fmt.Sprintf("uvmboot-%d", i), selected: c.IsSet(name),
+			mask: c.Uint64(name), state: "omitted",
+		}
+		if p.seals[i].selected {
+			p.seals[i].state = "pending"
+		}
+		p.reportSeal(&p.seals[i])
+	}
+	// Route parent cancellation through the same gate as VM/service/stop.
+	// Keep it live throughout pause, and join it with all other watchers.
+	p.watchers.Add(1)
+	go func() {
+		defer p.watchers.Done()
+		select {
+		case <-parent.Done():
+			p.stop(context.Cause(parent))
+		case <-watchCtx.Done():
+		}
+	}()
 	// Cancellation starts cleanup; inspecting the sticky cause afterward also
 	// captures a VM/service failure that won the race with our normal stop.
 	// Independent cleanup errors never transfer or erase native ownership.
 	defer func() {
-		cancel(nil)
+		p.stop(nil)
+		// A protocol stop during pause/pre-dispatch is normal shutdown, not
+		// a seal failure. Never suppress a native error or another cause.
+		if resultErr == context.Canceled && p.shells != nil && context.Cause(ctx) == context.Canceled {
+			select {
+			case <-p.shells.stopped:
+				resultErr = nil
+			default:
+			}
+		}
+		for i := range p.seals {
+			s := &p.seals[i]
+			if s.state == "pending" {
+				s.state = "unattempted"
+				s.err = resultErr
+			}
+			p.reportSeal(s)
+		}
 		resultErr = errors.Join(resultErr, p.cleanup())
 		if cause := context.Cause(ctx); cause != nil && cause != context.Canceled {
 			resultErr = errors.Join(resultErr, cause)
+		}
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("partition outcomes run=%s: diode=%s workload=%s; independent calls, no rollback",
+				p.run, p.seals[0].state, p.seals[1].state))
 		}
 	}()
 	lps, err := parseCPUGroupLPs(c.String(cpuGroupLPsArgName))
@@ -186,6 +361,7 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		}
 		v := &protectedSiblingVM{options: options, role: role}
 		p.workers = append(p.workers, v)
+		p.seals[i].vmID = options.ID
 		if options.GuestStateFilePath == "" || !options.SecurityPolicyEnabled ||
 			options.HclEnabled == nil || *options.HclEnabled || options.AllowOvercommit ||
 			options.EnableDeferredCommit || !options.DmVerityMode || options.SiblingRoot ||
@@ -223,10 +399,6 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 			return err
 		}
 		v.bundleOwned = true
-	}
-	group, err := guid.NewV4()
-	if err != nil {
-		return err
 	}
 	p.memory, err = newProtectedSiblingMemory("uvmboot-protected-"+group.String(), c.Uint64(sharedMemorySizeArgName))
 	if err != nil {
@@ -327,15 +499,28 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return context.Cause(ctx)
 	}
+	// Acquire all listeners before publishing readiness or closing admission.
+	// A competing pipe owner fails before these irreversible controls. Stop
+	// and accept errors immediately cancel setup/pause through the same gate.
+	p.shells, err = newProtectedSiblingShellServer(p.ctx, p.workers, p.stop)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("protected sibling: checked network ready at %s; sealing backing lease=%d pages=%d once\n",
 		time.Now().UTC().Format(time.RFC3339Nano), p.memory.lease, p.memory.pages)
 	if err := p.memory.advance(setupCtx, protectedSeal, &p.memory.sealed); err != nil {
 		return err
 	}
 	stopSetup()
-	// S6 insertion point: admission is closed, neither partition is sealed.
-	// Optional pause/masks must retain these same watchers and pair ownership.
-	fmt.Println("protected sibling: backing admission sealed; partitions unsealed; attach diode|workload or stop")
+	if prefix := c.String(partitionSealPausePrefixArgName); prefix != "" {
+		if err := p.pausePartitionSeals(prefix); err != nil {
+			return err
+		}
+	}
+	if err := p.sealPartitions(); err != nil {
+		return err
+	}
+	fmt.Println("protected sibling: backing admission sealed; independent partition outcomes recorded; attach diode|workload or stop")
 	return p.interactive()
 }
 
@@ -424,15 +609,16 @@ func (p *protectedSiblingPair) observeFailedStartup(v *protectedSiblingVM) {
 
 // watch observes a successfully started VM until pair cleanup cancels watchers.
 // An unexpected exit cancels every forward operation, including peer startup and
-// guest readiness. It never changes backing state. cleanup joins the goroutine
-// before closing VM handles; WaitCtx's own errors are retained as the cause.
+// guest readiness, through the seal-attempt gate. It never changes backing state.
+// cleanup joins the goroutine before closing VM handles; WaitCtx's own errors
+// are retained as the cause.
 func (p *protectedSiblingPair) watch(v *protectedSiblingVM) {
 	p.watchers.Add(1)
 	go func() {
 		defer p.watchers.Done()
 		err := v.vm.WaitCtx(p.watchCtx)
 		if p.watchCtx.Err() == nil {
-			p.cancel(errors.Join(fmt.Errorf("protected VM %s exited", v.options.ID), err, v.vm.ExitError()))
+			p.stop(errors.Join(fmt.Errorf("protected VM %s exited", v.options.ID), err, v.vm.ExitError()))
 		}
 	}()
 }
@@ -593,7 +779,7 @@ func (p *protectedSiblingPair) startService(v *protectedSiblingVM, command strin
 	go func() {
 		err := process.Wait()
 		if p.ctx.Err() == nil {
-			p.cancel(errors.Join(fmt.Errorf("protected service on %s exited: %s", v.options.ID, command), err))
+			p.stop(errors.Join(fmt.Errorf("protected service on %s exited: %s", v.options.ID, command), err))
 		}
 		service.done <- err
 	}()
@@ -603,16 +789,14 @@ func (p *protectedSiblingPair) startService(v *protectedSiblingVM, command strin
 // interactive serves the existing attach/stop protocol through a pair-owned
 // cancellable server, without container commands or global stop state. All
 // handlers remain owned until cleanup joins them before touching VM/backing
-// ownership. S6 can create this server earlier for its readiness/pause boundary;
-// this method issues no partition controls.
+// ownership. The server must already be available before readiness/pause and is
+// reused here without reacquiring names. This method issues no partition calls.
 func (p *protectedSiblingPair) interactive() error {
-	var err error
-	p.shells, err = newProtectedSiblingShellServer(p.ctx, p.workers)
-	if err != nil {
-		return err
+	if p.shells == nil {
+		return errors.New("protected interactive listeners were not acquired")
 	}
-	err = p.shells.wait()
-	p.cancel(nil)
+	err := p.shells.wait()
+	p.stop(nil)
 	return err
 }
 
@@ -626,7 +810,7 @@ func (p *protectedSiblingPair) interactive() error {
 func (p *protectedSiblingPair) cleanup() error {
 	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
 	defer cancel()
-	p.cancel(nil)
+	p.stop(nil)
 	p.stopWatch()
 	p.watchers.Wait()
 	var result error

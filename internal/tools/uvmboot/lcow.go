@@ -64,6 +64,9 @@ const (
 	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
 	siblingOpenShellBundleArgName     = "sibling-openshell-bundle"
 	protectedSharedMemoryArgName      = "protected-shared-memory"
+	diodePartitionSealMaskArgName     = "diode-partition-seal-mask"
+	workloadPartitionSealMaskArgName  = "workload-partition-seal-mask"
+	partitionSealPausePrefixArgName   = "partition-seal-pause-prefix"
 )
 
 var (
@@ -78,7 +81,23 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{
 			Name:  protectedSharedMemoryArgName,
 			Usage: "Run the interactive SNP diode/workload pair with native protected Bootstrap/Import startup; " +
-				"seal backing admission after checked networking, leaving partitions unsealed.",
+				"seal backing admission after checked networking; partitions remain unsealed unless independently selected.",
+		},
+		cli.Uint64Flag{
+			Name: diodePartitionSealMaskArgName,
+			Usage: "Protected mode only: seal diode with this exact uint64 bitmap after admission sealing/pause. " +
+				"Omitted means no call; explicit zero and future bits reach native validation unchanged.",
+		},
+		cli.Uint64Flag{
+			Name: workloadPartitionSealMaskArgName,
+			Usage: "Protected mode only: independently seal workload after diode, if selected. " +
+				"First failure/uncertainty stops later calls; no rollback or atomic pair success.",
+		},
+		cli.StringFlag{
+			Name: partitionSealPausePrefixArgName,
+			Usage: "Protected mode with at least one mask: fresh absolute local-drive prefix for .ready/.resume; " +
+				"pause after checked networking/admission with attach/stop live. Read complete .ready, then exclusively " +
+				"create .resume containing exactly continue followed by LF; never overwrite markers. Debugging only, not authentication.",
 		},
 		cli.StringFlag{
 			Name: unikraftPackageArgName,
@@ -333,10 +352,15 @@ var lcowCommand = cli.Command{
 	// and returns setup/worker/mapping failures through the existing cleanup.
 	// Protected opt-in transfers the entire pair lifetime to its separate owner
 	// before ordinary allocation, diagnostics, or independent worker defers.
+	// Protected-only controls are rejected even without opt-in; typed flag
+	// parsing rejects malformed/overflowing uint64 values before this action.
 	// Mapping-only observations retain full uint64 page indices under mappingMu;
 	// runMany joins workers before comparison. Byte-GPA conversion errors fail
 	// the run rather than allowing wrapped addresses into success diagnostics.
 	Action: func(c *cli.Context) (resultErr error) {
+		if err := validateProtectedPartitionCLI(c); err != nil {
+			return err
+		}
 		if c.Bool(protectedSharedMemoryArgName) {
 			return runProtectedSibling(c)
 		}

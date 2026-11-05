@@ -251,22 +251,26 @@ type protectedSiblingShellServer struct {
 	done      chan struct{}
 	stopped   chan struct{}
 	closeErr  error
+	pairStop  func(error)
 }
 
 // newProtectedSiblingShellServer exclusively acquires the existing stop and
 // role pipe names, then starts cancellable accept/connection ownership for the
 // two already-started workers. Failure closes acquisitions before returning no
 // server. Success borrows both VMs until close joins all handlers; caller must
-// invoke close even after wait returns. No guest work or readiness is implied.
-func newProtectedSiblingShellServer(parent context.Context, workers []*protectedSiblingVM) (*protectedSiblingShellServer, error) {
+// invoke close even after wait returns. pairStop must synchronously complete the
+// pair's forward-cancellation transition without joining this server. Accept
+// failures/stop notify it immediately, so pause cannot strand a private canceled
+// server while the pair keeps waiting. No guest work/readiness is implied.
+func newProtectedSiblingShellServer(parent context.Context, workers []*protectedSiblingVM, pairStop func(error)) (*protectedSiblingShellServer, error) {
 	if len(workers) != 2 || workers[0].vm == nil || workers[1].vm == nil ||
-		workers[0].role != diodeRole || workers[1].role != workloadRole {
+		workers[0].role != diodeRole || workers[1].role != workloadRole || pairStop == nil {
 		return nil, errors.New("protected shell server requires the owned diode/workload pair")
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	s := &protectedSiblingShellServer{
 		ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
-		done: make(chan struct{}), stopped: make(chan struct{}),
+		done: make(chan struct{}), stopped: make(chan struct{}), pairStop: pairStop,
 	}
 	for _, path := range []string{siblingStopPipe, siblingPipePrefix + "diode", siblingPipePrefix + "workload"} {
 		listener, err := winio.ListenPipe(path, nil)
@@ -311,24 +315,33 @@ func newProtectedSiblingShellServer(parent context.Context, workers []*protected
 	return s, nil
 }
 
-// acceptStop accepts one existing-protocol stop connection and cancels this
-// server only. Cancellation closes the listener to unblock Accept. An actual
-// accept/connection-close failure is a server error, not a successful stop.
+// stop forwards a stop/error to the pair before canceling this server. Neither
+// transition waits for handlers; cleanup alone closes/joins the handlers before
+// releasing their borrowed VMs.
+// A nil cause means ordinary protocol stop, never a successful native seal.
+func (s *protectedSiblingShellServer) stop(cause error) {
+	s.pairStop(cause)
+	s.cancel(cause)
+}
+
+// acceptStop accepts one existing-protocol stop connection and cancels the pair
+// and server immediately. Cancellation closes the listener to unblock Accept.
+// An actual accept/connection-close failure is an error, not a successful stop.
 func (s *protectedSiblingShellServer) acceptStop() {
 	defer s.wg.Done()
 	conn, err := s.listeners[0].Accept()
 	if err != nil {
 		if s.ctx.Err() == nil {
-			s.cancel(fmt.Errorf("protected stop accept: %w", err))
+			s.stop(fmt.Errorf("protected stop accept: %w", err))
 		}
 		return
 	}
 	if err := conn.Close(); err != nil {
-		s.cancel(fmt.Errorf("protected stop connection: %w", err))
+		s.stop(fmt.Errorf("protected stop connection: %w", err))
 		return
 	}
 	close(s.stopped)
-	s.cancel(nil)
+	s.stop(nil)
 }
 
 // acceptShells publishes each connection under the cancellation lock before
@@ -341,7 +354,7 @@ func (s *protectedSiblingShellServer) acceptShells(listener net.Listener, v *pro
 		conn, err := listener.Accept()
 		if err != nil {
 			if s.ctx.Err() == nil {
-				s.cancel(fmt.Errorf("protected %s attach accept: %w", v.options.ID, err))
+				s.stop(fmt.Errorf("protected %s attach accept: %w", v.options.ID, err))
 			}
 			return
 		}
