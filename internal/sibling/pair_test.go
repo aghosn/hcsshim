@@ -194,6 +194,7 @@ func TestPairBootstrapShellSyntax(t *testing.T) {
 	}
 	for _, script := range []string{
 		diodeNetworkCommand(&Uplink{Address: "172.31.250.2/24", Gateway: UplinkGateway}),
+		demoToolsStage + workloadNICCommand(),
 		workloadNICCommand(),
 		resolve + `printf '%s\n' "1 0 42 $storage_dev" >` + exportParameters + "export_add",
 	} {

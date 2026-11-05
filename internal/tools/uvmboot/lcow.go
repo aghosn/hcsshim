@@ -1373,13 +1373,10 @@ func runLCOW(
 				if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
 					return fmt.Errorf("share diode_tcpbulk: %w", err)
 				}
-				// Interactive demo helpers, staged on both roles (the diode runs
-				// capture/filter/smooth, the workload runs the covert client).
-				if role == diodeRole {
-					controllerPath := filepath.Join(filepath.Dir(busModulePath), "diode-controller")
-					if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
-						return fmt.Errorf("share diode-controller: %w", err)
-					}
+				// The same executable serves the diode UI and the manually started workload SNP responder.
+				controllerPath := filepath.Join(filepath.Dir(busModulePath), "diode-controller")
+				if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
+					return fmt.Errorf("share diode-controller: %w", err)
 				}
 				for shareName, guestDir := range map[string]string{
 					"demo.sh":       "/run/diode-demo",

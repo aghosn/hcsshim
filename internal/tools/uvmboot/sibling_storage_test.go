@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -81,6 +83,8 @@ func TestSiblingStoragePlanValidation(t *testing.T) {
 		}, "one read-only"},
 		{"missing-lun", func(p *siblingStoragePlan) { p.Disks[0].ExportLUN = nil }, "export_lun is required"},
 		{"unreachable-lun", func(p *siblingStoragePlan) { *p.Disks[0].ExportLUN = 255 }, "between 0 and 254"},
+		{"removable-root", func(p *siblingStoragePlan) { p.Disks[0].Removable = true }, "removable exports require a data disk"},
+		{"removable-zero", func(p *siblingStoragePlan) { p.Disks[0].Role = "data"; p.Disks[0].Removable = true }, "removable exports require a data disk"},
 		{"too-many-disks", func(p *siblingStoragePlan) {
 			p.Disks = append(p.Disks, make([]siblingStorageDisk, 15)...)
 		}, "maximum 16"},
@@ -91,6 +95,7 @@ func TestSiblingStoragePlanValidation(t *testing.T) {
 		{"duplicate-path", func(p *siblingStoragePlan) { p.Disks[1].HostPath = p.Disks[0].HostPath }, "aliases"},
 		{"case-alias", func(p *siblingStoragePlan) { p.Disks[1].HostPath = strings.ToUpper(p.Disks[0].HostPath) }, "aliases"},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			plan := storageTestPlan(t)
@@ -116,6 +121,41 @@ func TestSiblingStoragePlanValidation(t *testing.T) {
 		if _, err := decodeSiblingStoragePlan(strings.NewReader(input)); err == nil {
 			t.Fatalf("accepted malformed plan: %s", input)
 		}
+	}
+}
+
+func TestRemovableSiblingStartupUsesExistingDynamicExportAPI(t *testing.T) {
+	plan := storageTestPlan(t)
+	plan.Disks[1].Removable = true
+	decoded, err := decodeSiblingStoragePlan(strings.NewReader(storagePlanJSON(t, plan)))
+	if err != nil || !decoded.Disks[1].Removable {
+		t.Fatalf("removable data-disk opt-in lost: %v", err)
+	}
+	reports := []siblingStorageBackendReport{
+		{DiskID: "workload-root", ControllerID: "controller-a", LUN: 3, ExportLUN: 0, ReadOnly: true},
+		{DiskID: "workload-data", ControllerID: "controller-b", LUN: 7, ExportLUN: 1},
+	}
+	command, err := siblingStorageGuestCommand("/run/provider.ko", diodeRole, plan, reports, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(command, "'luns=0' 'read_only=true'") || strings.Contains(command, "'luns=0,1'") {
+		t.Fatalf("root must remain the only static export: %s", command)
+	}
+	record := regexp.MustCompile(`"1 0 ([0-9]+) \$storage_dev" > /sys/module/diode_storvsp/parameters/export_add`).FindStringSubmatch(command)
+	if len(record) != 2 {
+		t.Fatalf("missing dynamic read-write export: %s", command)
+	}
+	if token, err := strconv.ParseUint(record[1], 10, 64); err != nil || token == 0 {
+		t.Fatalf("invalid ownership token %q: %v", record[1], err)
+	}
+	if strings.Index(command, "insmod ") > strings.Index(command, "/parameters/export_add") ||
+		strings.Index(command, "/parameters/export_add") > strings.Index(command, linuxDiodeStorageReady) {
+		t.Fatal("dynamic export must follow provider registration and precede storage readiness")
+	}
+	plan.Disks = plan.Disks[1:]
+	if _, err := siblingStorageGuestCommand("/run/provider.ko", diodeRole, plan, reports[1:], false); err == nil {
+		t.Fatal("accepted all-removable startup without a fixed provider export")
 	}
 }
 

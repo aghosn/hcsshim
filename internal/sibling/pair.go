@@ -250,12 +250,14 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return nil, err
 		}
 	}
-	if err := pair.Workload.Share(ctx, filepath.Join(config.ModuleDirectory, "sibling_bus.ko"), "/run/sibling/sibling_bus.ko", true); err != nil {
-		return nil, err
+	for _, name := range []string{"sibling_bus.ko", "demo.sh", "diode-controller"} {
+		if err := pair.Workload.Share(ctx, filepath.Join(config.ModuleDirectory, name), "/run/sibling/"+name, true); err != nil {
+			return nil, err
+		}
 	}
 	nicCtx, nicCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer nicCancel()
-	device, err := runGuest(nicCtx, pair.Workload, workloadNICCommand())
+	device, err := runGuest(nicCtx, pair.Workload, demoToolsStage+workloadNICCommand())
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +310,10 @@ func bootstrap(ctx context.Context, workload, diode func(context.Context) error)
 	return group.Wait()
 }
 
+const demoToolsStage = `mkdir -p /run/sibling-exec && mount -t tmpfs -o exec,size=16m tmpfs /run/sibling-exec || exit 1; ` +
+	`for tool in demo.sh diode-controller; do ` +
+	`cp /run/sibling/$tool/$tool /run/sibling-exec/$tool && chmod 755 /run/sibling-exec/$tool || exit 1; done; `
+
 func diodeNetworkCommand(uplink *Uplink) string {
 	return `insmod /run/sibling/diode_netvsp.ko/diode_netvsp.ko; ` +
 		`until [ -e /sys/class/net/dvsp0 ]; do sleep 0.1; done; ` +
@@ -317,10 +323,8 @@ func diodeNetworkCommand(uplink *Uplink) string {
 		`up=${p##*/}; count=$((count+1)); done; [ "$count" -le 1 ] || exit 1; [ "$count" -eq 1 ]; do sleep 0.1; done; ` +
 		"ip addr add " + Quote(uplink.Address) + ` dev "$up"; ip link set "$up" up; ` +
 		"ip route replace default via " + Quote(uplink.Gateway) + ` dev "$up"; ` +
-		`mkdir -p /run/sibling-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/sibling-exec; ` +
+		demoToolsStage +
 		`cp /run/sibling/diode_iptables/diode_iptables /run/sibling-exec/ipt; chmod 755 /run/sibling-exec/ipt; ` +
-		`for tool in demo.sh diode-controller; do ` +
-		`cp /run/sibling/$tool/$tool /run/sibling-exec/$tool && chmod 755 /run/sibling-exec/$tool || exit 1; done; ` +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`/run/sibling-exec/ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE`
 }
