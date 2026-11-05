@@ -1062,9 +1062,30 @@ func runLCOW(
 		[]hcsschema.SharedMemoryRegionInfo,
 	) error,
 ) (resultErr error) {
+	var diodeTiming *linuxDiodeBootTiming
+	if siblingInteractive && unikraft == nil && options.UseGuestConnection &&
+		c.Bool(sharedMemoryTwoUVMArgName) && c.Bool(siblingDiodeUplinkArgName) &&
+		c.String(siblingBusGuestModuleArgName) != "" &&
+		c.String(siblingOpenShellBundleArgName) == "" &&
+		c.String(networkBenchmarkScriptArgName) == "" && c.String(storageBenchmarkScriptArgName) == "" {
+		role, err := sharedMemoryProofRole(options.ID)
+		if err != nil {
+			return err
+		}
+		if role == diodeRole {
+			diodeTiming = &linuxDiodeBootTiming{
+				output: os.Stdout, storageNeeded: storagePlan != nil,
+			}
+		}
+	}
+	createStarted := time.Now()
 	vm, err := uvm.CreateLCOW(ctx, options)
 	if err != nil {
 		return err
+	}
+	if diodeTiming != nil {
+		diodeTiming.createStarted = createStarted
+		diodeTiming.createElapsed = time.Since(createStarted)
 	}
 	var storageReleases []func(context.Context) error
 	defer func() {
@@ -1099,8 +1120,16 @@ func runLCOW(
 		}
 	}
 
+	if diodeTiming != nil {
+		diodeTiming.startRequested = time.Now()
+	}
 	if err := vm.Start(ctx); err != nil {
 		return err
+	}
+	if diodeTiming != nil {
+		if err := diodeTiming.report("gcs_ready", time.Now()); err != nil {
+			return fmt.Errorf("write Linux diode GCS timing: %w", err)
+		}
 	}
 	var stopSampling func() error
 	if c.String(networkBenchmarkScriptArgName) != "" {
@@ -1436,7 +1465,11 @@ func runLCOW(
 	}
 
 	if options.UseGuestConnection {
-		if err := execViaGCS(ctx, vm, c, storageBootstrap+execCommand); err != nil {
+		var output io.Writer = os.Stdout
+		if diodeTiming != nil {
+			output = diodeTiming
+		}
+		if err := execViaGCSWithOutput(ctx, vm, c, storageBootstrap+execCommand, output); err != nil {
 			return err
 		}
 		if stopSampling != nil {
@@ -1644,6 +1677,7 @@ func siblingDiodeNATCommand(uplink *diodeUplink) string {
 	cmd := "echo 1 >/proc/sys/net/ipv4/ip_forward; " +
 		"if $ipt iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o $up -j MASQUERADE; " +
 		"then echo \"diode_net: nat ok dev=$up addr=" + uplink.address + " gw=" + uplink.gateway + "\"; " +
+		`if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; then echo '` + linuxDiodeNetworkReady + `'; fi; ` +
 		"else echo 'diode_net: nat failed'; fi; "
 	if !siblingInteractive {
 		cmd += "if ping -c 2 -W 2 " + uplink.gateway + " >/dev/null 2>&1; " +
@@ -1966,12 +2000,22 @@ func execViaGCS(
 	cCtx *cli.Context,
 	execCommand string,
 ) error {
+	return execViaGCSWithOutput(ctx, vm, cCtx, execCommand, os.Stdout)
+}
+
+func execViaGCSWithOutput(
+	ctx context.Context,
+	vm *uvm.UtilityVM,
+	cCtx *cli.Context,
+	execCommand string,
+	output io.Writer,
+) error {
 	c := cmd.CommandContext(ctx, vm, "sh", "-c", execCommand)
 	c.Log = log.L.Dup()
 	if lcowUseTerminal {
 		c.Spec.Terminal = true
 		c.Stdin = os.Stdin
-		c.Stdout = os.Stdout
+		c.Stdout = output
 		con, err := console.ConsoleFromFile(os.Stdin)
 		if err != nil {
 			log.G(ctx).WithError(err).Warn("could not create console from stdin")
@@ -1993,7 +2037,7 @@ func execViaGCS(
 		}
 	} else if cCtx.String(outputHandlingArgName) == "stdout" {
 		if cCtx.Bool(forwardStdoutArgName) {
-			c.Stdout = os.Stdout
+			c.Stdout = output
 		}
 		if cCtx.Bool(forwardStderrArgName) {
 			c.Stderr = os.Stdout // match non-GCS behavior and forward to stdout

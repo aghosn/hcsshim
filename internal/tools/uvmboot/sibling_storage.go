@@ -317,7 +317,8 @@ func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePla
 		command += "insmod " + shellSingleQuote(modulePath) + moduleArgs +
 			` "backends=$storage_backends" ` + shellSingleQuote("luns="+strings.Join(luns, ",")) +
 			" " + shellSingleQuote("read_only="+strings.Join(readOnly, ",")) + ` || exit 1; ` +
-			`echo 'diode_storage: provider registered'; `
+			`echo 'diode_storage: provider registered'; ` +
+			`echo '` + linuxDiodeStorageReady + `'; `
 	} else {
 		for _, disk := range plan.Disks {
 			match := fmt.Sprintf(`storage_dev=; storage_count=0; for p in /sys/class/block/*; do `+

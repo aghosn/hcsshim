@@ -348,6 +348,9 @@ func TestSiblingStorageGuestCommandsPreserveDiskIdentity(t *testing.T) {
 	if err != nil || !strings.Contains(direct, "'direct_io=1'") || strings.Contains(diode, "direct_io=") {
 		t.Fatalf("direct backend selection changed ordinary startup: %q, %v", direct, err)
 	}
+	if !strings.Contains(diode, `|| exit 1; echo 'diode_storage: provider registered'; echo '`+linuxDiodeStorageReady+`'`) {
+		t.Fatal("storage timing marker must follow successful provider registration")
+	}
 	workload, err := siblingStorageGuestCommand("", workloadRole, plan, nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -362,7 +365,8 @@ func TestSiblingStorageGuestCommandsPreserveDiskIdentity(t *testing.T) {
 			t.Errorf("workload mapping missing %q: %s", expected, workload)
 		}
 	}
-	if strings.Contains(workload, "insmod") || strings.Contains(workload, "dd ") ||
+	if strings.Contains(workload, linuxDiodeStorageReady) ||
+		strings.Contains(workload, "insmod") || strings.Contains(workload, "dd ") ||
 		strings.Contains(diode, "/dev/sda") || strings.Contains(workload, "/dev/sda") {
 		t.Fatal("startup writes disks or assumes disk enumeration order")
 	}
