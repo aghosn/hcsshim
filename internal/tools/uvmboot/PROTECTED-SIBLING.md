@@ -129,6 +129,16 @@ Expected source sequence (collect actual evidence; logs alone are not proof):
    The launcher then seals page admission **once per backing page**, not once
    per VM, and optionally pauses and seals selected partitions.
 
+Inspect the existing
+`/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance` discovery output for
+the single configured link in each guest. Its fields are
+`bus_id`, `local_cid`, `peer_cid`, `version`, and `ready`: expect diode
+`local_cid=4 peer_cid=3`, workload `local_cid=3 peer_cid=4`, and
+`version=4 ready=1` on both. Record each actual `bus_id`; do not assume the two
+bus IDs are equal. These are the existing launcher discovery/CID checks
+(`siblingInstanceDiscoveryCommand` and `siblingVsockReadyCommand`), not a new
+readiness tool or a substitute for the checked socket/network setup.
+
 The URI in `ProtectedSharedControllerUri` is an operation-resource selector,
 not authority. Real controller handles are attached through HCS operation
 resources; operations own native duplicates through completion while the pair
@@ -369,8 +379,10 @@ Remove/Installed/InitializedPages property is not drain or release authority.
 Unknown startup ownership, malformed progress, incomplete teardown/reclaim,
 unjoined borrowers or failed scrub verification must remain errors. No
 ordinary `Section.Close`, content read, marker seed or opportunistic unpin is
-safe after bootstrap dispatch. The final history includes lease, initialized,
-sealed, teardown, reclaimed and zero-verified byte prefixes plus uncertainty.
+safe after bootstrap dispatch. In the final history, `lease` is the lease
+identity; `initialized`, `sealed`, `teardown`, and `reclaimed` are contiguous
+prefix counts in **4-KiB pages**, not bytes; `zero-verified-bytes` counts
+verified **bytes**; and `unknown` is a boolean uncertainty flag.
 Retained owners are **in-process only**: launcher exit/native fallback cleanup
 determine actual lifetime, not a persistence promise. Record unresolved cleanup
 as unresolved, not as zero work or successful reclamation.
