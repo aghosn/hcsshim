@@ -63,6 +63,10 @@ const (
 	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
 	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
 	siblingOpenShellBundleArgName     = "sibling-openshell-bundle"
+	protectedSharedMemoryArgName      = "protected-shared-memory"
+	diodePartitionSealMaskArgName     = "diode-partition-seal-mask"
+	workloadPartitionSealMaskArgName  = "workload-partition-seal-mask"
+	partitionSealPausePrefixArgName   = "partition-seal-pause-prefix"
 )
 
 var (
@@ -74,6 +78,27 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  protectedSharedMemoryArgName,
+			Usage: "Run the interactive SNP diode/workload pair with native protected Bootstrap/Import startup; " +
+				"seal backing admission after checked networking; partitions remain unsealed unless independently selected.",
+		},
+		cli.Uint64Flag{
+			Name: diodePartitionSealMaskArgName,
+			Usage: "Protected mode only: seal diode with this exact uint64 bitmap after admission sealing/pause. " +
+				"Omitted means no call; explicit zero and future bits reach native validation unchanged.",
+		},
+		cli.Uint64Flag{
+			Name: workloadPartitionSealMaskArgName,
+			Usage: "Protected mode only: independently seal workload after diode, if selected. " +
+				"First failure/uncertainty stops later calls; no rollback or atomic pair success.",
+		},
+		cli.StringFlag{
+			Name: partitionSealPausePrefixArgName,
+			Usage: "Protected mode with at least one mask: fresh absolute local-drive prefix for .ready/.resume; " +
+				"pause after checked networking/admission with attach/stop live. Read complete .ready, then exclusively " +
+				"create .resume containing exactly continue followed by LF; never overwrite markers. Debugging only, not authentication.",
+		},
 		cli.StringFlag{
 			Name: unikraftPackageArgName,
 			Usage: "Replace only the diode with a standalone SNP VMGS package containing guest.vmgs and launch-manifest.json; " +
@@ -218,7 +243,8 @@ var lcowCommand = cli.Command{
 		cli.StringFlag{
 			Name: siblingBusGuestModuleArgName,
 			Usage: "After the shared-memory guest module, load this matching " +
-				"sibling_bus.ko and wait for the host's sibling-link offer.",
+				"sibling_bus.ko and wait for the host's sibling-link offer. " +
+				"Protected mode skips the ordinary diagnostic module.",
 		},
 		cli.StringFlag{
 			Name: siblingStorageBackendsArgName,
@@ -322,7 +348,22 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
 	},
+	// Action validates LCOW flags, owns the shared section and worker lifetimes,
+	// and returns setup/worker/mapping failures through the existing cleanup.
+	// Protected opt-in transfers the entire pair lifetime to its separate owner
+	// before ordinary allocation, diagnostics, or independent worker defers.
+	// Protected-only controls are rejected even without opt-in; typed flag
+	// parsing rejects malformed/overflowing uint64 values before this action.
+	// Mapping-only observations retain full uint64 page indices under mappingMu;
+	// runMany joins workers before comparison. Byte-GPA conversion errors fail
+	// the run rather than allowing wrapped addresses into success diagnostics.
 	Action: func(c *cli.Context) (resultErr error) {
+		if err := validateProtectedPartitionCLI(c); err != nil {
+			return err
+		}
+		if c.Bool(protectedSharedMemoryArgName) {
+			return runProtectedSibling(c)
+		}
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
 			return err
@@ -616,8 +657,10 @@ var lcowCommand = cli.Command{
 			firstErr       error
 			errMu          sync.Mutex
 			mappingMu      sync.Mutex
-			mappingAddress = make(map[string]uint32)
+			mappingAddress = make(map[string]uint64)
 		)
+		// Each worker owns its VM through runLCOW and records its first failure
+		// under errMu. The shared section remains owned by this Action.
 		runMany(c, func(id string) (workerErr error) {
 			ctx := benchmarkCtx
 			defer func() {
@@ -690,6 +733,9 @@ var lcowCommand = cli.Command{
 				storagePlan,
 				unikraft,
 				execCommand,
+				// In mapping-only mode, require one mapping before publishing
+				// its full native page index under mappingMu. Other modes do
+				// not record observations; errors retain no partial map entry.
 				func(
 					uvmID string,
 					regions []hcsschema.SharedMemoryRegionInfo,
@@ -704,9 +750,7 @@ var lcowCommand = cli.Command{
 							len(regions),
 						)
 					}
-					rawAddress := uint32(
-						regions[0].GuestPhysicalAddress,
-					)
+					rawAddress := regions[0].GuestPhysicalAddress
 					mappingMu.Lock()
 					mappingAddress[uvmID] = rawAddress
 					mappingMu.Unlock()
@@ -728,7 +772,7 @@ var lcowCommand = cli.Command{
 				)
 			}
 			var (
-				expected     uint32
+				expected     uint64
 				haveExpected bool
 			)
 			for id, address := range mappingAddress {
@@ -739,15 +783,20 @@ var lcowCommand = cli.Command{
 				}
 				if address != expected {
 					return fmt.Errorf(
-						"UVM %s mapped shared memory at %#x, expected %#x",
+						"UVM %s mapped shared memory at page index %#x, expected %#x",
 						id,
 						address,
 						expected,
 					)
 				}
 			}
+			byteGPA, err := uvm.SharedMemoryByteGPA(expected, int64(section.size))
+			if err != nil {
+				return fmt.Errorf("convert shared-memory mapping page index %#x length %#x: %w",
+					expected, section.size, err)
+			}
 			logrus.WithFields(logrus.Fields{
-				"byte-gpa":  uint64(expected) << 12,
+				"byte-gpa":  byteGPA,
 				"raw":       fmt.Sprintf("%#x", expected),
 				"uvm-count": len(mappingAddress),
 			}).Info("verified identical shared-memory mappings")
@@ -862,6 +911,13 @@ func init() {
 		`-root-fs-type vhd -shared-memory-size 1048576 -exec "sleep 300"`
 }
 
+// createLCOWOptions translates CLI settings into caller-owned Linux options,
+// including an owned temporary SNP bundle directory when hardware mode is set.
+// The caller removes that directory only after VM ownership drains. Errors
+// return no usable options. Protected mode defers directory allocation to its
+// pair owner until both options have passed preflight, and omits the ordinary
+// diagnostic role; native discovery supplies its guest transport identity.
+// Callers serialize CLI access; this function does not create/start a VM.
 func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.OptionsLCOW, error) {
 	opt, err := oci.SpecToUVMCreateOpts(ctx,
 		&specs.Spec{
@@ -906,7 +962,7 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	if c.IsSet(kernelArgsArgName) {
 		options.KernelBootOptions = c.String(kernelArgsArgName)
 	}
-	if c.Bool(sharedMemoryTwoUVMArgName) {
+	if c.Bool(sharedMemoryTwoUVMArgName) && !c.Bool(protectedSharedMemoryArgName) {
 		role, err := sharedMemoryProofRole(id)
 		if err != nil {
 			return nil, err
@@ -993,17 +1049,13 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
 		options.SecurityPolicyEnabled = true
-		bundleDirectory, err := os.MkdirTemp(
-			"",
-			fmt.Sprintf("uvmboot-snp-%s-", id),
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"create temporary SNP bundle directory: %w",
-				err,
-			)
+		if !c.Bool(protectedSharedMemoryArgName) {
+			bundleDirectory, err := newLCOWBundleDirectory(id)
+			if err != nil {
+				return nil, err
+			}
+			options.BundleDirectory = bundleDirectory
 		}
-		options.BundleDirectory = bundleDirectory
 		options.AllowOvercommit = false
 
 		if !c.IsSet(noVerityBoot) {
@@ -1017,6 +1069,18 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	}
 
 	return options, nil
+}
+
+// newLCOWBundleDirectory creates an empty, caller-owned directory for one SNP
+// VM's private boot copies. id identifies the diagnostic name, not an existing
+// directory. Failure returns no usable path; the caller must remove the returned
+// directory only after all VM/native ownership of its contents has drained.
+func newLCOWBundleDirectory(id string) (string, error) {
+	directory, err := os.MkdirTemp("", fmt.Sprintf("uvmboot-snp-%s-", id))
+	if err != nil {
+		return "", fmt.Errorf("create temporary SNP bundle directory: %w", err)
+	}
+	return directory, nil
 }
 
 // parseAnnotations parses the annotations from the [cli.StringSliceFlag] specified by `name`.
@@ -1050,6 +1114,13 @@ func parseAnnotations(ctx context.Context, c *cli.Context, name string) map[stri
 	return annots
 }
 
+// runLCOW owns creation/start and the existing deferred cleanup for one worker,
+// then performs the selected guest setup/workload and observes its lifetime.
+// Shared-memory page indices remain full-width; invalid byte conversions and
+// mappingObserver errors propagate without executing a wrapped guest address.
+// The observer borrows region copies for the call and must synchronize shared
+// state across workers. Callers must not mutate options or c concurrently;
+// context budgets and the existing cleanup/error policies remain in force.
 func runLCOW(
 	ctx context.Context,
 	options *uvm.OptionsLCOW,
@@ -1116,7 +1187,9 @@ func runLCOW(
 				"shared-memory mapping not queryable before UVM start",
 			)
 		} else {
-			logSharedMemoryRegions(vm.ID(), "before start", preStartRegions)
+			if err := logSharedMemoryRegions(vm.ID(), "before start", preStartRegions); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1183,7 +1256,9 @@ func runLCOW(
 		}
 
 		if len(regions) > 0 {
-			logSharedMemoryRegions(vm.ID(), phase, regions)
+			if err := logSharedMemoryRegions(vm.ID(), phase, regions); err != nil {
+				return err
+			}
 			mappedRegions = regions
 		}
 		if mappingObserver != nil && len(regions) > 0 {
@@ -1566,6 +1641,11 @@ func siblingEventModuleArgs(route hcsschema.SiblingCommunicationRouteInfo) strin
 	)
 }
 
+// sharedMemoryGuestModuleCommand builds, but does not execute, a diagnostic
+// module command for the configured section and full native GPA page index.
+// Length is bytes; checked conversion rejects unaligned/overflowing ranges.
+// Section/geometry errors return no usable command. Inputs are borrowed values;
+// the returned string is caller-owned and no VM or shared state is modified.
 func sharedMemoryGuestModuleCommand(
 	modulePath string,
 	configured hcsschema.SharedMemoryRegion,
@@ -1588,7 +1668,11 @@ func sharedMemoryGuestModuleCommand(
 		)
 	}
 
-	byteGPA := uint64(uint32(mapped.GuestPhysicalAddress)) << 12
+	byteGPA, err := uvm.SharedMemoryByteGPA(mapped.GuestPhysicalAddress, int64(configured.Length))
+	if err != nil {
+		return "", fmt.Errorf("shared-memory section %q page index %#x: %w",
+			configured.SectionName, mapped.GuestPhysicalAddress, err)
+	}
 	return fmt.Sprintf(
 		"set -eu; insmod %s gpa=%#x length=%#x decrypted=1 "+
 			"read_only=0 role=%s%s; "+
@@ -1779,8 +1863,19 @@ func guestWaitFor(cond, what string) string {
 		"sleep 1; done; "
 }
 
-const siblingTransportVersion = 4
+// siblingTransportVersion is the exact guest transport version required by both
+// ordinary and protected sibling startup. The temporary whole-checkout baseline
+// is vsock-tun-forward f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91: transport v3,
+// distinct from its v1, 52-byte native discovery descriptor with one doorbell.
+// This guard does not negotiate versions or accept transport v4.
+const siblingTransportVersion = 3
 
+// siblingInstanceDiscoveryCommand returns shell setup for exactly one ready
+// sibling link. When executed in the guest, it waits up to guestWaitFor's budget,
+// reads the pinned sysfs field order into sb_bus/sb_local/sb_peer, and exits
+// nonzero on link-count, readiness or exact transport-version failure. Both
+// ordinary and protected callers use this guard; it does not parse the native
+// discovery descriptor or implement the guest-to-guest wire protocol.
 func siblingInstanceDiscoveryCommand() string {
 	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
 		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +
@@ -1940,23 +2035,36 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 		`dmesg | grep -E 'diode_net|hv_netvsc' || [ "$?" -eq 1 ]`
 	return cmd
 }
+
+// logSharedMemoryRegions prints full native page indices and checked byte GPAs.
+// Region properties lack lengths, so conversion validates the minimum 4-KiB span;
+// command generation separately validates the configured full byte range.
+// An invalid conversion returns VM/section/phase and the original full page index,
+// never a wrapped address. Region values are borrowed without mutation; output
+// uses the existing stdout diagnostic path, which concurrent workers may share.
 func logSharedMemoryRegions(
 	uvmID string,
 	phase string,
 	regions []hcsschema.SharedMemoryRegionInfo,
-) {
+) error {
 	for _, region := range regions {
-		rawAddress := uint32(region.GuestPhysicalAddress)
+		rawAddress := region.GuestPhysicalAddress
+		byteGPA, err := uvm.SharedMemoryByteGPA(rawAddress, 4096)
+		if err != nil {
+			return fmt.Errorf("UVM %s: shared-memory section %q mapped %s at page index %#x: %w",
+				uvmID, region.SectionName, phase, rawAddress, err)
+		}
 		fmt.Printf(
-			"UVM %s: shared-memory section %q mapped %s at raw address %#x; "+
-				"if page-based, byte GPA is %#x\n",
+			"UVM %s: shared-memory section %q mapped %s at page index %#x; "+
+				"byte GPA is %#x\n",
 			uvmID,
 			region.SectionName,
 			phase,
 			rawAddress,
-			uint64(rawAddress)<<12,
+			byteGPA,
 		)
 	}
+	return nil
 }
 
 func observeLCOW(
