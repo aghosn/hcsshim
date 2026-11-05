@@ -85,6 +85,36 @@ func TestProtectedSharedExchangeReceipt(t *testing.T) {
 	}
 }
 
+// TestProtectedSharedHostWriteCountWorkaround limits the denial-only workaround
+// to the exact unknown-fault-address count with ERROR_PARTIAL_COPY.
+func TestProtectedSharedHostWriteCountWorkaround(t *testing.T) {
+	const address = uintptr(0x100100)
+	badCount := ^uintptr(0) - address
+	for _, test := range []struct {
+		name    string
+		address uintptr
+		written uintptr
+		err     error
+		want    bool
+	}{
+		{"known-defect", address, badCount, windows.ERROR_PARTIAL_COPY, true},
+		{"wrapped-error", address, badCount, fmt.Errorf("write: %w", windows.ERROR_PARTIAL_COPY), true},
+		{"different-address", address + 1, badCount, windows.ERROR_PARTIAL_COPY, false},
+		{"different-count", address, badCount - 1, windows.ERROR_PARTIAL_COPY, false},
+		{"partial-write", address, 1, windows.ERROR_PARTIAL_COPY, false},
+		{"zero-count", address, 0, windows.ERROR_PARTIAL_COPY, false},
+		{"different-error", address, badCount, windows.ERROR_NOACCESS, false},
+		{"success", address, badCount, nil, false},
+		{"plausible-count", ^uintptr(0) - 8, 8, windows.ERROR_PARTIAL_COPY, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := proofHostWriteCountUnreliable(test.address, test.written, test.err); got != test.want {
+				t.Fatalf("unreliable write count = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 // TestProtectedSharedHostProbeAllPages checks ordinary owned mappings only:
 // every page must receive a sentinel and a correctly indexed evidence record.
 // No native ProtectedShared operation, VM or protection claim is involved.
