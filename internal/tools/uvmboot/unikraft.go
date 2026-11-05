@@ -151,7 +151,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	}
 	defer func() { resultErr = errors.Join(resultErr, log.Close()) }()
 	consoleCtx, cancelConsole := context.WithCancel(context.Background())
-	consoleDone, ready := make(chan error, 1), make(chan struct{})
+	consoleDone, ready := make(chan error, 1), make(chan time.Time, 1)
 	go func() {
 		stopAccept := context.AfterFunc(consoleCtx, func() { _ = listener.Close() })
 		defer stopAccept()
@@ -170,10 +170,12 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 		// VM teardown closes the serial peer; cancellation also unblocks accept/read.
 		<-consoleDone
 	}()
+	createStarted := time.Now()
 	vm, err := uvm.CreateLCOW(ctx, options)
 	if err != nil {
 		return err
 	}
+	createElapsed := time.Since(createStarted)
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -182,6 +184,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 			resultErr = errors.Join(resultErr, fmt.Errorf("close Unikraft UVM; retaining boot state %s and endpoint: %w", bundle, err))
 		}
 	}()
+	startRequested := time.Now()
 	if err := vm.Start(ctx); err != nil {
 		return err
 	}
@@ -199,7 +202,14 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
 	select {
-	case <-ready:
+	case readyAt := <-ready:
+		if _, err := fmt.Fprintf(io.MultiWriter(log, os.Stdout),
+			"unikraft_boot_timing: create_ms=%.3f start_to_provider_ready_ms=%.3f create_to_provider_ready_ms=%.3f\n",
+			float64(createElapsed)/float64(time.Millisecond),
+			float64(readyAt.Sub(startRequested))/float64(time.Millisecond),
+			float64(readyAt.Sub(createStarted))/float64(time.Millisecond)); err != nil {
+			return fmt.Errorf("write Unikraft boot timing: %w", err)
+		}
 		fmt.Println("Unikraft diode: direct SNP/provider startup observed; dataplane tests run in the workload")
 	case <-ctx.Done():
 		return fmt.Errorf("unikraft stopped before SNP/provider startup was observed: %w", ctx.Err())
@@ -225,7 +235,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	}
 }
 
-func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- struct{}) error {
+func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 65536)
 	snp, offers, provider, reported := false, false, false, false
@@ -248,7 +258,7 @@ func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- str
 			provider = true
 		}
 		if snp && offers && provider && !reported {
-			close(ready)
+			ready <- time.Now()
 			reported = true
 		}
 	}

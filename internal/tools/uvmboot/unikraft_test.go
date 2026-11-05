@@ -160,16 +160,20 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 				input = append(input, line)
 			}
 		}
-		ready := make(chan struct{})
+		ready := make(chan time.Time, 1)
 		var log bytes.Buffer
+		before := time.Now()
 		err := captureUnikraftConsole(strings.NewReader(strings.Join(input, "\n")), &log, ready)
 		if !errors.Is(err, io.EOF) {
 			t.Fatal(err)
 		}
 		select {
-		case <-ready:
+		case readyAt := <-ready:
 			if omit != -1 {
 				t.Fatal("reported incomplete boot as ready")
+			}
+			if readyAt.Before(before) || readyAt.After(time.Now()) {
+				t.Fatal("readiness timestamp is outside console observation")
 			}
 		default:
 			if omit == -1 {
@@ -179,7 +183,7 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 	}
 	for _, version := range []string{"2", "3", "40", ""} {
 		input := strings.Replace(strings.Join(lines, "\n"), "protocol=4", "protocol="+version, 1)
-		ready := make(chan struct{})
+		ready := make(chan time.Time, 1)
 		err := captureUnikraftConsole(strings.NewReader(input), io.Discard, ready)
 		if err == nil || errors.Is(err, io.EOF) {
 			t.Fatalf("accepted incompatible provider version %q: %v", version, err)
@@ -189,6 +193,21 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 			t.Fatalf("reported incompatible provider version %q as ready", version)
 		default:
 		}
+	}
+}
+
+func TestUnikraftConsoleTimestampsReadinessOnlyOnce(t *testing.T) {
+	input := "hyperv: isolation type 2 (SNP), paravisor absent\n" +
+		"vmbus: all offers delivered\n" +
+		"sibling: provider ready protocol=4; waiting for Linux workload\n"
+	ready := make(chan time.Time, 1)
+	var output bytes.Buffer
+	err := captureUnikraftConsole(strings.NewReader(input+input), &output, ready)
+	if !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if len(ready) != 1 || output.String() != input+input {
+		t.Fatal("duplicate readiness changed its timestamp or console output")
 	}
 }
 
