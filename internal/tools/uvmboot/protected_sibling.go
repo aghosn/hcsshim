@@ -77,9 +77,11 @@ type protectedSiblingPair struct {
 
 // protectedPartitionSeal is serial-owner evidence, not native partition state.
 // selected distinguishes omission from zero. Times are UTC wall-clock strings
-// for HV-event correlation; dispatched is learned only from S4's actual outcome.
-// A committed attempt can be canceled before submission, and any dispatched
-// error leaves effects uncertain. No retry, rollback or pair atomicity exists.
+// for HV-event correlation; dispatched follows S4's submission-attempt evidence,
+// recorded before optional-export lookup. Lookup failure can therefore report
+// dispatched without entering native code; it proves neither execution nor
+// effects. Dispatched errors are conservatively uncertain here. No retry,
+// rollback or pair atomicity exists.
 type protectedPartitionSeal struct {
 	role       string
 	vmID       string
@@ -135,7 +137,10 @@ func (p *protectedSiblingPair) reportSeal(s *protectedPartitionSeal) {
 // Each operation receives a fresh budget excluding pause wall time. The gate
 // checks parent/pair liveness immediately before committing an attempt; stop or
 // exit completed before that gate prevents it. Cancellation after commitment
-// can race native submission: S4 checks ctx again and reports actual dispatch.
+// can race submission: S4 checks ctx again and reports a submission attempt,
+// recorded before wrapper export lookup. A missing HcsSystemControl export can
+// therefore report dispatched without native entry; execution/effects are not
+// established by dispatched alone.
 // No native syscall is abandoned for a timeout; callers retain both VM owners
 // through return. First error (even pre-dispatch) prevents every later call.
 func (p *protectedSiblingPair) sealPartitions() error {
@@ -156,8 +161,8 @@ func (p *protectedSiblingPair) sealPartitions() error {
 		}
 		s.attemptAt = time.Now().UTC().Format(time.RFC3339Nano)
 		p.forwardMu.Unlock()
-		// Commitment is NOT evidence of native dispatch. Only the return
-		// contract below can distinguish no submission from unknown effects.
+		// Commitment is NOT submission-attempt evidence. S4's return
+		// contract supplies that evidence, not proof of native entry/effects.
 		err := p.workers[i].vm.SealPartition(ctx, s.mask)
 		cancel()
 		s.finishedAt = time.Now().UTC().Format(time.RFC3339Nano)
