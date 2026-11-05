@@ -5,6 +5,7 @@ package uvm
 import (
 	"context"
 	"encoding/base64"
+	stderrors "errors"
 	"fmt"
 	"maps"
 	"net"
@@ -12,12 +13,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/copyfile"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/logfields"
 	"github.com/Microsoft/hcsshim/internal/ot"
@@ -114,6 +117,12 @@ type OptionsLCOW struct {
 	PolicyBasedRouting            bool                                     // Whether we should use policy based routing when configuring net interfaces in guest
 	WritableOverlayDirs           bool                                     // Whether init should create writable overlay mounts for /var and /etc
 	Appliance                     *LCOWApplianceOptions                    // Explicit no-GCS, standalone VMGS guest
+
+	// ProtectedSharedResources are borrowed capabilities for native startup.
+	// The pair owner keeps originals through creation/start and cleanup, retaining
+	// them on uncertain failure. HCS duplicates handles; these never enter JSON
+	// option logs or the VM document. Native startup may revoke RP access.
+	ProtectedSharedResources []hcsv2.OperationResource `json:"-"`
 }
 
 // NewDefaultOptionsLCOW creates the default options for a bootable version of
@@ -968,7 +977,11 @@ func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcs
 
 // CreateLCOW creates an HCS compute system representing a utility VM. It
 // consumes a set of options derived from various defaults and options
-// expressed as annotations.
+// expressed as annotations. Protected capabilities are borrowed, not transferred;
+// errors attempt independent bounded native cleanup without proving zero backing
+// progress. The caller retains originals on uncertainty. A successful returned VM
+// is caller-owned and not started; native Start performs protected setup, not GCS.
+// opts and the not-yet-published VM require exclusive access during creation.
 func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error) {
 	ctx, span := ot.StartSpan(ctx, "uvm::CreateLCOW")
 	defer span.End()
@@ -1011,7 +1024,13 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 
 	defer func() {
 		if err != nil {
-			uvm.Close()
+			if len(opts.ProtectedSharedResources) == 0 {
+				uvm.Close()
+			} else {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				err = stderrors.Join(err, uvm.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
@@ -1048,7 +1067,7 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 		return nil, err
 	}
 
-	if err = uvm.create(ctx, doc); err != nil {
+	if err = uvm.create(ctx, doc, opts.ProtectedSharedResources...); err != nil {
 		return nil, fmt.Errorf("error while creating the compute system: %w", err)
 	}
 	if logrus.IsLevelEnabled(logrus.TraceLevel) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/sirupsen/logrus"
@@ -162,10 +163,15 @@ func verifyWCOWBootFiles(bootFiles *WCOWBootFiles) error {
 	return nil
 }
 
-// Verifies that the final UVM options are correct and supported.
+// VerifyOptions checks supported UVM options without allocating native resources.
+// LCOW protected settings require an explicit non-hidden startup role and matching
+// borrowed capabilities. Errors leave ownership with the caller.
 func VerifyOptions(_ context.Context, options interface{}) error {
 	switch opts := options.(type) {
 	case *OptionsLCOW:
+		if err := validateProtectedSharedOptions(opts); err != nil {
+			return err
+		}
 		if opts.Appliance != nil {
 			if opts.GuestStateFilePath == "" || !opts.SecurityPolicyEnabled ||
 				opts.HclEnabled == nil || *opts.HclEnabled ||
@@ -312,16 +318,29 @@ func (uvm *UtilityVM) OS() string {
 	return uvm.operatingSystem
 }
 
-func (uvm *UtilityVM) create(ctx context.Context, doc interface{}) error {
+// create creates the HCS system and caches its runtime identity on success.
+// Optional resources are borrowed through completion, never serialized or closed
+// here. Failure returns no usable system and attempts bounded private cleanup;
+// it does not authorize releasing originals or infer zero protected progress.
+// The caller exclusively owns this not-yet-published UtilityVM during creation.
+func (uvm *UtilityVM) create(ctx context.Context, doc interface{}, resources ...hcs.OperationResource) (err error) {
 	uvm.exitCh = make(chan struct{})
-	system, err := hcs.CreateComputeSystem(ctx, uvm.id, doc)
+	system, err := hcs.CreateComputeSystemWithResources(ctx, uvm.id, doc, resources)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if system != nil {
-			_ = system.Terminate(ctx)
-			_ = system.WaitCtx(ctx)
+			if len(resources) == 0 {
+				_ = system.Terminate(ctx)
+				_ = system.WaitCtx(ctx)
+			} else {
+				// Identity-query failure must not abandon native cleanup just
+				// because the create budget expired. Originals remain borrowed.
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				err = errors.Join(err, system.Terminate(cleanupCtx), system.WaitCtx(cleanupCtx), system.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 

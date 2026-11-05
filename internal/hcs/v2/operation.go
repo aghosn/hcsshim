@@ -5,6 +5,8 @@ package hcsv2
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,6 +21,44 @@ const infiniteTimeout = ^uint32(0)
 // HcsWaitForOperationResult when the wait elapses while HCS is still
 // tracking the operation.
 const hcsErrOperationTimeout = syscall.Errno(0x80370118)
+
+// OperationResource supplies a capability, not a serialized numeric handle.
+// The caller owns Handle and keeps it open through the resource-bearing call.
+// Native attachment duplicates it; HCS owns the duplicate through operation
+// completion, including cancellation. URI must match the consuming schema.
+type OperationResource struct {
+	Type   uint32
+	URI    string
+	Handle syscall.Handle
+}
+
+// attachOperationResources validates the complete borrowed list before attaching
+// any capability. The operation must not yet have been dispatched and must be
+// exclusively owned by the caller. Failure prevents dispatch; operation close
+// releases any attached prefix, never the originals. Unknown types fail locally;
+// an unavailable native attachment export returns its actual lookup error.
+func attachOperationResources(ctx context.Context, op computecore.HcsOperation, resources []OperationResource) error {
+	seen := make(map[string]bool, len(resources))
+	for _, r := range resources {
+		if r.URI == "" || strings.ContainsRune(r.URI, '\x00') || seen[r.URI] ||
+			r.Handle == 0 || r.Handle == syscall.InvalidHandle {
+			return errors.New("invalid or duplicate HCS operation resource")
+		}
+		switch r.Type {
+		case computecore.HcsResourceTypeFile, computecore.HcsResourceTypeJob,
+			computecore.HcsResourceTypeComObject, computecore.HcsResourceTypeSocket:
+		default:
+			return fmt.Errorf("unsupported HCS operation resource type %d", r.Type)
+		}
+		seen[r.URI] = true
+	}
+	for _, r := range resources {
+		if err := computecore.HcsAddResourceToOperation(ctx, op, r.Type, r.URI, r.Handle); err != nil {
+			return fmt.Errorf("attach HCS operation resource %q: %w", r.URI, err)
+		}
+	}
+	return nil
+}
 
 // waitTimeoutMs derives the TimeoutMs argument for HcsWaitForOperationResult
 // from ctx's deadline. With no deadline (or one already past) it falls back

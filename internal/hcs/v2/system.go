@@ -69,8 +69,19 @@ func siloNameFmt(containerID string) string {
 	return fmt.Sprintf(`\Container_%s`, containerID)
 }
 
-// CreateComputeSystem creates a new compute system with the given configuration but does not start it.
+// CreateComputeSystem creates but does not start a caller-owned system without
+// capabilities. Close releases the returned handle; errors return no system.
 func CreateComputeSystem(ctx context.Context, id string, hcsDocumentInterface interface{}) (_ *System, err error) {
+	return CreateComputeSystemWithResources(ctx, id, hcsDocumentInterface, nil)
+}
+
+// CreateComputeSystemWithResources attaches borrowed capabilities before create
+// dispatch and returns an owned, not-started system. Originals must stay open
+// through return; native HCS owns its duplicates. Errors return no system and
+// attempt bounded native cleanup, but do not establish that no participant or
+// backing was acquired. The resource owner must retain originals on uncertainty.
+// Ordinary nil-resource creation preserves its existing cleanup behavior.
+func CreateComputeSystemWithResources(ctx context.Context, id string, hcsDocumentInterface interface{}, resources []OperationResource) (_ *System, err error) {
 	operation := "hcs::CreateComputeSystem"
 
 	ctx, span := ot.StartSpan(ctx, operation)
@@ -93,14 +104,39 @@ func CreateComputeSystem(ctx context.Context, id string, hcsDocumentInterface in
 	// including a synchronous create failure.
 	defer func() {
 		if err != nil {
-			_ = computeSystem.Terminate(ctx)
-			computeSystem.Close()
+			if len(resources) == 0 {
+				_ = computeSystem.Terminate(ctx)
+				computeSystem.Close()
+			} else {
+				// Cleanup cannot inherit an expired creation deadline. A lost
+				// observation is not proof of native reference drainage.
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cleanupCancel()
+				err = errors.Join(err, computeSystem.Terminate(cleanupCtx))
+				if computeSystem.notificationID != 0 {
+					err = errors.Join(err, computeSystem.WaitCtx(cleanupCtx))
+				}
+				err = errors.Join(err, computeSystem.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
 	createCtx, cancel := context.WithTimeout(ctx, timeout.SystemCreate)
 	defer cancel()
 	_, createErr := runOperation(createCtx, func(op computecore.HcsOperation) error {
+		if len(resources) != 0 {
+			if err := createCtx.Err(); err != nil {
+				return err
+			}
+		}
+		if err := attachOperationResources(createCtx, op, resources); err != nil {
+			return err
+		}
+		if len(resources) != 0 {
+			if err := createCtx.Err(); err != nil {
+				return err
+			}
+		}
 		var hErr error
 		computeSystem.handle, hErr = computecore.HcsCreateComputeSystem(ctx, id, hcsDocument, op, nil)
 		return hErr
@@ -937,31 +973,103 @@ func (computeSystem *System) CloseCtx(ctx context.Context) (err error) {
 	return nil
 }
 
-// Modify the System by sending a request to HCS
+// Modify submits a JSON update without capabilities and waits for HCS completion.
+// Failure does not prove that the update had no effect.
 func (computeSystem *System) Modify(ctx context.Context, config interface{}) error {
+	return computeSystem.ModifyWithResources(ctx, config, nil)
+}
+
+// ModifyWithResources borrows resources through attachment/submission/completion,
+// returning the actual HCS error. The caller retains originals and serializes
+// action/receipt pairs; properties are cached observations, not live inventory.
+func (computeSystem *System) ModifyWithResources(ctx context.Context, config interface{}, resources []OperationResource) error {
+	_, err := computeSystem.ModifyWithResourcesOutcome(ctx, config, resources)
+	return err
+}
+
+// ModifyWithResourcesOutcome is ModifyWithResources with a submission indicator.
+// Dispatched becomes true immediately before invoking the native Modify wrapper,
+// after handle, JSON, cancellation and attachment checks. It is an attempt, not
+// proof of native execution (including an export lookup failure). The system
+// read lock excludes Close through the operation wait and close. A timeout or
+// error after dispatch is not proof of zero work; no retry is performed.
+// Cancellation prechecks apply only to resource-bearing calls, preserving the
+// existing nil-resource Modify behavior and operation lifetime contract.
+func (computeSystem *System) ModifyWithResourcesOutcome(ctx context.Context, config interface{}, resources []OperationResource) (dispatched bool, err error) {
 	computeSystem.handleLock.RLock()
 	defer computeSystem.handleLock.RUnlock()
 
 	operation := "hcs::System::Modify"
 
 	if computeSystem.handle == 0 {
-		return makeSystemError(computeSystem, operation, ErrAlreadyClosed)
+		return false, makeSystemError(computeSystem, operation, ErrAlreadyClosed)
 	}
 
 	requestBytes, err := json.Marshal(config)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	requestJSON := string(requestBytes)
 
 	_, callErr := runOperation(ctx, func(op computecore.HcsOperation) error {
+		if len(resources) != 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if err := attachOperationResources(ctx, op, resources); err != nil {
+			return err
+		}
+		if len(resources) != 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		dispatched = true
 		return computecore.HcsModifyComputeSystem(ctx, computeSystem.handle, op, requestJSON, 0)
 	})
 	if callErr != nil {
-		return makeSystemError(computeSystem, operation, callErr)
+		return dispatched, makeSystemError(computeSystem, operation, callErr)
 	}
-	return nil
+	return dispatched, nil
+}
+
+// SystemControl submits a URI command and waits for its real operation result.
+// It discards output, never downgrades missing exports and never retries.
+// Failure/cancellation cannot establish that an irreversible command had no effect.
+func (computeSystem *System) SystemControl(ctx context.Context, uri, input string) error {
+	_, err := computeSystem.SystemControlOutcome(ctx, uri, input)
+	return err
+}
+
+// SystemControlOutcome reports whether native submission was attempted, not
+// whether native execution began. It holds the system read lock through the
+// native-lifetime-safe operation wait/close, excluding concurrent Close.
+// Closed handles, invalid strings and already-canceled contexts do not dispatch.
+// Errors after dispatch (including missing exports) leave effects uncertain.
+func (computeSystem *System) SystemControlOutcome(ctx context.Context, uri, input string) (dispatched bool, err error) {
+	computeSystem.handleLock.RLock()
+	defer computeSystem.handleLock.RUnlock()
+
+	operation := "hcs::System::SystemControl"
+	if computeSystem.handle == 0 {
+		return false, makeSystemError(computeSystem, operation, ErrAlreadyClosed)
+	}
+	if uri == "" || strings.ContainsRune(uri, '\x00') || strings.ContainsRune(input, '\x00') {
+		return false, makeSystemError(computeSystem, operation, errors.New("invalid HCS control URI or input"))
+	}
+	_, callErr := runOperation(ctx, func(op computecore.HcsOperation) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dispatched = true
+		return computecore.HcsSystemControl(ctx, computeSystem.handle, op, uri, input)
+	})
+	if callErr != nil {
+		return dispatched, makeSystemError(computeSystem, operation, callErr)
+	}
+	return dispatched, nil
 }
 
 // SetCPUGroupAffinities pins the container's server silo to the given processor

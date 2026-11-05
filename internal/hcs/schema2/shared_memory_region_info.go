@@ -9,8 +9,140 @@
 
 package hcsschema
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
 type SharedMemoryRegionInfo struct {
 	SectionName string `json:"SectionName,omitempty"`
 
-	GuestPhysicalAddress int32 `json:"GuestPhysicalAddress,omitempty"`
+	// GuestPhysicalAddress is a 4-KiB page index, NOT a byte address. The native
+	// wire value is uint64; consumers must check shift/range overflow.
+	GuestPhysicalAddress uint64 `json:"GuestPhysicalAddress,omitempty"`
+
+	ProtectedShared *ProtectedSharedRegionInfo `json:"ProtectedShared,omitempty"`
+}
+
+// ProtectedSharedRegionInfo is the complete private v2 cached last-action
+// receipt, not live HV inventory. InitializedPages retains the known initialized
+// prefix across Install/Remove/action resets; it is not unreclaimed/live pages.
+// OperationResultValid describes only the actual last native result. Successful
+// Install/Remove have local HRESULT/owner flags, false validity and zero native
+// status/prefix. Counts use 4-KiB pages; LeaseId is opaque, never a HANDLE.
+type ProtectedSharedRegionInfo struct {
+	Version              uint32 `json:"Version"`
+	Prepared             bool   `json:"Prepared"`
+	Installed            bool   `json:"Installed"`
+	Removed              bool   `json:"Removed"`
+	LeaseId              uint64 `json:"LeaseId"`
+	PageCount            uint64 `json:"PageCount"`
+	InitializedPages     uint64 `json:"InitializedPages"`
+	OperationHresult     uint32 `json:"OperationHresult"`
+	OperationStatus      uint32 `json:"OperationStatus"`
+	OperationResultValid bool   `json:"OperationResultValid"`
+	PagesProcessed       uint32 `json:"PagesProcessed"`
+}
+
+// decodeProtectedSharedObject requires exact, complete nonnull private fields.
+// It rejects unknown/case-folded/duplicate names before typed width decoding.
+// destination must be a fresh caller-exclusive value, unpublished on failure;
+// this helper does not validate action semantics or confer native authority.
+func decodeProtectedSharedObject(data []byte, required []string, destination any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, name := range required {
+		raw, present := fields[name]
+		if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("missing or null private field %q", name)
+		}
+		delete(fields, name)
+	}
+	for name := range fields {
+		return fmt.Errorf("unexpected private field %q", name)
+	}
+
+	// json.Unmarshal accepts duplicate keys; private receipts must not silently
+	// replace an earlier identity/status field with a later one.
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if _, err := decoder.Token(); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(required))
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := token.(string)
+		if !ok || seen[name] {
+			return fmt.Errorf("invalid or duplicate private field %q", name)
+		}
+		seen[name] = true
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return err
+		}
+	}
+	return json.Unmarshal(data, destination)
+}
+
+// UnmarshalJSON publishes a complete v2 receipt atomically. Missing/null/unknown
+// fields, invalid widths and other versions preserve the receiver and fail.
+// The caller exclusively owns p; action/identity validation belongs to consumers.
+func (p *ProtectedSharedRegionInfo) UnmarshalJSON(data []byte) error {
+	type region ProtectedSharedRegionInfo
+	var next region
+	err := decodeProtectedSharedObject(data, []string{
+		"Version", "Prepared", "Installed", "Removed", "LeaseId", "PageCount",
+		"InitializedPages", "OperationHresult", "OperationStatus",
+		"OperationResultValid", "PagesProcessed",
+	}, &next)
+	if err != nil {
+		return fmt.Errorf("decode ProtectedSharedRegionInfo: %w", err)
+	}
+	if next.Version != 2 {
+		return fmt.Errorf("unsupported protected receipt version %d", next.Version)
+	}
+	*p = ProtectedSharedRegionInfo(next)
+	return nil
+}
+
+// UnmarshalJSON preserves ordinary optional/permissive region decoding, but a
+// present protected member requires the entire exact outer frame and nonnull
+// v2 receipt. Case-folded private names cannot silently become ordinary data.
+// Errors preserve the exclusively owned receiver; no partial receipt is valid.
+func (p *SharedMemoryRegionInfo) UnmarshalJSON(data []byte) error {
+	type region SharedMemoryRegionInfo
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	protected := false
+	for name := range fields {
+		if strings.EqualFold(name, "ProtectedShared") {
+			protected = true
+		}
+	}
+	var next region
+	if protected {
+		if err := decodeProtectedSharedObject(data, []string{
+			"SectionName", "GuestPhysicalAddress", "ProtectedShared",
+		}, &next); err != nil {
+			return err
+		}
+	} else {
+		// Ordinary decoding retains omitted receiver fields (including null's
+		// no-op behavior), unlike private frames which must be complete.
+		next = region(*p)
+		if err := json.Unmarshal(data, &next); err != nil {
+			return err
+		}
+	}
+	*p = SharedMemoryRegionInfo(next)
+	return nil
 }

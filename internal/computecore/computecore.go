@@ -56,6 +56,9 @@ import (
 //sys hcsSaveComputeSystem(computeSystem HcsSystem, operation HcsOperation, options string) (hr error) = computecore.HcsSaveComputeSystem?
 //sys hcsGetComputeSystemProperties(computeSystem HcsSystem, operation HcsOperation, propertyQuery string) (hr error) = computecore.HcsGetComputeSystemProperties?
 //sys hcsModifyComputeSystem(computeSystem HcsSystem, operation HcsOperation, configuration string, identity syscall.Handle) (hr error) = computecore.HcsModifyComputeSystem?
+// hcsSystemControl borrows system/operation and UTF-16 strings through submission.
+// Optional-export lookup and HRESULT failures propagate without a fallback.
+//sys hcsSystemControl(computeSystem HcsSystem, operation HcsOperation, uri string, input string) (hr error) = computecore.HcsSystemControl?
 //sys hcsWaitForComputeSystemExit(computeSystem HcsSystem, timeoutMs uint32, result **uint16) (hr error) = computecore.HcsWaitForComputeSystemExit?
 //sys hcsSetComputeSystemCallback(computeSystem HcsSystem, callbackOptions uint32, context uintptr, callback uintptr) (hr error) = computecore.HcsSetComputeSystemCallback?
 
@@ -565,6 +568,21 @@ func HcsModifyComputeSystem(ctx gcontext.Context, computeSystem HcsSystem, opera
 
 	return execute(ctx, timeout.SyscallWatcher, func() error {
 		return hcsModifyComputeSystem(computeSystem, operation, configuration, identity)
+	})
+}
+
+// HcsSystemControl submits a URI-routed command; success is submission only.
+// The caller keeps both handles alive and waits on operation for completion.
+// execute preserves native-call lifetimes on cancellation/watchdog expiry.
+// Missing exports return the real lookup error, never a successful downgrade.
+func HcsSystemControl(ctx gcontext.Context, computeSystem HcsSystem, operation HcsOperation, uri, input string) (hr error) {
+	ctx, span := ot.StartSpan(ctx, "HcsSystemControl")
+	defer span.End()
+	defer func() { ot.SetSpanStatus(span, hr) }()
+	span.SetAttributes(attribute.String("uri", uri))
+
+	return execute(ctx, timeout.SyscallWatcher, func() error {
+		return hcsSystemControl(computeSystem, operation, uri, input)
 	})
 }
 
