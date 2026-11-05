@@ -83,7 +83,9 @@ var protectedSiblingRetained struct {
 // CPU groups, HNS endpoints or temporary boot copies are allocated. The route
 // requires two direct-SNP Linux workers and GCS only for subsequent tools.
 // It returns no partially valid configuration; explicit diagnostic, baseline,
-// benchmark, storage export and appliance options never fall through.
+// benchmark, storage export and appliance options never fall through. Geometry
+// must satisfy the matched merged transport's descriptor gate as well as native
+// alignment/schema bounds; acceptance is not a service-allocation guarantee.
 func validateProtectedSiblingCLI(c *cli.Context) error {
 	if !useGCS || c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		!c.Bool(securityHardwareFlag) || !c.Bool(siblingInteractiveArgName) ||
@@ -110,8 +112,9 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 		}
 	}
 	size := c.Uint64(sharedMemorySizeArgName)
-	if size == 0 || size%protectedPageBytes != 0 || size > protectedMaxBytes {
-		return fmt.Errorf("protected --shared-memory-size must be page-aligned bytes in %d..%d", protectedPageBytes, protectedMaxBytes)
+	if size < protectedTransportMinBytes || size > protectedTransportMaxBytes ||
+		size%protectedPageBytes != 0 || size > protectedMaxBytes {
+		return fmt.Errorf("protected --shared-memory-size must be page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
 	}
 	// Missing artifacts are input errors, not a reason to allocate protected
 	// backing and discover the mismatch after root access has been revoked.
@@ -440,8 +443,11 @@ func (p *protectedSiblingPair) watch(v *protectedSiblingVM) {
 // the VM throughout; long-lived services must use the separate lifetime method.
 // Existing cmd cancellation kills the guest process, but cannot abandon an
 // already executing synchronous native/GCS call or release its borrowed owners.
+// Opt-in Wait joins all command-owned callbacks before readiness/return; there
+// is no detached Kill that can subsequently borrow this VM.
 func protectedSiblingGuest(ctx context.Context, v *protectedSiblingVM, command string) error {
 	process := cmd.CommandContext(ctx, v.vm, "sh", "-c", command)
+	process.JoinBackgroundOperations = true
 	process.CopyAfterExitTimeout = 5 * time.Second
 	process.Stdout, process.Stderr = os.Stdout, os.Stderr
 	if err := process.Run(); err != nil {
@@ -572,9 +578,12 @@ func (p *protectedSiblingPair) checkSockets(ctx context.Context) error {
 // separate from bounded setup. cleanup observes Wait within its own deadline,
 // retaining the process/owner if unavailable; any premature exit cancels the
 // experiment. Readiness is independently checked in the guest, never inferred
-// from successful GCS process creation.
+// from successful GCS process creation. service.done is published only after
+// command-owned cancellation/stdio callbacks and Process.Close have completed;
+// an in-flight native/GCS call can delay it beyond the cleanup budget.
 func (p *protectedSiblingPair) startService(v *protectedSiblingVM, command string) error {
 	process := cmd.CommandContext(p.ctx, v.vm, "sh", "-c", command)
+	process.JoinBackgroundOperations = true
 	process.CopyAfterExitTimeout = 5 * time.Second
 	if err := process.Start(); err != nil {
 		return err

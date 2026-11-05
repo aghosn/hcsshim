@@ -130,9 +130,14 @@ func siblingShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.
 // siblingShellSession consumes the existing attach protocol and owns conn and
 // any guest shell until Wait completes. The session and ordinary detached input
 // relay borrow vm. joinInput closes both input-pipe ends and joins that reader
-// before returning; the protected server must close conn on context cancellation
-// to unblock even the initial frame read. Protocol/start failures end this
-// session only, with existing client diagnostics and no backing access.
+// before returning, and opts Cmd into joined stdin/cancellation ownership.
+// Cmd closes the transferred reader when its process wait ends, independently
+// of the frame producer, so a late frame read cannot deadlock stdin drainage.
+// The protected server must close conn on context cancellation to unblock even
+// the initial frame read. Protocol/start failures end this session only, with
+// existing client diagnostics and no backing access. Protected stream drainage
+// has a five-second post-wait budget, but executing native/GCS calls cannot be
+// abandoned; the pair retains VM ownership until the handler actually returns.
 func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, allowContainers, joinInput bool) {
 	defer conn.Close()
 	typ, payload, err := readFrame(conn)
@@ -153,7 +158,16 @@ func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, co
 	if err != nil || typ != frameResize || len(payload) != 4 {
 		return
 	}
+	var cancelSession context.CancelFunc
+	if joinInput {
+		ctx, cancelSession = context.WithCancel(ctx)
+		defer cancelSession()
+	}
 	c := cmd.CommandContext(ctx, vm, "sh")
+	c.JoinBackgroundOperations = joinInput
+	if joinInput {
+		c.CopyAfterExitTimeout = 5 * time.Second
+	}
 	c.Log = log.L.Dup()
 	c.Spec.Terminal = true
 	// Start in the staged tool directory so the demo helpers (./demo.sh and
@@ -185,8 +199,14 @@ func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, co
 		for {
 			typ, payload, err := readFrame(conn)
 			if err != nil {
-				// The client went away: end its shell.
-				_, _ = c.Process.Kill(ctx)
+				// Protected disconnect uses Cmd's tracked cancellation:
+				// a frame read finishing after Wait cannot dispatch a new
+				// untracked Kill against an already-closed process.
+				if joinInput {
+					cancelSession()
+				} else {
+					_, _ = c.Process.Kill(ctx)
+				}
 				return
 			}
 			switch typ {
@@ -204,9 +224,10 @@ func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, co
 	}()
 	_ = c.Wait()
 	if joinInput {
-		// Wait has released the guest process. Closing both directions also
-		// unblocks a frame reader currently writing to the stdin relay, not
-		// only a reader waiting for the next client frame.
+		// Wait has joined Cmd's stdin/cancellation workers, including final
+		// CloseStdin/Kill. Stop resize dispatch, then unblock and join the
+		// separate frame producer before relinquishing its borrowed VM.
+		cancelSession()
 		_ = conn.Close()
 		_ = in.Close()
 		_ = inw.Close()

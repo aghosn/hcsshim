@@ -20,6 +20,12 @@ import (
 const (
 	protectedPageBytes = 4096
 
+	// Matched merged guest gate: vsock-tun-forward/mshv/include/hyperv/
+	// sibling_link.h, sibling_link_validate, called by sibling_bus_probe.
+	// Descriptor admission is necessary, not proof of service-area capacity.
+	protectedTransportMinBytes = 0x20000
+	protectedTransportMaxBytes = 32 << 20
+
 	// SharedMemoryRegion.Length is signed int32 bytes; retain only whole pages.
 	protectedMaxBytes  = math.MaxInt32 & ^(protectedPageBytes - 1)
 	protectedSeal      = 2
@@ -91,7 +97,8 @@ func validateProtectedControllerABI() error {
 }
 
 // newProtectedSiblingMemory creates fresh pagefile backing and an independent
-// VID controller. size is page-aligned bytes within the signed schema bound.
+// VID controller. size is page-aligned bytes within both the signed schema
+// bound and the matched merged transport's inclusive descriptor limits.
 // name must be a unique simple object name. No content view, seed, or pin is
 // acquired here; native allocation/admission can still reject the geometry.
 // On error all acquisitions made here are closed; success transfers ownership
@@ -101,8 +108,9 @@ func newProtectedSiblingMemory(name string, size uint64) (*protectedSiblingMemor
 	if err := validateProtectedControllerABI(); err != nil {
 		return nil, err
 	}
-	if size == 0 || size%protectedPageBytes != 0 || size > protectedMaxBytes {
-		return nil, fmt.Errorf("protected backing requires page-aligned bytes in %d..%d", protectedPageBytes, protectedMaxBytes)
+	if size < protectedTransportMinBytes || size > protectedTransportMaxBytes ||
+		size%protectedPageBytes != 0 || size > protectedMaxBytes {
+		return nil, fmt.Errorf("protected backing requires page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
 	}
 	var session uint32
 	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
