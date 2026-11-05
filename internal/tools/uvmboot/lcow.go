@@ -63,6 +63,7 @@ const (
 	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
 	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
 	siblingOpenShellBundleArgName     = "sibling-openshell-bundle"
+	protectedSharedMemoryArgName      = "protected-shared-memory"
 )
 
 var (
@@ -74,6 +75,11 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  protectedSharedMemoryArgName,
+			Usage: "Run the interactive SNP diode/workload pair with native protected Bootstrap/Import startup; " +
+				"seal backing admission after checked networking, leaving partitions unsealed.",
+		},
 		cli.StringFlag{
 			Name: unikraftPackageArgName,
 			Usage: "Replace only the diode with a standalone SNP VMGS package containing guest.vmgs and launch-manifest.json; " +
@@ -218,7 +224,8 @@ var lcowCommand = cli.Command{
 		cli.StringFlag{
 			Name: siblingBusGuestModuleArgName,
 			Usage: "After the shared-memory guest module, load this matching " +
-				"sibling_bus.ko and wait for the host's sibling-link offer.",
+				"sibling_bus.ko and wait for the host's sibling-link offer. " +
+				"Protected mode skips the ordinary diagnostic module.",
 		},
 		cli.StringFlag{
 			Name: siblingStorageBackendsArgName,
@@ -324,10 +331,15 @@ var lcowCommand = cli.Command{
 	},
 	// Action validates LCOW flags, owns the shared section and worker lifetimes,
 	// and returns setup/worker/mapping failures through the existing cleanup.
+	// Protected opt-in transfers the entire pair lifetime to its separate owner
+	// before ordinary allocation, diagnostics, or independent worker defers.
 	// Mapping-only observations retain full uint64 page indices under mappingMu;
 	// runMany joins workers before comparison. Byte-GPA conversion errors fail
 	// the run rather than allowing wrapped addresses into success diagnostics.
 	Action: func(c *cli.Context) (resultErr error) {
+		if c.Bool(protectedSharedMemoryArgName) {
+			return runProtectedSibling(c)
+		}
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
 			return err
@@ -875,6 +887,13 @@ func init() {
 		`-root-fs-type vhd -shared-memory-size 1048576 -exec "sleep 300"`
 }
 
+// createLCOWOptions translates CLI settings into caller-owned Linux options,
+// including an owned temporary SNP bundle directory when hardware mode is set.
+// The caller removes that directory only after VM ownership drains. Errors
+// return no usable options. Protected mode defers directory allocation to its
+// pair owner until both options have passed preflight, and omits the ordinary
+// diagnostic role; native discovery supplies its guest transport identity.
+// Callers serialize CLI access; this function does not create/start a VM.
 func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.OptionsLCOW, error) {
 	opt, err := oci.SpecToUVMCreateOpts(ctx,
 		&specs.Spec{
@@ -919,7 +938,7 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	if c.IsSet(kernelArgsArgName) {
 		options.KernelBootOptions = c.String(kernelArgsArgName)
 	}
-	if c.Bool(sharedMemoryTwoUVMArgName) {
+	if c.Bool(sharedMemoryTwoUVMArgName) && !c.Bool(protectedSharedMemoryArgName) {
 		role, err := sharedMemoryProofRole(id)
 		if err != nil {
 			return nil, err
@@ -1006,17 +1025,13 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
 		options.SecurityPolicyEnabled = true
-		bundleDirectory, err := os.MkdirTemp(
-			"",
-			fmt.Sprintf("uvmboot-snp-%s-", id),
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"create temporary SNP bundle directory: %w",
-				err,
-			)
+		if !c.Bool(protectedSharedMemoryArgName) {
+			bundleDirectory, err := newLCOWBundleDirectory(id)
+			if err != nil {
+				return nil, err
+			}
+			options.BundleDirectory = bundleDirectory
 		}
-		options.BundleDirectory = bundleDirectory
 		options.AllowOvercommit = false
 
 		if !c.IsSet(noVerityBoot) {
@@ -1030,6 +1045,18 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 	}
 
 	return options, nil
+}
+
+// newLCOWBundleDirectory creates an empty, caller-owned directory for one SNP
+// VM's private boot copies. id identifies the diagnostic name, not an existing
+// directory. Failure returns no usable path; the caller must remove the returned
+// directory only after all VM/native ownership of its contents has drained.
+func newLCOWBundleDirectory(id string) (string, error) {
+	directory, err := os.MkdirTemp("", fmt.Sprintf("uvmboot-snp-%s-", id))
+	if err != nil {
+		return "", fmt.Errorf("create temporary SNP bundle directory: %w", err)
+	}
+	return directory, nil
 }
 
 // parseAnnotations parses the annotations from the [cli.StringSliceFlag] specified by `name`.
