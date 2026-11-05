@@ -1863,8 +1863,19 @@ func guestWaitFor(cond, what string) string {
 		"sleep 1; done; "
 }
 
-const siblingTransportVersion = 4
+// siblingTransportVersion is the exact guest transport version required by both
+// ordinary and protected sibling startup. The temporary whole-checkout baseline
+// is vsock-tun-forward f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91: transport v3,
+// distinct from its v1, 52-byte native discovery descriptor with one doorbell.
+// This guard does not negotiate versions or accept transport v4.
+const siblingTransportVersion = 3
 
+// siblingInstanceDiscoveryCommand returns shell setup for exactly one ready
+// sibling link. When executed in the guest, it waits up to guestWaitFor's budget,
+// reads the pinned sysfs field order into sb_bus/sb_local/sb_peer, and exits
+// nonzero on link-count, readiness or exact transport-version failure. Both
+// ordinary and protected callers use this guard; it does not parse the native
+// discovery descriptor or implement the guest-to-guest wire protocol.
 func siblingInstanceDiscoveryCommand() string {
 	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
 		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +

@@ -6,13 +6,25 @@ or hardware acceptance. All commands below are for the user to execute manually
 in S8; none were executed to validate this document. No automated tests or new
 proof harness are scheduled.
 
-Source handoff: hcsshim `69037a34e74252fa11f1dd88889aca3bc92eba30`
-(plus this documentation), topic
+Source handoff: hcsshim `affdad0d26f9dfb15c4881c7064ea2890dccd36b`
+plus this FINAL-R2 compatibility correction, topic
 `experiment/lcow-protected-shared-memory-snp-proof`; accepted OS source through
 `a48976d4f1ec759c01b1ba37215ad911e432d9f4`. Guest command contracts below use
-vsock-tun-forward merged revision
-`6c4fb606c5757810d27b8b1792b6603e322ee257`, not an older local companion branch.
+vsock-tun-forward branch `protected-shared-hcs-v1`, pinned at
+`f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91`. This is the user-selected rollback
+from the previously assumed `6c4fb606c5757810d27b8b1792b6603e322ee257`
+descriptor-v2/transport-v4 baseline, not a native discovery/event-range upgrade.
 Record the actual revisions and deployed artifacts for every attempt.
+
+The explicit user amendment makes transport **v3 the shared expectation for
+ordinary and protected startup**, temporarily across this whole checkout until
+an OS discovery-v2 upgrade. There is no protected-only selector, compatibility
+flag, negotiation, or acceptance of both versions. Existing
+`shared_memory_test.go` v4 fixtures/diagnostics (accept v4, reject v3) are
+intentionally stale and untouched at the user's direction; they were not run.
+This is an approved stale-test gap in source acceptance, not a passing-test
+claim. Manually rebuild the launcher and matched guest artifacts in S8;
+this source correction has not changed any binaries.
 
 ## 1. Match the entire stack before launching
 
@@ -44,7 +56,15 @@ kernel's stock `hv_netvsc`/`hv_sock` sibling transport; it does not load a
 replacement workload IP driver. Ordinary baseline only also needs the matching
 `hcs_shmem_diag.ko`. A stale module is not repaired by choosing a different GPA.
 
-The merged descriptor gate admits page-aligned lengths from `0x20000` through
+The pinned native/guest discovery contract is descriptor **v1, 52 bytes**, with
+a **single doorbell** (`event_flag`), not the v2/54-byte event-range contract.
+Separately, the guest-to-guest wire protocol is **transport v3**
+(`SIBLING_BUS_VERSION`); that is the version reported by `sibling_instance`
+and checked by the launcher. Protocol consumers are in the guests; changing
+the launcher guard does not convert descriptors or wire layouts. No native
+source change or discovery upgrade is part of FINAL-R2.
+
+The pinned descriptor gate admits page-aligned lengths from `0x20000` through
 32 MiB, inclusive, with aligned, nonzero, nonwrapping GPA. The launcher uses
 4-KiB pages. Passing that gate does **not** guarantee enough space for every
 transport/service allocation. The 1-MiB example below is an input, not a capacity
@@ -77,7 +97,7 @@ $pairFlags = @('--security-hardware', '--root-fs-type', 'none',
     '--sibling-bus-guest-module', $Bus, '--sibling-diode-uplink',
     '--sibling-interactive')
 
-# M01: ordinary shared backing and its existing diagnostic handshake.
+# M01: ordinary shared backing/diagnostic handshake, using the same pinned v3 guest.
 & $Launcher @globalFlags lcow @pairFlags --shared-memory-two-uvm-proof `
     --shared-memory-guest-module $Diag
 ```
@@ -134,8 +154,10 @@ Inspect the existing
 the single configured link in each guest. Its fields are
 `bus_id`, `local_cid`, `peer_cid`, `version`, and `ready`: expect diode
 `local_cid=4 peer_cid=3`, workload `local_cid=3 peer_cid=4`, and
-`version=4 ready=1` on both. Record each actual `bus_id`; do not assume the two
-bus IDs are equal. These are the existing launcher discovery/CID checks
+`version=3 ready=1` on both, for ordinary and protected runs. This `version`
+is the transport version, not descriptor version 1. Record each actual `bus_id`;
+do not assume the two bus IDs are equal. These are the existing launcher
+discovery/CID checks
 (`siblingInstanceDiscoveryCommand` and `siblingVsockReadyCommand`), not a new
 readiness tool or a substitute for the checked socket/network setup.
 
@@ -220,7 +242,7 @@ Avoid duplicate block commands (one unblock does not remove all duplicates).
 Pre-NAT capture may still see dropped packets; receipt there does not prove
 egress. Record external server observations where available. Repeat before
 partition calls using the pause, and after successful selected calls.
-The merged demo's `-covert`/`-smooth` use its hardcoded host destination; they
+The pinned demo's `-covert`/`-smooth` use its hardcoded host destination; they
 are not required here and must not be presented as a general timing-channel
 or network-isolation proof.
 
@@ -436,7 +458,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
 The generator runs for the **host**, not as a Windows executable on Linux.
 Review its actual delta for unrelated changes. Windows can instead run
 `go generate ./internal/computecore` with the host Windows toolchain, then use
-the existing merged companion builder with an explicit checkout:
+the pinned companion builder with an explicit checkout:
 
 ```powershell
 $Hcs = (Resolve-Path -LiteralPath (Read-Host 'Actual hcsshim checkout root')).Path
@@ -451,8 +473,10 @@ try {
     -HcsshimPath $Hcs -OutputPath $Output
 ```
 
-Verify that script/resolver match the merged source before use. Explicit
-`-HcsshimPath` wins over `.hcs_path` and `HCS_PATH`; the resolver checks checkout
+Verify the companion checkout is `protected-shared-hcs-v1` at
+`f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91`, and that script/resolver match
+that exact revision before use. Explicit `-HcsshimPath` wins over `.hcs_path`
+and `HCS_PATH`; the resolver checks checkout
 root and markers. The script builds `.\internal\tools\uvmboot` with
 `GOOS=windows`, `GOARCH=amd64`, `CGO_ENABLED=0`, `-mod=readonly`; it does not do
 generation. Its default output name is `target\hcs\uvmboot-shmem.exe`, but the
@@ -483,7 +507,10 @@ honestly rather than weakening native validation.
 | M07 | Feasible startup/network/import failure, peer exit and normal stop; no unsafe release, duplicate prefixes or stranded listeners; authorized reclaim/full scrub; safe races only where existing tools permit | | |
 | M08 | Native and Go generation/build separately recorded; complete matched export/IID/schema/proxy/tool/boot provenance; bounded ordering/root-denial/import evidence attributable to actual binaries | | |
 
-Source-only gaps: no generation, compilation, formatting verification,
+Source-only gaps: the intentionally unchanged `shared_memory_test.go`
+transport-v4 expectations contradict this amended v3 baseline; do not treat
+them as current acceptance evidence or run them for this handoff. No new tests
+were added. No generation, compilation, formatting verification,
 deployment, hardware execution, malformed-response injection or exhaustive
 allocation/race/failure coverage has been performed for this handoff. The
 launcher intentionally offers no CLI for arbitrary controller identities,
@@ -515,8 +542,8 @@ are the lookup anchors.
 | Native import rights/ownership, immutable metadata, HV admission | OS `onecore/vm/inc/vid.h`, `vid/dll/src/vid.src`, `vid/inc/{VidDefs.h,VidIoctl.h}`, `vid/sys/vsmm/{VsmmProtectedShared,VsmmMemoryBlock,VsmmVaGpaRange}.c` | M03/M06/M07 |
 | Worker owner/local IID, retained initialization; protected startup before offers | OS `onecore/vm/worker/memory/{MemoryBlock,MemoryManager}.cpp`, `worker/vmb/VmbComGuestMemoryAccess.cpp`, `proxy/idl/VmbServices.idl`, `common/shmem/SharedRegionManager.cpp`, `dv/dm/vdev/dll/DynMemDevice.cpp`, `compute/management/orchestration/VirtualMachine/VirtualMachineOrchestrator.cpp` | M02/M03/M08 |
 | Checked network/services, staging aliases, interfaces/CIDs | hcsshim `protected_sibling.go`: `stageProtectedSiblingTools`, `protectedSiblingNetwork`, `checkSockets`, `startService`; `lcow.go` sibling helpers; `bench.go` iperf name | M04/M07 |
-| Demo/tcpdump/iptables syntax, traffic units, descriptor limits | merged companion `diagnostics/sibling-bus/{demo.sh,diode_tcpbulk.c,sibling_bus.c}`; `mshv/include/hyperv/sibling_link.h` (`sibling_link_validate`) | M03/M04 |
+| Demo/tcpdump/iptables syntax, traffic units, descriptor v1/52/single-doorbell limits, transport v3/sysfs/CIDs and socket CLI | pinned companion `f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91`: `diagnostics/sibling-bus/{demo.sh,diode_tcpbulk.c,diode_vsock_test.c,sibling_bus.c}`; `mshv/include/hyperv/{sibling_link.h,sibling_wire.h}` (`sibling_link_validate`, `SIBLING_BUS_VERSION`, `sibling_instance_show`); hcsshim `lcow.go`: `siblingTransportVersion`, `siblingInstanceDiscoveryCommand` (shared ordinary/protected guard) | M01/M03/M04 |
 | Exact masks and truthful submission evidence | hcsshim `protected_sibling.go`: `sealPartitions`, `reportSeal`; `internal/uvm/partition.go`, `internal/hcs/v2/system.go`, `internal/computecore/computecore.go` | M05/M06 |
 | Exclusive marker sharing/content/cleanup and interactive lifetime | hcsshim `protected_sibling_pause.go`; `interactive.go`: protected server and `siblingShellSession`; `internal/cmd/cmd.go` opt-in joining | M05/M07 |
 | Prefix accounting/authorized reclaim/no ordinary close | hcsshim `protected_sibling.go`: `cleanup`; `protected_sibling_memory.go`: `controlBatch`, `advance`, `release` | M07 |
-| Generation/build and explicit builder checkout | plan S8; hcsshim `go.mod`, computecore generator directive; merged companion `scripts/{build-hcs-launcher.ps1,resolve-build-root.py}` | M08 |
+| Generation/build and explicit builder checkout | plan S8; hcsshim `go.mod`, computecore generator directive; pinned companion `f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91`: `scripts/{build-hcs-launcher.ps1,resolve-build-root.py}` | M08 |
