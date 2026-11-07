@@ -31,6 +31,7 @@ type Config struct {
 	SharedMemoryBytes      uint64 `json:"shared_memory_bytes"`
 	WorkloadGuestStateFile string `json:"workload_guest_state_file"`
 	Interactive            bool   `json:"interactive,omitempty"`
+	MediateGCS             bool   `json:"mediate_gcs,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -195,6 +196,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, fmt.Errorf("create sibling diode: %w", err)
 	}
+	if config.MediateGCS {
+		if err := pair.Workload.ConfigureGCSRelay(pair.Diode); err != nil {
+			return nil, fmt.Errorf("configure sibling GCS relay before boot: %w", err)
+		}
+	}
 	dns, err := HostDNSServers()
 	if err != nil {
 		return nil, err
@@ -233,7 +239,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return err
 		}
 		pair.uplinkCleanup = cleanup
-		_, err = runGuest(bootCtx, pair.Diode, diodeNetworkCommand(uplink))
+		_, err = runGuest(bootCtx, pair.Diode, diodeBootstrapCommand(uplink, config.MediateGCS))
 		return err
 	})
 	if err != nil {
@@ -313,6 +319,26 @@ func bootstrap(ctx context.Context, workload, diode func(context.Context) error)
 const demoToolsStage = `mkdir -p /run/sibling-exec && mount -t tmpfs -o exec,size=16m tmpfs /run/sibling-exec || exit 1; ` +
 	`for tool in demo.sh diode-controller; do ` +
 	`cp /run/sibling/$tool/$tool /run/sibling-exec/$tool && chmod 755 /run/sibling-exec/$tool || exit 1; done; `
+
+// GCSRelayCommand starts the same guest relay for standalone and shim-owned pairs.
+func GCSRelayCommand() string {
+	return `rm -f /run/gcs-relay.ready; ` +
+		`/bin/gcs -sibling-relay -relay-ready /run/gcs-relay.ready </dev/null >/run/gcs-relay.log 2>&1 & relay_pid=$!; ` +
+		`echo "$relay_pid" >/run/gcs-relay.pid; ` +
+		`relay_wait=0; until [ -f /run/gcs-relay.ready ]; do ` +
+		`if ! kill -0 "$relay_pid" 2>/dev/null; then cat /run/gcs-relay.log; exit 1; fi; ` +
+		`relay_wait=$((relay_wait + 1)); if [ "$relay_wait" -ge 100 ]; then ` +
+		`kill "$relay_pid"; cat /run/gcs-relay.log; echo 'GCS relay startup timed out' >&2; exit 1; fi; ` +
+		`sleep 0.1; done; echo 'GCS_RELAY_READY: workload control and stdio through diode; Plan9 unchanged'`
+}
+
+func diodeBootstrapCommand(uplink *Uplink, mediateGCS bool) string {
+	command := diodeNetworkCommand(uplink)
+	if mediateGCS {
+		command += "; " + GCSRelayCommand()
+	}
+	return command
+}
 
 func diodeNetworkCommand(uplink *Uplink) string {
 	return `insmod /run/sibling/diode_netvsp.ko/diode_netvsp.ko; ` +

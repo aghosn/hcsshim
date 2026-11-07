@@ -40,3 +40,27 @@ func TestCalculateContainersMemoryLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestGCSPeerFromCommandLine(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		peer    uint32
+		bad     bool
+	}{
+		{"root=/dev/dm-0 init=/startup.sh", 2, false},
+		{"gcs.vsock_peer_cid=4 idle=halt", 4, false},
+		{"gcs.vsock_peer_cid=2", 2, false},
+		{"other.gcs.vsock_peer_cid=4", 2, false},
+		{"gcs.vsock_peer_cid=", 0, true},
+		{"gcs.vsock_peer_cid=3", 0, true},
+		{"gcs.vsock_peer_cid=4294967296", 0, true},
+		{"gcs.vsock_peer_cid=4 gcs.vsock_peer_cid=2", 0, true},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			peer, err := gcsPeerFromCommandLine(test.command)
+			if (err != nil) != test.bad || peer != test.peer {
+				t.Fatalf("peer=%d err=%v, want peer=%d bad=%v", peer, err, test.peer, test.bad)
+			}
+		})
+	}
+}

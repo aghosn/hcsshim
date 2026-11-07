@@ -63,6 +63,7 @@ const (
 	siblingBusGuestModuleArgName      = "sibling-bus-guest-module"
 	siblingDiodeUplinkArgName         = "sibling-diode-uplink"
 	siblingOpenShellBundleArgName     = "sibling-openshell-bundle"
+	siblingGCSRelayArgName            = "sibling-gcs-relay"
 )
 
 var (
@@ -74,6 +75,10 @@ var lcowCommand = cli.Command{
 	Name:  "lcow",
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  siblingGCSRelayArgName,
+			Usage: "Experimental: route workload GCS and stdio through the Linux diode; requires interactive sibling-root boot.",
+		},
 		cli.StringFlag{
 			Name: unikraftPackageArgName,
 			Usage: "Replace only the diode with a standalone SNP VMGS package containing guest.vmgs and launch-manifest.json; " +
@@ -379,7 +384,7 @@ var lcowCommand = cli.Command{
 		}
 		benchmarkCtx := context.Background()
 		var cancelBenchmark context.CancelFunc
-		if unikraft != nil {
+		if unikraft != nil || c.Bool(siblingGCSRelayArgName) {
 			benchmarkCtx, cancelBenchmark = context.WithCancel(benchmarkCtx)
 			defer cancelBenchmark()
 		}
@@ -493,6 +498,13 @@ var lcowCommand = cli.Command{
 			if _, err := os.Stat(c.String(siblingBusGuestModuleArgName)); err != nil {
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
+		}
+		if c.Bool(siblingGCSRelayArgName) && (!useGCS || !siblingInteractive ||
+			!c.Bool(sharedMemoryTwoUVMArgName) || !c.Bool(siblingStorageRootArgName) ||
+			c.String(siblingBusGuestModuleArgName) == "" || unikraft != nil ||
+			c.String(siblingOpenShellBundleArgName) != "" || c.String(networkBenchmarkScriptArgName) != "" ||
+			c.String(storageBenchmarkScriptArgName) != "") {
+			return fmt.Errorf("--%s requires an interactive Linux sibling-root pair without other experiments", siblingGCSRelayArgName)
 		}
 		for _, flag := range []struct {
 			name  string
@@ -622,6 +634,10 @@ var lcowCommand = cli.Command{
 			mappingMu      sync.Mutex
 			mappingAddress = make(map[string]uint32)
 		)
+		var gcsRelay *siblingGCSRelay
+		if c.Bool(siblingGCSRelayArgName) {
+			gcsRelay = &siblingGCSRelay{diode: make(chan *uvm.UtilityVM, 1)}
+		}
 		runMany(c, func(id string) (workerErr error) {
 			ctx := benchmarkCtx
 			defer func() {
@@ -634,7 +650,7 @@ var lcowCommand = cli.Command{
 					if cancelBenchmark != nil {
 						cancelBenchmark()
 					}
-				} else if unikraft != nil && id == "uvmboot-1" {
+				} else if (unikraft != nil || gcsRelay != nil) && id == "uvmboot-1" {
 					cancelBenchmark()
 				}
 			}()
@@ -693,6 +709,7 @@ var lcowCommand = cli.Command{
 				c,
 				storagePlan,
 				unikraft,
+				gcsRelay,
 				execCommand,
 				func(
 					uvmID string,
@@ -1060,6 +1077,7 @@ func runLCOW(
 	c *cli.Context,
 	storagePlan *siblingStoragePlan,
 	unikraft *unikraftConfig,
+	gcsRelay *siblingGCSRelay,
 	execCommand string,
 	mappingObserver func(
 		string,
@@ -1097,7 +1115,7 @@ func runLCOW(
 			resultErr = errors.Join(resultErr, closeStorageBenchmark(ctx, vm.CloseCtx, storageReleases))
 			return
 		}
-		if c.String(networkBenchmarkScriptArgName) == "" && c.String(unikraftPackageArgName) == "" {
+		if c.String(networkBenchmarkScriptArgName) == "" && c.String(unikraftPackageArgName) == "" && gcsRelay == nil {
 			_ = vm.CloseCtx(ctx)
 			return
 		}
@@ -1107,6 +1125,11 @@ func runLCOW(
 			resultErr = errors.Join(resultErr, fmt.Errorf("close UVM %s: %w", vm.ID(), err))
 		}
 	}()
+	if gcsRelay != nil {
+		if err := gcsRelay.configure(ctx, vm); err != nil {
+			return err
+		}
+	}
 
 	var (
 		preStartRegions []hcsschema.SharedMemoryRegionInfo
@@ -1481,6 +1504,9 @@ func runLCOW(
 	}
 
 	if options.UseGuestConnection {
+		if gcsRelay != nil && vm.ID() == "uvmboot-0" {
+			execCommand += "; " + siblingGCSRelayCommand()
+		}
 		var output io.Writer = os.Stdout
 		if diodeTiming != nil {
 			output = diodeTiming

@@ -225,9 +225,15 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 			IoListen:       gcs.HvsockIoListen(uvm.runtimeID),
 			InitGuestState: initGuestState,
 		}
+		if uvm.gcIoListen != nil {
+			gcc.IoListen = uvm.gcIoListen
+		}
 		uvm.gc, err = gcc.Connect(ctx, true)
 		if err != nil {
 			return err
+		}
+		if uvm.gcIoPortStart != 0 {
+			uvm.gc.SetNextPort(uvm.gcIoPortStart)
 		}
 		uvm.guestCaps = uvm.gc.Capabilities()
 		uvm.protocol = uvm.gc.Protocol()
