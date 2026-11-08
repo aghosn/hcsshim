@@ -192,8 +192,14 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 		if vm.ProcessorCount() != 1 {
 			return fmt.Errorf("Unikraft network benchmark expected one VP, HCS assigned %d", vm.ProcessorCount())
 		}
-		stopSampling := sampleNetworkBenchmarkCPU(context.Background(), vm)
-		defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
+		sampleCPU, err := networkBenchmarkCPUEnabled(c)
+		if err != nil {
+			return err
+		}
+		if sampleCPU {
+			stopSampling := sampleNetworkBenchmarkCPU(context.Background(), vm)
+			defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
+		}
 	}
 	for _, report := range reports {
 		data, err := json.Marshal(report)

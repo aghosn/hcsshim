@@ -312,7 +312,7 @@ var lcowCommand = cli.Command{
 		},
 		cli.BoolFlag{
 			Name:  networkBenchmarkSingleVPArgName,
-			Usage: "Use one VP for the Unikraft network pair or its standalone reference (Linux pair default remains two)",
+			Usage: "Use one VP for a matched Linux/Unikraft network comparison or its standalone reference (Linux default remains two)",
 		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
@@ -1163,10 +1163,16 @@ func runLCOW(
 		if uint64(vm.ProcessorCount()) != networkBenchmarkProcessors(c) {
 			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", networkBenchmarkProcessors(c), vm.ProcessorCount())
 		}
-		stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
-		defer func() {
-			resultErr = errors.Join(resultErr, stopSampling())
-		}()
+		sampleCPU, err := networkBenchmarkCPUEnabled(c)
+		if err != nil {
+			return err
+		}
+		if sampleCPU {
+			stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
+			defer func() {
+				resultErr = errors.Join(resultErr, stopSampling())
+			}()
+		}
 		if err := shareNetworkBenchmark(ctx, c, vm); err != nil {
 			return err
 		}
@@ -1284,6 +1290,10 @@ func runLCOW(
 			iperfPath := filepath.Join(filepath.Dir(module), iperfGuestName)
 			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
 				return fmt.Errorf("share %s: %w", iperfGuestName, err)
+			}
+			controllerPath := filepath.Join(filepath.Dir(module), "diode-controller")
+			if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
+				return fmt.Errorf("share benchmark diagnostics: %w", err)
 			}
 			execCommand = iperfStage + "set -eu; " +
 				`ping -c 3 -W 3 ` + unikraft.network.provider.String() + `; ` +

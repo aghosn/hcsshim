@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +36,23 @@ func networkBenchmarkProcessors(c *cli.Context) uint64 {
 		return 1
 	}
 	return 2
+}
+
+func networkBenchmarkCPUEnabled(c *cli.Context) (bool, error) {
+	script, err := os.ReadFile(c.String(networkBenchmarkScriptArgName))
+	if err != nil {
+		return false, fmt.Errorf("read network benchmark CPU sampling policy: %w", err)
+	}
+	enabled := true
+	for _, line := range strings.Split(string(script), "\n") {
+		switch strings.TrimSuffix(line, "\r") {
+		case "cpu_measurements=0":
+			enabled = false
+		case "cpu_measurements=1":
+			enabled = true
+		}
+	}
+	return enabled, nil
 }
 
 func validateNetworkBenchmarkServer(server string, addresses []net.Addr) (bool, error) {
@@ -97,9 +115,6 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	sibling := c.IsSet(siblingBusGuestModuleArgName) && c.Bool(sharedMemoryTwoUVMArgName) &&
 		c.Bool(siblingDiodeUplinkArgName) && c.GlobalInt(countArgName) == 2
 	unikraft := c.String(unikraftPackageArgName) != ""
-	if c.Bool(networkBenchmarkSingleVPArgName) && !baseline && !unikraft {
-		return errors.New("single-VP network benchmarks support only the Unikraft pair or its standalone reference; Linux pair experiments are unchanged")
-	}
 	if unikraft && !c.Bool(networkBenchmarkSingleVPArgName) {
 		return errors.New("Unikraft network benchmarks require --network-benchmark-single-vp")
 	}
@@ -163,6 +178,13 @@ func networkBenchmarkVPPreflight(role, server string, noSMT bool, idlePolicy str
 		`ip route get ` + server + `; `
 }
 
+func networkBenchmarkDiagnosticStage(script string) string {
+	return `if grep -qx 'receive_diagnostics=1' ` + shellSingleQuote(script) + `; then ` +
+		`cp /run/diode-controller/diode-controller /run/dtb-exec/diode-controller && ` +
+		`chmod 755 /run/dtb-exec/diode-controller || ` +
+		`{ echo 'network_benchmark: FAIL diagnostic helper staging failed' >&2; exit 1; }; fi; `
+}
+
 func networkBenchmarkClient(c *cli.Context, role string) string {
 	server := c.String(networkBenchmarkServerArgName)
 	expected := "dvsc0"
@@ -178,6 +200,7 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
+		networkBenchmarkDiagnosticStage(script) +
 		`cp ` + shellSingleQuote(script) + ` /run/dtb-exec/network-benchmark.sh; ` +
 		`/bin/sh /run/dtb-exec/network-benchmark.sh ` + server + ` ` +
 		fmt.Sprint(c.Int(networkBenchmarkPortArgName)) + `; `
@@ -201,11 +224,17 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 	return command + siblingDiodeUplinkCommand(uplink, guestWaitFor) +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`"$ipt" iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE; ` +
-		networkBenchmarkPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName)) +
+		networkBenchmarkVPPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) +
 		`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 		`{ echo 'network_benchmark: FAIL diode uplink is not synthetic hv_netvsc' >&2; exit 1; }; ` +
+		`diag=/run/dtb-exec/receive-diagnostics.log; ` +
+		`if grep -qx 'receive_diagnostics=1' /run/network-benchmark/` + filepath.Base(c.String(networkBenchmarkScriptArgName)) + `; then ` +
+		`[ -x /run/dtb-exec/diode-controller ] || { echo 'network_benchmark: FAIL diagnostic helper missing' >&2; exit 1; }; ` +
+		`/run/dtb-exec/diode-controller net-diagnostics -interface "$up" >"$diag"; fi; ` +
 		`echo 'network_benchmark: diode forwarding ready'; ` +
 		`until dmesg | grep -qF 'dvsp0: channel closed'; do sleep 1; done; ` +
+		`if [ -f "$diag" ]; then /run/dtb-exec/diode-controller net-diagnostics -interface "$up" >>"$diag"; ` +
+		`echo 'NETBENCH_DIODE_DIAGNOSTICS_BEGIN'; cat "$diag"; echo 'NETBENCH_DIODE_DIAGNOSTICS_END'; fi; ` +
 		`"$ipt" iptables -t nat -L POSTROUTING -v -n -x; `
 }
 
