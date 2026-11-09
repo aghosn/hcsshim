@@ -47,8 +47,9 @@ type UtilityVM struct {
 	physicallyBacked bool       // If the uvm is backed by physical memory and not virtual memory
 	m                sync.Mutex // Lock for adding/removing devices
 
-	exitErr error
-	exitCh  chan struct{}
+	exitErr      error
+	exitCh       chan struct{}
+	startInvoked atomic.Bool
 
 	// devicesPhysicallyBacked indicates if additional devices added to a uvm should be
 	// entirely physically backed

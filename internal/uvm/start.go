@@ -60,6 +60,7 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
+	uvm.startInvoked.Store(true)
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
 	ctx, cancel := context.WithTimeout(pCtx, timeout.GCSConnectionTimeout)

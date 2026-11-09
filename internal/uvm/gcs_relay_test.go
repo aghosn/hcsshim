@@ -26,7 +26,7 @@ func (l *relayTestListener) Close() error {
 
 func TestGCSRelayReplacesOnlyWorkloadControl(t *testing.T) {
 	direct, relayed, diodeDirect := &relayTestListener{}, &relayTestListener{}, &relayTestListener{}
-	workload := &UtilityVM{operatingSystem: "linux", gcListener: direct}
+	workload := &UtilityVM{operatingSystem: "linux", gcListener: direct, exitCh: make(chan struct{})}
 	diode := &UtilityVM{operatingSystem: "linux", gcListener: diodeDirect, runtimeID: guid.GUID{Data1: 4}}
 	err := workload.configureGCSRelay(diode, func(address *winio.HvsockAddr) (net.Listener, error) {
 		if address.VMID != diode.runtimeID ||
@@ -42,6 +42,20 @@ func TestGCSRelayReplacesOnlyWorkloadControl(t *testing.T) {
 		workload.gcListener != relayed || workload.gcIoListen == nil ||
 		workload.gcIoPortStart != guestresource.GCSRelayIOPortStart {
 		t.Fatal("relay did not replace workload control/stdio independently of diode management")
+	}
+}
+
+func TestGCSRelayRejectsStartedWorkloadBeforeAccept(t *testing.T) {
+	direct := &relayTestListener{}
+	workload := &UtilityVM{operatingSystem: "linux", gcListener: direct, exitCh: make(chan struct{})}
+	workload.startInvoked.Store(true)
+	diode := &UtilityVM{operatingSystem: "linux"}
+	err := workload.configureGCSRelay(diode, func(*winio.HvsockAddr) (net.Listener, error) {
+		t.Fatal("started workload must not create a relay listener")
+		return nil, nil
+	})
+	if err == nil || direct.closed || workload.gcListener != direct || workload.gcIoListen != nil {
+		t.Fatalf("started workload configuration changed: %v", err)
 	}
 }
 

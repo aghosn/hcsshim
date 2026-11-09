@@ -21,7 +21,7 @@ func (uvm *UtilityVM) ConfigureGCSRelay(diode *UtilityVM) error {
 
 func (uvm *UtilityVM) configureGCSRelay(diode *UtilityVM, listen func(*winio.HvsockAddr) (net.Listener, error)) error {
 	if diode == nil || diode == uvm || uvm.OS() != "linux" || diode.OS() != "linux" ||
-		uvm.gcListener == nil || uvm.exitCh != nil || uvm.gcIoListen != nil {
+		uvm.gcListener == nil || uvm.startInvoked.Load() || uvm.gcIoListen != nil {
 		return fmt.Errorf("GCS relay requires separate Linux guests and an unstarted workload with external GCS")
 	}
 	listener, err := listen(&winio.HvsockAddr{
