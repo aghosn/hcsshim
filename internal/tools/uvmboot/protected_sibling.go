@@ -249,6 +249,7 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 		filepath.Join(filepath.Dir(module), "diode_tcpdump"),
 		filepath.Join(filepath.Dir(module), "diode_tc"),
 		filepath.Join(filepath.Dir(module), "diode_iptables"),
+		filepath.Join(filepath.Dir(module), "ahv-guest-ctl"),
 		filepath.Join(filepath.Dir(module), pageMetadataCollector),
 	} {
 		info, err := os.Stat(path)
@@ -650,7 +651,8 @@ func protectedSiblingGuest(ctx context.Context, v *protectedSiblingVM, command s
 
 // stageProtectedSiblingTools borrows existing merged artifacts through file
 // shares and checks copying/chmod into executable tmpfs. Missing demo/filter
-// tools fail instead of silently degrading the interactive experiment.
+// tools fail instead of silently degrading the interactive experiment. The AHV
+// CLI is delivered only to the diode; staging never prepares or collects evidence.
 // Shares stay VM-owned; no independent boot stack or guest harness is created.
 func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protectedSiblingVM) error {
 	module := c.String(siblingBusGuestModuleArgName)
@@ -668,6 +670,11 @@ func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protecte
 		{"diode_tcpdump", "/run/diode-tcpdump", "tcpdump"},
 		{"diode_tc", "/run/diode-tc", "tc"},
 		{"diode_iptables", "/run/diode-iptables", "ipt"},
+	}
+	if v.role == diodeRole {
+		artifacts = append(artifacts, struct {
+			host, root, destination string
+		}{"ahv-guest-ctl", "/run/ahv-tools", "ahv-guest-ctl"})
 	}
 	command := "set -eu; mkdir -p /run/dtb-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec; "
 	metadataStage, err := stagePageMetadata(ctx, c, v.vm, v.role)
