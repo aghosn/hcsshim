@@ -34,9 +34,10 @@ type protectedSiblingDependencyOps struct {
 // protectedSiblingDependencies retains the early diode process and workload
 // root mount for runProtectedSibling. Its context deliberately does not inherit
 // forward cancellation: workload shutdown still needs relay/storage services.
-// The pair coordinator serializes start, waitReady and drain; only completion
-// and closing observation use mu. A bounded join failure retains this owner,
-// including any in-flight native/GCS borrower and the workload's bundle owner.
+// The pair coordinator serializes start, waitReady, beginClosing and drain;
+// completion and expected-closing observation use mu. A bounded join failure
+// retains this owner, including any in-flight native/GCS borrower and the
+// workload's bundle owner.
 type protectedSiblingDependencies struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -308,6 +309,16 @@ func protectedSiblingStopError(err error) error {
 	return err
 }
 
+// beginClosing marks subsequent relay completion as expected without stopping
+// dependencies or clearing an earlier failure. runProtectedSibling must call it
+// before workload termination can close the relay connection, after joining
+// forward setup borrowers. The watcher uses the same gate to preserve ordering.
+func (d *protectedSiblingDependencies) beginClosing() {
+	d.mu.Lock()
+	d.closing = true
+	d.mu.Unlock()
+}
+
 // drain stops/joins the starter, quiesces storage via diode GCS and releases the
 // root while guest unplug is still possible. The caller must first join setup/
 // shell borrowers and observe workload native drainage. A failed join, uncertain
@@ -318,9 +329,7 @@ func (d *protectedSiblingDependencies) drain(ctx context.Context, workloadDraine
 	if !workloadDrained {
 		return errors.New("protected workload drainage unconfirmed; dependencies retained")
 	}
-	d.mu.Lock()
-	d.closing = true
-	d.mu.Unlock()
+	d.beginClosing()
 	var result error
 	if d.attempted {
 		// Do not cancel cmd's context here: its SIGKILL could orphan a shell

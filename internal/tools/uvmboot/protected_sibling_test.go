@@ -250,6 +250,73 @@ func TestProtectedRelayExpectedClosingDoesNotCrash(t *testing.T) {
 	}
 }
 
+// TestProtectedRelayExpectedExitBeforeDrain checks S2-R1's workload-first stop
+// interval: relay completion after beginClosing but before dependency drainage
+// must not report a crash or release dependencies. Stream/Close errors and
+// unconfirmed process exit must remain observable during the later drain.
+func TestProtectedRelayExpectedExitBeforeDrain(t *testing.T) {
+	streamFailure := errors.New("stream/Close join failed")
+	waitFailure := errors.New("process exit unconfirmed")
+	tests := []struct {
+		name    string
+		exited  bool
+		exitErr error
+		wantErr error
+	}{
+		{name: "clean-exit", exited: true},
+		{name: "workload-eof", exited: true, exitErr: &cmd.ExitError{ExitState: &cmd.ExitState{}}},
+		{
+			name: "joined-error", exited: true,
+			exitErr: errors.Join(&cmd.ExitError{ExitState: &cmd.ExitState{}}, streamFailure),
+			wantErr: streamFailure,
+		},
+		{name: "unconfirmed-exit", exitErr: waitFailure, wantErr: waitFailure},
+	}
+	for _, tt := range tests {
+		// Each case completes the relay behind a barrier before drain, so
+		// dependency cancellation cannot accidentally make the exit expected.
+		t.Run(tt.name, func(t *testing.T) {
+			f := newProtectedDependencyFixture(t)
+			f.exited, f.exitErr = tt.exited, tt.exitErr
+			if err := f.owner.start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			protectedDependencyAwait(t, f.waitEntered)
+			f.owner.beginClosing()
+			if f.depCtx.Err() != nil || f.pair.ctx.Err() != nil ||
+				!reflect.DeepEqual(f.recorded(), []string{"start", "wait"}) {
+				t.Fatal("expected-closing transition stopped or cancelled dependencies")
+			}
+			// Model relay EOF caused by workload termination, with provider/
+			// attachment drainage deliberately not entered yet.
+			f.exit.release()
+			protectedDependencyAwait(t, f.owner.done)
+			if f.pair.ctx.Err() != nil || f.owner.failure != nil {
+				t.Fatalf("expected pre-drain exit reported a crash: %v", context.Cause(f.pair.ctx))
+			}
+			if f.depCtx.Err() != nil || f.owner.root == nil ||
+				f.owner.providerDrained || f.owner.rootReleased ||
+				!reflect.DeepEqual(f.recorded(), []string{"start", "wait", "joined"}) {
+				t.Fatal("expected relay completion destroyed still-owned dependencies")
+			}
+			err := f.owner.drain(context.Background(), true)
+			if (tt.wantErr == nil && err != nil) || (tt.wantErr != nil && !errors.Is(err, tt.wantErr)) {
+				t.Fatalf("drain error = %v, want %v", err, tt.wantErr)
+			}
+			if f.pair.ctx.Err() != nil {
+				t.Fatal("drain converted expected completion into a crash")
+			}
+			if tt.exited {
+				if !f.owner.providerDrained || !f.owner.rootReleased {
+					t.Fatal("confirmed exit did not permit ordered dependency drainage")
+				}
+			} else if f.owner.root == nil || f.owner.providerDrained || f.owner.rootReleased {
+				t.Fatal("unconfirmed exit allowed dependency release")
+			}
+		})
+	}
+}
+
 // TestProtectedRelayExpectedExitPreservesDrainErrors checks T4: normalizing an
 // expected termination must not swallow a joined stream/Close failure or erase
 // confirmed release progress. Closing still must not create a new pair crash.
@@ -270,7 +337,8 @@ func TestProtectedRelayExpectedExitPreservesDrainErrors(t *testing.T) {
 
 // TestProtectedRelayUnexpectedExitCancelsReadiness checks T3/T4: an exit after
 // creation cancels pending readiness, preserves its cause and never releases
-// root dependencies merely because the foreground service died.
+// root dependencies merely because the foreground service died. A later
+// expected-closing transition must not erase the already observed failure.
 func TestProtectedRelayUnexpectedExitCancelsReadiness(t *testing.T) {
 	f := newProtectedDependencyFixture(t)
 	failure := errors.New("relay transport failed")
@@ -291,6 +359,7 @@ func TestProtectedRelayUnexpectedExitCancelsReadiness(t *testing.T) {
 	if !errors.Is(context.Cause(f.pair.ctx), failure) || f.depCtx.Err() != nil || f.owner.root == nil {
 		t.Fatal("exit lost its cause or destroyed still-needed dependencies")
 	}
+	f.owner.beginClosing()
 	if err := f.owner.drain(ctx, true); !errors.Is(err, failure) {
 		t.Fatalf("cleanup hid the original service failure: %v", err)
 	}
