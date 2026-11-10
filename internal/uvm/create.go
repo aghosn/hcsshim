@@ -396,10 +396,9 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 
 	if uvm.hcsSystem != nil {
 		_ = uvm.hcsSystem.Terminate(ctx)
-		// uvm.Wait() waits on <-uvm.outputProcessingDone, which may not be closed until below
-		// (for a Create -> Stop without a Start), or uvm.outputHandler may be blocked on IO and
-		// take a while to close.
-		// In either case, we want to wait on the system closing, not IO completion.
+		// uvm.Wait() also joins started output processing, which may remain
+		// blocked on IO until the listeners/connections are closed below.
+		// Wait on the system closing here, not IO completion.
 		_ = uvm.hcsSystem.WaitCtx(ctx)
 	}
 

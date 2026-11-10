@@ -352,10 +352,10 @@ func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
 			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; polls=0; ` +
 				`sleep() { polls=$((polls+1)); if [ "$polls" -eq 1 ]; then ` + publish + `fi; }; `
 			command := siblingInstanceDiscoveryCommand() + siblingVsockReadyCommand(diodeRole)
+			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
 			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance",
 				`"$fixture"/*-*/sibling_instance`)
 			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/hv_sock", `"$fixture"`)
-			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
 			command = setup + command + `echo "INSTANCE_ACCEPTED polls=$polls bus=$sb_bus local=$sb_local peer=$sb_peer"`
 			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
 			if test.failure == "" {
