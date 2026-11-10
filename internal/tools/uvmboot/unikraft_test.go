@@ -54,8 +54,8 @@ func TestUnikraftManifestAndStorageAssignments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attachments := devices[cfg.controller].Attachments
-	if cfg.memoryMB != 128 || len(devices) != 1 || len(attachments) != 2 ||
+	attachments := devices[cfg.Controller].Attachments
+	if cfg.MemoryMB != 128 || len(devices) != 1 || len(attachments) != 2 ||
 		attachments["3"].Path != plan.Disks[0].HostPath || !attachments["3"].ReadOnly ||
 		attachments["5"].Path != plan.Disks[1].HostPath || attachments["5"].ReadOnly ||
 		reports[1].LUN != 5 || reports[1].ExportLUN != 1 {
@@ -79,7 +79,7 @@ func TestUnikraftIdleManifest(t *testing.T) {
 	for _, mode := range []string{"halt", "poll"} {
 		cfg, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(
 			unikraftTestParams() + " libukbus_vmbus.idle=" + mode + " --")))
-		if err != nil || cfg.idle != mode {
+		if err != nil || cfg.Idle != mode {
 			t.Fatalf("idle mode %s: cfg=%+v err=%v", mode, cfg, err)
 		}
 	}
@@ -286,7 +286,7 @@ func TestUnikraftRootOnlyPairUsesStaticManifestAndSharedWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.network != nil {
+	if cfg.Network != nil {
 		t.Fatal("root-only appliance unexpectedly enabled networking")
 	}
 	command, err := unikraftWorkloadCommand("/run/sibling-bus-module/sibling_bus.ko", cfg, plan, "")

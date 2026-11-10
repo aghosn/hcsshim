@@ -189,8 +189,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	}
 
 	if opts, ok := uvm.createOpts.(*OptionsLCOW); ok && opts.Appliance != nil {
-		// An appliance has no guest connection or guest-side mount manager.
-		return nil
+		return uvm.startApplianceStorage(ctx, opts.Appliance)
 	}
 
 	if uvm.gcListener != nil {

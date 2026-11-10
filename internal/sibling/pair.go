@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/internal/uvm"
@@ -24,7 +25,7 @@ import (
 )
 
 // Config is an explicit host-side opt-in; it never names existing HCS systems.
-// Both guests inherit the sandbox's security/integrity options without alteration.
+// The workload inherits the sandbox's security/integrity options without alteration.
 type Config struct {
 	Version                int    `json:"version"`
 	ModuleDirectory        string `json:"module_directory"`
@@ -32,6 +33,7 @@ type Config struct {
 	WorkloadGuestStateFile string `json:"workload_guest_state_file"`
 	Interactive            bool   `json:"interactive,omitempty"`
 	MediateGCS             bool   `json:"mediate_gcs,omitempty"`
+	UnikraftPackage        string `json:"unikraft_package,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -70,18 +72,25 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		strings.ContainsAny(config.WorkloadGuestStateFile, "\\/:\x00") || !strings.EqualFold(filepath.Ext(config.WorkloadGuestStateFile), ".vmgs") {
 		return nil, errors.New("sibling workload guest state must be a VMGS filename under the existing boot files directory")
 	}
+	if config.UnikraftPackage != "" && (!filepath.IsAbs(config.UnikraftPackage) ||
+		config.SharedMemoryBytes != 32<<20) {
+		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
+	}
 	return &config, nil
 }
 
 // Pair is the sole lifetime owner of two newly created UVMs and their shared
 // section. Workload tasks borrow Workload; only the sandbox closes the Pair.
 type Pair struct {
-	Workload      *uvm.UtilityVM
-	Diode         *uvm.UtilityVM
-	section       *Section
-	uplinkCleanup func() error
-	closeOnce     sync.Once
-	closeErr      error
+	Workload        *uvm.UtilityVM
+	Diode           *uvm.UtilityVM
+	section         *Section
+	uplinkCleanup   func() error
+	closeOnce       sync.Once
+	closeErr        error
+	done            chan struct{}
+	unikraft        bool
+	unikraftConsole *ownedUnikraftConsole
 	// Closers are captured immediately after acquisition so partial startup
 	// follows the same consumer-before-provider ownership order.
 	workloadCloser    io.Closer
@@ -139,6 +148,8 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 // Start creates and bootstraps a pair in-process. Workload boot and diode root
 // provider bootstrap must overlap: the workload cannot reach GCS without root0.
 func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair, resultErr error) {
+	ctx, cancelStartup := context.WithCancel(ctx)
+	defer cancelStartup()
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
 	}
@@ -151,7 +162,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
-	for _, module := range []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "demo.sh", "diode-controller"} {
+	native, err := loadOwnedUnikraft(config)
+	if err != nil {
+		return nil, err
+	}
+	for _, module := range config.moduleInputs() {
 		info, err := os.Stat(filepath.Join(config.ModuleDirectory, module))
 		if err != nil {
 			return nil, fmt.Errorf("sibling pair input %s is unavailable: %w", module, err)
@@ -164,9 +179,16 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
-	pair := &Pair{}
+	pair := &Pair{done: make(chan struct{}), unikraft: native != nil}
+	var nativeControl *diodecontrol.Client
 	defer func() {
 		if resultErr != nil {
+			if nativeControl != nil {
+				resultErr = errors.Join(resultErr, nativeControl.Err())
+			}
+			if pair.unikraftConsole != nil {
+				resultErr = errors.Join(resultErr, pair.unikraftConsole.Err())
+			}
 			resultErr = errors.Join(resultErr, pair.Close())
 		}
 	}()
@@ -179,6 +201,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
+	if native != nil {
+		if err := configureOwnedUnikraft(workloadOptions, diodeOptions, config, native, group.String()); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.Mkdir(diodeOptions.BundleDirectory, 0700); err != nil {
 		return nil, fmt.Errorf("create owned diode bundle: %w", err)
 	}
@@ -188,6 +215,12 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create sibling workload: %w", err)
+	}
+	if native != nil {
+		if err := pair.prepareOwnedUnikraft(diodeOptions, native); err != nil {
+			return nil, err
+		}
+		cancelOnProviderLoss(ctx, pair.unikraftConsole, cancelStartup)
 	}
 	pair.Diode, err = uvm.CreateLCOW(ctx, diodeOptions)
 	if pair.Diode != nil {
@@ -213,6 +246,15 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	}, func(bootCtx context.Context) error {
 		if err := pair.Diode.Start(bootCtx); err != nil {
 			return fmt.Errorf("start sibling diode: %w", err)
+		}
+		if native != nil {
+			var err error
+			nativeControl, err = pair.Diode.NativeStorageControl()
+			if err != nil {
+				return err
+			}
+			cancelOnProviderLoss(ctx, nativeControl, cancelStartup)
+			return pair.unikraftConsole.waitReady(bootCtx)
 		}
 		root, err := pair.Diode.SCSIManager.AddVirtualDisk(bootCtx,
 			filepath.Join(workloadOptions.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd), true, pair.Diode.ID(), "", nil)
@@ -263,7 +305,13 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	}
 	nicCtx, nicCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer nicCancel()
-	device, err := runGuest(nicCtx, pair.Workload, demoToolsStage+workloadNICCommand())
+	nicCommand := workloadNICCommand()
+	ip, gateway := "10.200.0.2", "10.200.0.1"
+	if native != nil {
+		nicCommand = workloadNICCommandForMAC(native.Network.PeerMAC.String())
+		ip, gateway = native.Network.Peer.String(), native.Network.Provider.String()
+	}
+	device, err := runGuest(nicCtx, pair.Workload, demoToolsStage+nicCommand)
 	if err != nil {
 		return nil, err
 	}
@@ -273,19 +321,25 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	}
 	if err := pair.Workload.ConfigureSiblingNetworking(guestresource.LCOWNetworkAdapter{
 		ID: device, DNSServerList: strings.Join(dns, ","),
-		IPConfigs: []guestresource.LCOWIPConfig{{IPAddress: "10.200.0.2", PrefixLength: 30}},
-		Routes:    []guestresource.LCOWRoute{{DestinationPrefix: "0.0.0.0/0", NextHop: "10.200.0.1"}},
+		IPConfigs: []guestresource.LCOWIPConfig{{IPAddress: ip, PrefixLength: 30}},
+		Routes:    []guestresource.LCOWRoute{{DestinationPrefix: "0.0.0.0/0", NextHop: gateway}},
 	}); err != nil {
 		return nil, err
 	}
-	control, err := NewExportControl(pair.Diode)
-	if err != nil {
-		return nil, err
-	}
-	controlCtx, controlCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer controlCancel()
-	if err := control.checkProvider(controlCtx); err != nil {
-		return nil, err
+	var control scsi.SiblingExportControl
+	if native != nil {
+		control = nativeControl
+	} else {
+		linuxControl, err := NewExportControl(pair.Diode)
+		if err != nil {
+			return nil, err
+		}
+		controlCtx, controlCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer controlCancel()
+		if err := linuxControl.checkProvider(controlCtx); err != nil {
+			return nil, err
+		}
+		control = linuxControl
 	}
 	backend, err := scsi.NewSiblingHostBackend(pair.Diode.SCSIManager, pair.Diode.ID(), control)
 	if err != nil {
@@ -300,10 +354,20 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return nil, fmt.Errorf("start sibling interactive shells: %w", err)
 		}
 	}
-	go func() {
-		_ = pair.Diode.Wait()
-		_ = pair.Close()
-	}()
+	if native != nil {
+		if err := nativeControl.Err(); err != nil {
+			return nil, err
+		}
+		if err := pair.unikraftConsole.Err(); err != nil {
+			return nil, err
+		}
+		pair.watchOwnedProvider(nativeControl)
+	} else {
+		go func() {
+			_ = pair.Diode.Wait()
+			_ = pair.Close()
+		}()
+	}
 	return pair, nil
 }
 
@@ -356,22 +420,38 @@ func diodeNetworkCommand(uplink *Uplink) string {
 }
 
 func workloadNICCommand() string {
+	return workloadNICCommandForMAC("")
+}
+
+func workloadNICCommandForMAC(mac string) string {
+	checkMAC := ""
+	if mac != "" {
+		checkMAC = `[ "$(cat "$p/address")" = ` + Quote(mac) + ` ] || { echo 'workload peer MAC differs from Unikraft manifest' >&2; exit 1; }; `
+	}
 	return BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
 		`set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; [ "$#" -eq 1 ]; ` +
 		`until grep -q 'ready=1' "$1"; do sleep 0.1; done; ` +
 		`set -- $(cat "$1"); [ "$#" -eq 5 ]; sb_bus=${1#*=}; [ "${2#*=}" = 3 ]; [ "${3#*=}" = 4 ]; [ "${4#*=}" = 4 ]; [ "${5#*=}" = 1 ]; ` +
 		`until count=0; dev=; for p in /sys/class/net/*; do [ -e "$p/device" ] || continue; ` +
 		`d=$(readlink -f "$p/device"); case ${d##*/} in bus${sb_bus}-relid*) ` +
-		`[ "$(basename "$(readlink "$p/device/driver")")" = hv_netvsc ] || exit 1; dev=${d##*/}; count=$((count+1));; ` +
+		`[ "$(basename "$(readlink "$p/device/driver")")" = hv_netvsc ] || exit 1; ` + checkMAC + `dev=${d##*/}; count=$((count+1));; ` +
 		`*) echo 'direct RP NIC detected on workload' >&2; exit 1;; esac; done; [ "$count" -le 1 ] || exit 1; ` +
 		`[ "$count" -eq 1 ]; do sleep 0.1; done; printf '%s\n' "$dev"`
 }
 
 func (p *Pair) Close() error {
+	return p.close(nil)
+}
+
+func (p *Pair) close(cause error) error {
 	if p == nil {
 		return nil
 	}
 	p.closeOnce.Do(func() {
+		p.closeErr = cause
+		if p.done != nil {
+			close(p.done)
+		}
 		if p.interactiveCloser != nil {
 			p.closeErr = errors.Join(p.closeErr, p.interactiveCloser.Close())
 		}
@@ -381,6 +461,9 @@ func (p *Pair) Close() error {
 		}
 		if p.diodeCloser != nil {
 			p.closeErr = errors.Join(p.closeErr, p.diodeCloser.Close())
+		}
+		if p.unikraftConsole != nil {
+			p.closeErr = errors.Join(p.closeErr, p.unikraftConsole.Close())
 		}
 		if p.uplinkCleanup != nil {
 			p.closeErr = errors.Join(p.closeErr, p.uplinkCleanup())

@@ -501,10 +501,10 @@ var lcowCommand = cli.Command{
 		}
 		if c.Bool(siblingGCSRelayArgName) && (!useGCS || !siblingInteractive ||
 			!c.Bool(sharedMemoryTwoUVMArgName) || !c.Bool(siblingStorageRootArgName) ||
-			c.String(siblingBusGuestModuleArgName) == "" || unikraft != nil ||
+			c.String(siblingBusGuestModuleArgName) == "" ||
 			c.String(siblingOpenShellBundleArgName) != "" || c.String(networkBenchmarkScriptArgName) != "" ||
 			c.String(storageBenchmarkScriptArgName) != "") {
-			return fmt.Errorf("--%s requires an interactive Linux sibling-root pair without other experiments", siblingGCSRelayArgName)
+			return fmt.Errorf("--%s requires an interactive sibling-root pair without other experiments", siblingGCSRelayArgName)
 		}
 		for _, flag := range []struct {
 			name  string
@@ -660,7 +660,7 @@ var lcowCommand = cli.Command{
 				if err != nil {
 					return err
 				}
-				return runUnikraftProvider(ctx, c, unikraft, storagePlan, siblingCommunicationGroupID, cpuGroup, section)
+				return runUnikraftProvider(ctx, c, unikraft, storagePlan, siblingCommunicationGroupID, cpuGroup, section, gcsRelay)
 			}
 			options, err := createLCOWOptions(ctx, c, id)
 			if err != nil {
@@ -1296,7 +1296,7 @@ func runLCOW(
 				return fmt.Errorf("share benchmark diagnostics: %w", err)
 			}
 			execCommand = iperfStage + "set -eu; " +
-				`ping -c 3 -W 3 ` + unikraft.network.provider.String() + `; ` +
+				`ping -c 3 -W 3 ` + unikraft.Network.Provider.String() + `; ` +
 				networkBenchmarkClient(c, "workload")
 		}
 		execCommand, err = unikraftWorkloadCommand("/run/sibling-bus-module/"+filepath.Base(module),
@@ -1832,7 +1832,7 @@ func guestWaitFor(cond, what string) string {
 		"sleep 1; done; "
 }
 
-const siblingTransportVersion = 4
+const siblingTransportVersion = sibling.TransportVersion
 
 func siblingInstanceDiscoveryCommand() string {
 	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +

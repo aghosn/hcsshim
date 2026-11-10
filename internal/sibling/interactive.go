@@ -26,13 +26,23 @@ type pairShells struct {
 	closed    bool
 }
 
+type shellGuest struct {
+	name string
+	vm   *uvm.UtilityVM
+}
+
+func pairShellGuests(pair *Pair) []shellGuest {
+	guests := []shellGuest{{"workload", pair.Workload}}
+	if !pair.unikraft {
+		guests = append(guests, shellGuest{"diode", pair.Diode})
+	}
+	return guests
+}
+
 func startPairShells(pair *Pair) (*pairShells, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &pairShells{ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
-	for _, peer := range []struct {
-		name string
-		vm   *uvm.UtilityVM
-	}{{"workload", pair.Workload}, {"diode", pair.Diode}} {
+	for _, peer := range pairShellGuests(pair) {
 		listener, err := winio.ListenPipe(`\\.\pipe\sibling-`+peer.name, &winio.PipeConfig{
 			SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
 		})
