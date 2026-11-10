@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/exec"
@@ -98,9 +99,9 @@ func protectedSiblingTestArgs(t *testing.T, combined bool) []string {
 	return args
 }
 
-// TestProtectedSiblingProfilesPreflight exercises both intended profiles without
-// native authority, and confirms that the combined route still cannot reach the
-// legacy serial startup before its dependency owner is implemented.
+// TestProtectedSiblingProfilesPreflight admits both complete profiles without
+// native authority. The combined workload selects relay-root VMGS while the
+// diode/legacy roots remain direct; neither enables ordinary proof mappings.
 func TestProtectedSiblingProfilesPreflight(t *testing.T) {
 	oldGCS := useGCS
 	// Restore the process-wide CLI fixture setting after this serial test.
@@ -128,10 +129,24 @@ func TestProtectedSiblingProfilesPreflight(t *testing.T) {
 		if err != nil || profile != want || c.Bool(sharedMemoryTwoUVMArgName) {
 			t.Fatalf("combined=%t: profile=%v err=%v (must not enable proof mode)", combined, profile, err)
 		}
-		if combined {
-			if err := validateProtectedSiblingCLI(c); err == nil ||
-				!strings.Contains(err.Error(), "startup is not enabled") {
-				t.Fatalf("combined startup escaped its stage gate: %v", err)
+		if err := validateProtectedSiblingCLI(c); err != nil {
+			t.Fatalf("supported profile did not reach protected owner admission: %v", err)
+		}
+		for i, id := range []string{"uvmboot-0", "uvmboot-1"} {
+			options, err := createLCOWOptions(context.Background(), c, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mediated := combined && i == 1
+			image := vmutils.DefaultGuestStateFile
+			if mediated {
+				image = siblingStorageRootVMGS
+			}
+			if options.SiblingRoot != mediated || options.GuestStateFilePath != image ||
+				options.BundleDirectory != "" || !options.DmVerityMode ||
+				len(options.SharedMemoryRegions) != 0 ||
+				strings.Contains(options.KernelBootOptions, "hcs_shmem_diag.role=") {
+				t.Fatalf("combined=%t role=%s: incorrect root image, premature bundle or ordinary proof state", combined, id)
 			}
 		}
 	}

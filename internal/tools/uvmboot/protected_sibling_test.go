@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
 
 // protectedDependencyBarrier permits deterministic callback overlap without
@@ -174,7 +177,7 @@ func protectedDependencyResult(t *testing.T, ch <-chan error) error {
 
 // TestProtectedRelayReadinessSeparateFromCreation checks T3's early-process
 // overlap: creation alone cannot satisfy even relay readiness, and readiness
-// does not end the service. Workload Start/receipt gating belongs to S3.
+// does not end the service. Workload Start/receipt gating is separate.
 func TestProtectedRelayReadinessSeparateFromCreation(t *testing.T) {
 	f := newProtectedDependencyFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -367,7 +370,7 @@ func TestProtectedRelayUnexpectedExitCancelsReadiness(t *testing.T) {
 
 // TestProtectedRelayMarkerCannotOverrideExit checks T3's stale-success race:
 // even a successful ready-file callback cannot revive an exited relay or permit
-// a later ready/seal phase. Workload handshake gating remains an S3 obligation.
+// a later ready/seal phase. The bootstrap helper separately gates the handshake.
 func TestProtectedRelayMarkerCannotOverrideExit(t *testing.T) {
 	f := newProtectedDependencyFixture(t)
 	failure := errors.New("relay exited after writing ready file")
@@ -598,6 +601,7 @@ func TestProtectedRelayForegroundCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	other, otherReady, err := protectedSiblingRelayCommands("pair fixture", bus, storage, plan, reports)
 	if err != nil {
 		t.Fatal(err)
@@ -633,5 +637,405 @@ func TestProtectedRelayForegroundCommand(t *testing.T) {
 	reports[0].ReadOnly = false
 	if _, _, err := protectedSiblingRelayCommands("pair fixture", bus, storage, plan, reports); err == nil {
 		t.Fatal("accepted writable root provider")
+	}
+}
+
+// protectedBootstrapTestOps labels the production helper's callback boundaries.
+// It supplies orchestration observations only, never VM/controller receipts.
+func protectedBootstrapTestOps(call func(context.Context, string) error) protectedSiblingBootstrapOps {
+	// step binds one boundary while keeping all effects instance-local.
+	step := func(name string) func(context.Context) error {
+		// Record/perform only the selected scenario's orchestration callback.
+		return func(ctx context.Context) error { return call(ctx, name) }
+	}
+	return protectedSiblingBootstrapOps{
+		bootstrap: step("bootstrap"), create: step("create"), configure: step("configure"),
+		attach: step("attach"), stageDiode: step("stage-diode"),
+		startDependencies: step("start-dependencies"), startWorkload: step("start-workload"),
+		ready: step("relay-ready"), stageWorkload: step("stage-workload"),
+	}
+}
+
+// TestProtectedCombinedBootstrapOverlap checks T3/T6 through the production
+// orchestrator: configure and diode staging precede Start, early dependencies
+// survive a pending workload handshake, and a ready marker cannot skip it.
+func TestProtectedCombinedBootstrapOverlap(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	workload := newProtectedDependencyBarrier()
+	t.Cleanup(workload.release)
+	entered := make(chan struct{})
+	// Model only workload GCS blocking; native receipt validation remains
+	// concrete in the production startWorkload callback, outside this seam.
+	ops := protectedBootstrapTestOps(func(ctx context.Context, name string) error {
+		f.record(name)
+		switch name {
+		case "start-dependencies":
+			if err := f.owner.start(ctx); err != nil {
+				return err
+			}
+			<-f.waitEntered
+		case "start-workload":
+			close(entered)
+			select {
+			case <-workload.ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case "relay-ready":
+			return f.owner.waitReady(ctx)
+		}
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	// Run the same ordered bootstrap helper that the real pair uses.
+	go func() { result <- protectedSiblingBootstrap(ctx, ops) }()
+	protectedDependencyAwait(t, entered)
+	f.ready.release()
+	want := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+		"start-dependencies", "start", "wait", "start-workload"}
+	if !reflect.DeepEqual(f.recorded(), want) {
+		t.Fatalf("incorrect native/configure/dependency order: %v", f.recorded())
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("relay marker bypassed workload handshake: %v", err)
+	default:
+	}
+	workload.release()
+	if err := protectedDependencyResult(t, result); err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, "relay-ready", "ready", "stage-workload")
+	if !reflect.DeepEqual(f.recorded(), want) || f.depCtx.Err() != nil {
+		t.Fatalf("readiness/tool staging order or dependency lifetime changed: %v", f.recorded())
+	}
+}
+
+// TestProtectedCombinedBootstrapFailures checks T3's before/after-create and
+// readiness failures at every production callback boundary. No later tool/
+// readiness step may run after an error, including a failed workload Start.
+func TestProtectedCombinedBootstrapFailures(t *testing.T) {
+	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+		"start-dependencies", "start-workload", "relay-ready", "stage-workload"}
+	for i, failed := range steps {
+		// Each independent failure must leave exactly its attempted prefix.
+		t.Run(failed, func(t *testing.T) {
+			failure := errors.New("failed " + failed)
+			var calls []string
+			// Return an error at one orchestration boundary, without native fakes.
+			ops := protectedBootstrapTestOps(func(_ context.Context, name string) error {
+				calls = append(calls, name)
+				if name == failed {
+					return failure
+				}
+				return nil
+			})
+			if err := protectedSiblingBootstrap(context.Background(), ops); !errors.Is(err, failure) {
+				t.Fatalf("lost bootstrap failure: %v", err)
+			}
+			if !reflect.DeepEqual(calls, steps[:i+1]) {
+				t.Fatalf("work continued after failure: %v", calls)
+			}
+		})
+	}
+}
+
+// TestProtectedCombinedBootstrapCancellation checks T3: cancellation returned
+// by an otherwise successful callback prevents every later boundary, including
+// tool/readiness steps, and final callback cancellation cannot report success.
+func TestProtectedCombinedBootstrapCancellation(t *testing.T) {
+	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+		"start-dependencies", "start-workload", "relay-ready", "stage-workload"}
+	for i := -1; i < len(steps); i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		var calls []string
+		if i == -1 {
+			cancel()
+		}
+		// Cancel after a selected synchronous borrower has returned its work.
+		ops := protectedBootstrapTestOps(func(_ context.Context, name string) error {
+			calls = append(calls, name)
+			if i >= 0 && name == steps[i] {
+				cancel()
+			}
+			return nil
+		})
+		err := protectedSiblingBootstrap(ctx, ops)
+		cancel()
+		if !errors.Is(err, context.Canceled) || len(calls) != i+1 {
+			t.Fatalf("cancel boundary=%d: calls=%v err=%v", i, calls, err)
+		}
+	}
+}
+
+// protectedDrainTestOps binds shutdown ordering to the real dependency owner.
+// Native termination is represented only by a confirmed-drain decision, not a
+// fake VM or protected backing receipt.
+func protectedDrainTestOps(f *protectedDependencyFixture, forwardErr error,
+	workloadDrained, diodeDrained bool) protectedSiblingDrainOps {
+	return protectedSiblingDrainOps{
+		// joinForward must finish while both dependency paths are still live.
+		joinForward: func(context.Context) error {
+			f.record("join-forward")
+			return forwardErr
+		},
+		// Mark expected EOF without cancelling dependencies or erasing failure.
+		beginClosing: func() {
+			f.record("begin-closing")
+			f.owner.beginClosing()
+		},
+		// Termination may cause relay EOF before the later drain call.
+		terminateWorkload: func(context.Context) (bool, error) {
+			f.record("terminate-workload")
+			if workloadDrained {
+				f.exit.release()
+				<-f.owner.done
+				return true, nil
+			}
+			return false, errors.New("workload wait unconfirmed")
+		},
+		// Use the production lifetime/retention decisions, not a fake drain.
+		drainDependencies: func(ctx context.Context, drained bool) error {
+			f.record("drain-dependencies")
+			return f.owner.drain(ctx, drained)
+		},
+		// A diode stop is still attempted after earlier unconfirmed drainage.
+		terminateDiode: func(context.Context) (bool, error) {
+			f.record("terminate-diode")
+			if !diodeDrained {
+				return false, errors.New("diode wait unconfirmed")
+			}
+			return true, nil
+		},
+	}
+}
+
+// TestProtectedCombinedDrainOrdering checks T4/S2-R1 at the production cleanup
+// seam. Forward borrowers join before expected EOF/native workload termination;
+// provider/root release precede diode termination and backing-release authority.
+func TestProtectedCombinedDrainOrdering(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	if err := f.owner.start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	protectedDependencyAwait(t, f.waitEntered)
+	safe, err := protectedSiblingDrain(context.Background(), protectedDrainTestOps(f, nil, true, true))
+	if err != nil || !safe {
+		t.Fatalf("confirmed ordered cleanup did not authorize later backing cleanup: %v", err)
+	}
+	want := []string{"start", "wait", "join-forward", "begin-closing", "terminate-workload",
+		"joined", "drain-dependencies", "quiesce", "release", "terminate-diode"}
+	if !reflect.DeepEqual(f.recorded(), want) || f.pair.ctx.Err() != nil ||
+		!f.owner.rootReleased || !f.owner.providerDrained {
+		t.Fatalf("unsafe cleanup/expected EOF handling: %v cause=%v", f.recorded(), context.Cause(f.pair.ctx))
+	}
+}
+
+// TestProtectedCombinedDrainFailures checks T4: failed borrower/native drainage,
+// quiescence, root unplug or cleanup budget cannot authorize backing release.
+// Native diode termination remains best-effort even when root ownership stays.
+func TestProtectedCombinedDrainFailures(t *testing.T) {
+	for _, scenario := range []string{"forward-join", "workload-wait", "provider", "root-release", "diode-wait", "timeout"} {
+		// Each case drives the actual dependency retention helper.
+		t.Run(scenario, func(t *testing.T) {
+			f := newProtectedDependencyFixture(t)
+			failure := errors.New(scenario)
+			var forwardErr error
+			workloadDrained, diodeDrained := true, true
+			switch scenario {
+			case "forward-join":
+				forwardErr = failure
+			case "workload-wait":
+				workloadDrained = false
+			case "provider":
+				f.quiesceErr = failure
+			case "root-release":
+				f.releaseErr = failure
+			case "diode-wait":
+				diodeDrained = false
+			}
+			if err := f.owner.start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			protectedDependencyAwait(t, f.waitEntered)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if scenario == "timeout" {
+				cancel()
+				f.quiesceErr = context.Canceled
+			}
+			safe, err := protectedSiblingDrain(ctx, protectedDrainTestOps(f, forwardErr, workloadDrained, diodeDrained))
+			if safe || err == nil {
+				t.Fatal("incomplete cleanup authorized backing release")
+			}
+			calls := f.recorded()
+			if calls[len(calls)-1] != "terminate-diode" {
+				t.Fatalf("early failure skipped native diode termination: %v", calls)
+			}
+			if scenario != "diode-wait" && (f.owner.root == nil || f.owner.rootOwner == nil || f.owner.rootReleased) {
+				t.Fatal("unresolved usage/release discarded workload root ownership")
+			}
+		})
+	}
+}
+
+// TestProtectedCombinedFailedWorkloadKeepsDependencies checks T3/T4 after real
+// helper-owned process creation: a workload Start failure skips all later
+// readiness/staging, but forward stop cannot kill the dependency lifetime.
+func TestProtectedCombinedFailedWorkloadKeepsDependencies(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	failure := errors.New("workload Start failed")
+	// Reuse the production bootstrap owner and its independent dependency ctx.
+	ops := protectedBootstrapTestOps(func(ctx context.Context, name string) error {
+		f.record(name)
+		switch name {
+		case "start-dependencies":
+			return f.owner.start(ctx)
+		case "start-workload":
+			return failure
+		case "relay-ready", "stage-workload":
+			t.Error("unsafe readiness after failed workload Start")
+		}
+		return nil
+	})
+	if err := protectedSiblingBootstrap(context.Background(), ops); !errors.Is(err, failure) {
+		t.Fatalf("lost workload failure: %v", err)
+	}
+	protectedDependencyAwait(t, f.waitEntered)
+	f.pair.stop(failure)
+	if f.depCtx.Err() != nil || f.owner.root == nil || f.owner.rootOwner == nil {
+		t.Fatal("failed workload startup destroyed required dependencies")
+	}
+}
+
+// TestProtectedCombinedOwnedRoot checks T1/T6's source-lifetime contract: the
+// attached disk is the workload bundle copy, not the outer caller's template,
+// and selecting it does not mutate the preflight plan.
+func TestProtectedCombinedOwnedRoot(t *testing.T) {
+	plan := storageTestPlan(t)
+	plan.Disks = plan.Disks[:1]
+	template := plan.Disks[0].HostPath
+	options := uvm.NewDefaultOptionsLCOW("uvmboot-1", "fixture")
+	options.BundleDirectory = t.TempDir()
+	workload := &protectedSiblingVM{options: options, bundleOwned: true}
+	owned, err := protectedSiblingOwnedRoot(workload, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned.Disks[0].HostPath != filepath.Join(options.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd) ||
+		owned.Disks[0].HostPath == template || plan.Disks[0].HostPath != template ||
+		owned.Disks[0].Access != "read-only" || *owned.Disks[0].ExportLUN != 0 {
+		t.Fatal("owned root selection changed the read-only route or borrowed a template")
+	}
+	workload.bundleOwned = false
+	if _, err := protectedSiblingOwnedRoot(workload, plan); err == nil {
+		t.Fatal("unowned root bundle accepted")
+	}
+}
+
+// TestProtectedToolStagingIsolation checks H-side T6: both roles receive checked
+// copies on one tmpfs, but only the diode receives AHV tooling, and staging has
+// no implicit prepare/report operation.
+func TestProtectedToolStagingIsolation(t *testing.T) {
+	for _, role := range []string{diodeRole, workloadRole} {
+		artifacts := protectedSiblingToolArtifacts(role)
+		command := protectedSiblingToolCommand(artifacts, "metadata-stage; ")
+		ahv := false
+		for _, artifact := range artifacts {
+			if artifact.host == "ahv-guest-ctl" {
+				ahv = true
+			}
+			if !strings.Contains(command, "cp "+shellSingleQuote(artifact.root+"/"+artifact.host)) ||
+				!strings.Contains(command, "chmod 755 /run/dtb-exec/"+artifact.destination) {
+				t.Fatalf("%s tool %s not checked/staged", role, artifact.host)
+			}
+		}
+		if ahv != (role == diodeRole) ||
+			strings.Contains(command, "ahv-guest-ctl") != (role == diodeRole) ||
+			strings.Count(command, "mount -t tmpfs") != 1 ||
+			!strings.Contains(command, "metadata-stage; ") {
+			t.Fatalf("%s lost role isolation/single tmpfs staging", role)
+		}
+		for _, forbidden := range []string{"ahv-guest-ctl prepare", "ahv-guest-ctl report", "exec /run/dtb-exec/ahv-guest-ctl"} {
+			if strings.Contains(command, forbidden) {
+				t.Fatalf("implicit AHV operation in %s staging: %s", role, forbidden)
+			}
+		}
+	}
+}
+
+// TestProtectedCombinedRelayLossDuringStart checks T3/T4: relay failure cancels
+// a pending workload handshake, suppresses later readiness/tool steps and keeps
+// dependencies/root ownership available for native workload shutdown.
+func TestProtectedCombinedRelayLossDuringStart(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	failure := errors.New("relay lost during workload handshake")
+	f.exitErr = failure
+	entered := make(chan struct{})
+	// Drive the production bootstrap with the real dependency cancellation
+	// owner; only the blocking workload operation is an orchestration callback.
+	ops := protectedBootstrapTestOps(func(ctx context.Context, name string) error {
+		f.record(name)
+		switch name {
+		case "start-dependencies":
+			return f.owner.start(ctx)
+		case "start-workload":
+			close(entered)
+			<-ctx.Done()
+			return ctx.Err()
+		case "relay-ready", "stage-workload":
+			t.Error("relay loss permitted later readiness/staging")
+		}
+		return nil
+	})
+	result := make(chan error, 1)
+	// Relay loss must interrupt the actual production ordering helper.
+	go func() { result <- protectedSiblingBootstrap(f.pair.ctx, ops) }()
+	protectedDependencyAwait(t, entered)
+	f.exit.release()
+	if err := protectedDependencyResult(t, result); err == nil ||
+		!errors.Is(context.Cause(f.pair.ctx), failure) {
+		t.Fatalf("pending Start lost dependency failure: %v cause=%v", err, context.Cause(f.pair.ctx))
+	}
+	if f.depCtx.Err() != nil || f.owner.root == nil || f.owner.rootOwner == nil {
+		t.Fatal("relay loss destroyed owners before workload native drainage")
+	}
+}
+
+// TestProtectedRootAttachFailureRetention checks T4's actual attachment seam:
+// an uncertain attach without a release callback retains a sentinel and bundle;
+// a returned partial mount stays owned and is released only after quiescence.
+func TestProtectedRootAttachFailureRetention(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		f := newProtectedDependencyFixture(t)
+		failure := errors.New("attach failed after possible native progress")
+		attachment := *f.owner.root
+		// Supply only an attachment result/error, matching the existing small
+		// storage-test seam rather than introducing a fake SCSI manager.
+		err := f.owner.attachRoot(context.Background(), siblingStorageDisk{},
+			func(context.Context, siblingStorageDisk) (siblingStorageAttachment, error) {
+				if partial {
+					return attachment, failure
+				}
+				return siblingStorageAttachment{}, failure
+			})
+		if !errors.Is(err, failure) || f.owner.root == nil || f.owner.rootOwner == nil {
+			t.Fatal("failed attach discarded its root attempt or bundle owner")
+		}
+		err = f.owner.drain(context.Background(), false)
+		if err == nil || f.owner.root == nil || f.owner.providerDrained {
+			t.Fatal("attach failure bypassed workload drain prerequisite")
+		}
+		err = f.owner.drain(context.Background(), true)
+		if partial {
+			if err != nil || f.owner.root != nil || !f.owner.rootReleased ||
+				!reflect.DeepEqual(f.recorded(), []string{"quiesce", "release"}) {
+				t.Fatalf("partial mount was not released after quiescence: %v calls=%v", err, f.recorded())
+			}
+		} else if err == nil || f.owner.root == nil || f.owner.rootReleased {
+			t.Fatal("unobservable attachment outcome allowed ownership release")
+		}
 	}
 }

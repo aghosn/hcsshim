@@ -34,7 +34,7 @@ type protectedSiblingDependencyOps struct {
 // protectedSiblingDependencies retains the early diode process and workload
 // root mount for runProtectedSibling. Its context deliberately does not inherit
 // forward cancellation: workload shutdown still needs relay/storage services.
-// The pair coordinator serializes start, waitReady, beginClosing and drain;
+// The pair coordinator serializes attachment, start, readiness and drainage;
 // completion and expected-closing observation use mu. A bounded join failure
 // retains this owner, including any in-flight native/GCS borrower and the
 // workload's bundle owner.
@@ -71,6 +71,21 @@ func newProtectedSiblingDependencies(stop func(error), ops protectedSiblingDepen
 		rootOwner: rootOwner, root: root,
 		created: make(chan struct{}), done: make(chan struct{}),
 	}
+}
+
+// attachRoot records an attempted mount before borrowing the diode's SCSI
+// manager for runProtectedSibling. Partial results survive errors. An error
+// without a release callback leaves a sentinel that forbids owner deletion;
+// successful release, not an attach error or ordinary manager close, clears it.
+func (d *protectedSiblingDependencies) attachRoot(ctx context.Context, disk siblingStorageDisk,
+	attach func(context.Context, siblingStorageDisk) (siblingStorageAttachment, error)) error {
+	d.root = &siblingStorageAttachment{}
+	attachment, err := attach(ctx, disk)
+	*d.root = attachment
+	if err != nil {
+		return fmt.Errorf("protected root attach outcome uncertain; retain owners: %w", err)
+	}
+	return nil
 }
 
 // protectedSiblingRelayCommands builds the early diode service used by
@@ -123,11 +138,11 @@ func protectedSiblingRelayCommands(run, busModule, storageModule string,
 	return command, ready, nil
 }
 
-// newProtectedSiblingRelay binds the real cmd/GCS operations to the same owner
-// exercised by helper tests. runProtectedSibling must retain it on the pair
-// before start, after attaching the workload bundle's root copy to the diode.
-func newProtectedSiblingRelay(p *protectedSiblingPair, diode, workload *protectedSiblingVM,
-	root *siblingStorageAttachment, command, ready string) *protectedSiblingDependencies {
+// configureProtectedSiblingRelay binds real cmd/GCS operations to the retained
+// root owner used by runProtectedSibling. It must precede the single start;
+// configuration itself starts no process and transfers no attachment ownership.
+func configureProtectedSiblingRelay(d *protectedSiblingDependencies, p *protectedSiblingPair,
+	diode *protectedSiblingVM, command, ready string) {
 	// Configure before Start; cmd owns cancellation, streams and Process.Close
 	// through Wait, including synchronous calls that outlive a cleanup budget.
 	process := cmd.CommandContext(context.Background(), diode.vm, "sh", "-c", command)
@@ -177,17 +192,80 @@ func newProtectedSiblingRelay(p *protectedSiblingPair, diode, workload *protecte
 		// quiesce is valid only after the potential provider starter is joined.
 		// rmmod drains provider work; failure/failed observation forbids release.
 		quiesce: func(ctx context.Context) error {
-			return protectedSiblingGuest(ctx, diode,
-				`set -eu; if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; `+
-					`[ ! -d /sys/module/diode_storvsp ]`)
+			return protectedSiblingQuiesceProvider(ctx, diode)
 		},
 	}
 	// Attribute asynchronous failure to this pair and its diode, not a
 	// standalone background command whose ownership cannot be reconstructed.
-	stop := func(err error) {
+	d.stop = func(err error) {
 		p.stop(fmt.Errorf("protected dependency run=%s vm=%s: %w", p.run, diode.options.ID, err))
 	}
-	return newProtectedSiblingDependencies(stop, ops, workload, root)
+	d.ops = ops
+}
+
+// protectedSiblingQuiesceProvider verifies provider absence through the diode's
+// direct GCS. Callers must first join every possible provider starter; failure
+// is not evidence that the disk or protected transfer buffers are unused.
+func protectedSiblingQuiesceProvider(ctx context.Context, diode *protectedSiblingVM) error {
+	return protectedSiblingGuest(ctx, diode,
+		`set -eu; if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; `+
+			`[ ! -d /sys/module/diode_storvsp ]`)
+}
+
+// protectedSiblingBootstrapOps supplies only per-run ordering operations.
+// bootstrap/startWorkload in production include concrete receipt validation;
+// tests exercise orchestration, never fabricate native authority.
+type protectedSiblingBootstrapOps struct {
+	bootstrap, create, configure, attach func(context.Context) error
+	stageDiode, startDependencies        func(context.Context) error
+	startWorkload, ready, stageWorkload  func(context.Context) error
+}
+
+// protectedSiblingBootstrap enforces runProtectedSibling's combined cold-start
+// order. Creation/configuration precede workload Start; dependencies can await
+// peer native-running while that Start completes GCS. Every callback is joined
+// before returning, except the explicitly owned asynchronous dependency starter.
+// Failure/cancellation prevents every later step and the caller's ready/seal phase.
+func protectedSiblingBootstrap(ctx context.Context, ops protectedSiblingBootstrapOps) error {
+	for _, step := range []func(context.Context) error{
+		ops.bootstrap, ops.create, ops.configure, ops.attach, ops.stageDiode,
+		ops.startDependencies, ops.startWorkload, ops.ready, ops.stageWorkload,
+	} {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
+		if err := step(ctx); err != nil {
+			return err
+		}
+	}
+	return context.Cause(ctx)
+}
+
+// protectedSiblingDrainOps keeps native termination concrete while permitting
+// tests to verify the consumer/provider ordering used by runProtectedSibling.
+// terminate callbacks report confirmed drainage separately from their errors.
+type protectedSiblingDrainOps struct {
+	joinForward       func(context.Context) error
+	beginClosing      func()
+	terminateWorkload func(context.Context) (bool, error)
+	drainDependencies func(context.Context, bool) error
+	terminateDiode    func(context.Context) (bool, error)
+}
+
+// protectedSiblingDrain marks expected relay EOF before native workload stop,
+// drains relay/provider/root while diode GCS is live, and always attempts diode
+// termination even after errors. False forbids backing teardown/release and
+// owner deletion; cancellation or failed observations never imply drainage.
+// The caller must first return from synchronous setup; joinForward closes/joins
+// remaining services and shells without destroying dependencies.
+func protectedSiblingDrain(ctx context.Context, ops protectedSiblingDrainOps) (bool, error) {
+	forwardErr := ops.joinForward(ctx)
+	ops.beginClosing()
+	workloadDrained, workloadErr := ops.terminateWorkload(ctx)
+	dependencyErr := ops.drainDependencies(ctx, workloadDrained && forwardErr == nil)
+	diodeDrained, diodeErr := ops.terminateDiode(ctx)
+	return forwardErr == nil && workloadDrained && diodeDrained && dependencyErr == nil,
+		errors.Join(forwardErr, workloadErr, dependencyErr, diodeErr)
 }
 
 // start initiates and retains process creation before waiting under the forward
@@ -323,8 +401,8 @@ func (d *protectedSiblingDependencies) beginClosing() {
 // root while guest unplug is still possible. The caller must first join setup/
 // shell borrowers and observe workload native drainage. A failed join, uncertain
 // creation, provider drain or Mount.Release retains the attachment and bundle
-// owner; no result authorizes native backing reclaim. S3 owns best-effort native
-// termination and sticky pair uncertainty after any incomplete cleanup.
+// owner; no result authorizes native backing reclaim. runProtectedSibling owns
+// best-effort native termination and sticky pair uncertainty after incomplete cleanup.
 func (d *protectedSiblingDependencies) drain(ctx context.Context, workloadDrained bool) error {
 	if !workloadDrained {
 		return errors.New("protected workload drainage unconfirmed; dependencies retained")

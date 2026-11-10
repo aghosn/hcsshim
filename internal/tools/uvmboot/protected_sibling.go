@@ -19,8 +19,10 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
 
 const (
@@ -66,6 +68,7 @@ type protectedSiblingService struct {
 // serializes cancellation with seal-attempt commitment, not native execution.
 // cleanup has its own independent budget and joins shell/command borrowers.
 type protectedSiblingPair struct {
+	profile     protectedSiblingProfile
 	memory      *protectedSiblingMemory
 	workers     []*protectedSiblingVM
 	cpuGroups   *cpuGroupAssignments
@@ -81,8 +84,7 @@ type protectedSiblingPair struct {
 	forwardMu   sync.Mutex
 	run         string
 	seals       [2]protectedPartitionSeal
-	// mediated is dormant until the combined runProtectedSibling path is
-	// wired. stop cancels forward work only; its dependencies drain separately.
+	// stop cancels forward work only; mediated dependencies drain separately.
 	mediated *protectedSiblingDependencies
 }
 
@@ -270,8 +272,7 @@ func classifyProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, e
 }
 
 // preflightProtectedSiblingProfile checks file inputs for runProtectedSibling
-// without allocating backing, boot copies or VMs. It validates the intended
-// combined contract even while validateProtectedSiblingCLI keeps startup gated.
+// without allocating backing, boot copies or VMs.
 // File checks establish input shape, not image authenticity or native authority.
 func preflightProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, error) {
 	profile, err := classifyProtectedSiblingProfile(c)
@@ -330,26 +331,27 @@ func preflightProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, 
 	return profile, nil
 }
 
-// validateProtectedSiblingCLI preflights runProtectedSibling before any resource
-// acquisition. Combined startup stays closed until its dependency owner is wired:
-// it must never enter the legacy serial Start sequence and deadlock on GCS/root.
+// validateProtectedSiblingCLI preflights both runProtectedSibling profiles before
+// any resource acquisition, including the concrete controller ABI.
 func validateProtectedSiblingCLI(c *cli.Context) error {
-	profile, err := preflightProtectedSiblingProfile(c)
-	if err != nil {
+	if _, err := preflightProtectedSiblingProfile(c); err != nil {
 		return err
-	}
-	if profile == protectedSiblingMediatedRoot {
-		return errors.New("protected mediated-root/GCS startup is not enabled")
 	}
 	return validateProtectedControllerABI()
 }
 
 // runProtectedSibling owns the default-off experiment from preflight to bounded
-// cleanup. CLI access and backing state remain serial; both successful starts
-// precede concurrent guest transport setup. Signals, VM exits and service exits
-// cancel ongoing work. Primary and cleanup errors are joined, never suppressed
-// by markers. Independent optional masks follow checked networking/backing seal
-// and optional cancellable pause, with per-call budgets starting after resume.
+// cleanup. Legacy direct-root startup remains serial. Combined startup checks
+// diode Bootstrap/Install before creating Import, configures the unstarted
+// workload's relay, and exports its owned bundle root from the diode. Early
+// diode services overlap workload native Start/GCS handshake; both the actual
+// Import receipt and explicit relay readiness precede networking and seals.
+// Tools/shares are staged once per role, with AHV tooling only on the diode.
+// Forward cancellation preserves dependencies through workload termination,
+// relay/provider drainage and root unplug; the workload bundle survives until
+// that attachment is released. Only then may native backing reclaim and owner
+// release follow. Errors/uncertainty retain owners, never ordinary fallbacks.
+// Independent optional masks/pause keep their existing exact semantics.
 // Compilation and lab execution are separate manual prerequisites.
 func runProtectedSibling(c *cli.Context) (resultErr error) {
 	if err := validateProtectedPartitionCLI(c); err != nil {
@@ -357,6 +359,17 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	}
 	if err := validateProtectedSiblingCLI(c); err != nil {
 		return err
+	}
+	profile, err := classifyProtectedSiblingProfile(c)
+	if err != nil {
+		return err
+	}
+	var rootPlan *siblingStoragePlan
+	if profile == protectedSiblingMediatedRoot {
+		rootPlan, err = loadSiblingStoragePlan(c)
+		if err != nil {
+			return err
+		}
 	}
 	// Populate cli v1's lazy maps before guest/shell goroutines read settings.
 	_ = c.IsSet("help")
@@ -373,7 +386,7 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	}
 	p := &protectedSiblingPair{
 		ctx: ctx, cancel: cancel, parent: parent, watchCtx: watchCtx, stopWatch: stopWatch,
-		run: group.String(),
+		run: group.String(), profile: profile,
 	}
 	for i, name := range []string{diodePartitionSealMaskArgName, workloadPartitionSealMaskArgName} {
 		role := diodeRole
@@ -452,10 +465,11 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		p.seals[i].vmID = options.ID
 		if options.GuestStateFilePath == "" || !options.SecurityPolicyEnabled ||
 			options.HclEnabled == nil || *options.HclEnabled || options.AllowOvercommit ||
-			options.EnableDeferredCommit || !options.DmVerityMode || options.SiblingRoot ||
+			options.EnableDeferredCommit || !options.DmVerityMode ||
+			options.SiblingRoot != (profile == protectedSiblingMediatedRoot && i == 1) ||
 			options.Appliance != nil || !options.UseGuestConnection ||
 			len(options.SharedMemoryRegions) != 0 || len(options.SiblingCommunicationEndpoints) != 0 {
-			return errors.New("protected route requires direct SNP, RP dm-verity root and no preconfigured shared regions/endpoints")
+			return errors.New("protected route requires SNP dm-verity roots, the selected root route and no preconfigured shared regions/endpoints")
 		}
 		if err := uvm.VerifyOptions(ctx, options); err != nil {
 			return fmt.Errorf("protected %s options: %w", options.ID, err)
@@ -511,11 +525,16 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	}
 	setupCtx, stopSetup := context.WithTimeout(ctx, protectedSetupBudget)
 	defer stopSetup()
-	// Do not wait for pair/network readiness here: diode's native startup must
-	// finish and publish its actual full-init Install receipt before B exists.
-	for _, v := range p.workers {
-		if err := p.start(setupCtx, v); err != nil {
+	if profile == protectedSiblingMediatedRoot {
+		if err := p.bootstrapMediated(setupCtx, c, rootPlan); err != nil {
 			return err
+		}
+	} else {
+		// Native Bootstrap's actual full-init Install receipt precedes Import.
+		for _, v := range p.workers {
+			if err := p.start(setupCtx, v); err != nil {
+				return err
+			}
 		}
 	}
 	for _, v := range p.workers {
@@ -537,8 +556,10 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		if v.role == workloadRole && len(configs[i].dns) == 0 {
 			return errors.New("protected workload requires an available host DNS resolver")
 		}
-		if err := stageProtectedSiblingTools(setupCtx, c, v); err != nil {
-			return err
+		if profile == protectedSiblingDirectRoot {
+			if err := stageProtectedSiblingTools(setupCtx, c, v); err != nil {
+				return err
+			}
 		}
 	}
 	// Both starts are complete. Discovery can now wait for the real peer, with
@@ -618,6 +639,16 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 // invalid post-start observation makes uncertainty sticky, even if worker-side
 // automatic cleanup ran. Native startup precedes GCS tool use.
 func (p *protectedSiblingPair) start(ctx context.Context, v *protectedSiblingVM) error {
+	if err := p.create(ctx, v); err != nil {
+		return err
+	}
+	return p.startCreated(ctx, v)
+}
+
+// create retains a native attempt before dispatch. Import can be created only
+// from Bootstrap's checked full initialization and lease; creation never grants
+// native startup authority or allows uncertainty to be cleared.
+func (p *protectedSiblingPair) create(ctx context.Context, v *protectedSiblingVM) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -638,6 +669,16 @@ func (p *protectedSiblingPair) start(ctx context.Context, v *protectedSiblingVM)
 	if err != nil {
 		p.memory.unknown = true
 		return fmt.Errorf("protected %s create (native ownership unobservable): %w", v.options.ID, err)
+	}
+	return nil
+}
+
+// startCreated starts the retained attempt and validates the real receipt/GPA.
+// UtilityVM.Start includes the GCS handshake, not merely native-running state.
+// Failed startup retains exact observed prefixes and sticky native uncertainty.
+func (p *protectedSiblingPair) startCreated(ctx context.Context, v *protectedSiblingVM) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := v.vm.Start(ctx); err != nil {
 		p.memory.unknown = true
@@ -671,6 +712,91 @@ func (p *protectedSiblingPair) start(ctx context.Context, v *protectedSiblingVM)
 	fmt.Printf("protected sibling: vm=%s role=%s mode=%s lease=%d initialized=%d installed=true byte_gpa=%#x at=%s\n",
 		v.options.ID, v.role, v.region.ProtectedSharedBackingMode, info.LeaseId,
 		info.InitializedPages, gpa, time.Now().UTC().Format(time.RFC3339Nano))
+	return nil
+}
+
+// bootstrapMediated binds the small ordering helper to concrete native operations
+// for runProtectedSibling. No callback substitutes for native receipt validation.
+func (p *protectedSiblingPair) bootstrapMediated(ctx context.Context, c *cli.Context, plan *siblingStoragePlan) error {
+	diode, workload := p.workers[0], p.workers[1]
+	return protectedSiblingBootstrap(ctx, protectedSiblingBootstrapOps{
+		// bootstrap establishes the actual lease before any Import creation.
+		bootstrap: func(ctx context.Context) error { return p.start(ctx, diode) },
+		// create retains the workload bundle and its Import attempt.
+		create: func(ctx context.Context) error { return p.create(ctx, workload) },
+		// configure replaces the direct listener before the first workload Start.
+		configure: func(context.Context) error { return workload.vm.ConfigureGCSRelay(diode.vm) },
+		// attach acquires only the workload-owned root copy, retaining failures.
+		attach: func(ctx context.Context) error { return p.prepareMediatedRoot(ctx, c, plan) },
+		// stageDiode runs once, before the early service can use its tools.
+		stageDiode: func(ctx context.Context) error { return stageProtectedSiblingTools(ctx, c, diode) },
+		// startDependencies creates the owned foreground service without peer waits.
+		startDependencies: func(ctx context.Context) error { return p.mediated.start(ctx) },
+		// startWorkload allows native offers while the diode service awaits its peer.
+		startWorkload: func(ctx context.Context) error { return p.startCreated(ctx, workload) },
+		// ready is additional to the actual Import receipt and GCS handshake.
+		ready: func(ctx context.Context) error { return p.mediated.waitReady(ctx) },
+		// stageWorkload uses only its now-connected relayed GCS, never the diode tmpfs.
+		stageWorkload: func(ctx context.Context) error { return stageProtectedSiblingTools(ctx, c, workload) },
+	})
+}
+
+// protectedSiblingOwnedRoot selects CreateLCOW's fixed bundle copy from a
+// preflighted root plan, never the caller-owned template. It leaves the input
+// plan unchanged; the pair keeps the workload owner until diode release succeeds.
+func protectedSiblingOwnedRoot(workload *protectedSiblingVM, plan *siblingStoragePlan) (*siblingStoragePlan, error) {
+	if workload == nil || !workload.bundleOwned || workload.options == nil ||
+		workload.options.BundleDirectory == "" || plan == nil || len(plan.Disks) != 1 {
+		return nil, errors.New("protected root requires an owned workload bundle and one root export")
+	}
+	owned := &siblingStoragePlan{Version: plan.Version, Disks: append([]siblingStorageDisk(nil), plan.Disks...)}
+	owned.Disks[0].HostPath = filepath.Join(workload.options.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd)
+	return owned, nil
+}
+
+// prepareMediatedRoot retains the attachment attempt before calling the existing
+// SCSI helper. An attach error can hide partial native progress: the sentinel
+// has no release authority, so cleanup retains both VM/bundle owners. Successful
+// mounts keep their real Release callback even if later command/share setup fails.
+func (p *protectedSiblingPair) prepareMediatedRoot(ctx context.Context, c *cli.Context, plan *siblingStoragePlan) error {
+	diode, workload := p.workers[0], p.workers[1]
+	owned, err := protectedSiblingOwnedRoot(workload, plan)
+	if err != nil {
+		return err
+	}
+	p.mediated = newProtectedSiblingDependencies(p.stop, protectedSiblingDependencyOps{
+		// quiesce also covers failure before any provider starter was dispatched.
+		quiesce: func(ctx context.Context) error { return protectedSiblingQuiesceProvider(ctx, diode) },
+	}, workload, nil)
+	// The production SCSI helper supplies the actual slot and release owner;
+	// errors with no returned mount must retain the attempt rather than guess.
+	if err := p.mediated.attachRoot(ctx, owned.Disks[0], func(ctx context.Context, disk siblingStorageDisk) (siblingStorageAttachment, error) {
+		return attachSiblingStorageDisk(ctx, diode.vm, disk)
+	}); err != nil {
+		return err
+	}
+	root := p.mediated.root
+	if root.release == nil || root.controller >= uint(len(guestrequest.ScsiControllerGuids)) {
+		return errors.New("protected root attachment lacks valid release/controller identity")
+	}
+	report := siblingStorageBackendReport{
+		DiskID: "workload-root", Role: "root", HostPath: owned.Disks[0].HostPath,
+		ReadOnly: true, DiodeVM: diode.options.ID, WorkloadVM: workload.options.ID,
+		ControllerID: guestrequest.ScsiControllerGuids[root.controller],
+		Controller:   root.controller, LUN: root.lun, ExportLUN: 0, State: "attached-only",
+	}
+	module := c.String(siblingBusGuestModuleArgName)
+	storage := filepath.Join(filepath.Dir(module), "diode_storvsp.ko")
+	if err := diode.vm.Share(ctx, storage, "/run/diode-storage-module", true); err != nil {
+		return err
+	}
+	command, ready, err := protectedSiblingRelayCommands(p.run,
+		"/run/sibling-bus-module/"+filepath.Base(module), "/run/diode-storage-module/diode_storvsp.ko",
+		owned, []siblingStorageBackendReport{report})
+	if err != nil {
+		return err
+	}
+	configureProtectedSiblingRelay(p.mediated, p, diode, command, ready)
 	return nil
 }
 
@@ -740,9 +866,32 @@ func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protecte
 	if err := v.vm.Share(ctx, module, "/run/sibling-bus-module", true); err != nil {
 		return err
 	}
-	artifacts := []struct {
-		host, root, destination string
-	}{
+	artifacts := protectedSiblingToolArtifacts(v.role)
+	metadataStage, err := stagePageMetadata(ctx, c, v.vm, v.role)
+	if err != nil {
+		return err
+	}
+	for _, a := range artifacts {
+		if err := v.vm.Share(ctx, filepath.Join(filepath.Dir(module), a.host), a.root, true); err != nil {
+			return fmt.Errorf("share required protected tool %s: %w", a.host, err)
+		}
+	}
+	if netModule := siblingNetModuleName(v.role); netModule != "" {
+		if err := v.vm.Share(ctx, filepath.Join(filepath.Dir(module), netModule), "/run/diode-net-module", true); err != nil {
+			return err
+		}
+	}
+	return protectedSiblingGuest(ctx, v, protectedSiblingToolCommand(artifacts, metadataStage))
+}
+
+type protectedSiblingTool struct {
+	host, root, destination string
+}
+
+// protectedSiblingToolArtifacts is the shared staging contract for both
+// profiles. Only the diode receives the explicit-use AHV CLI.
+func protectedSiblingToolArtifacts(role string) []protectedSiblingTool {
+	artifacts := []protectedSiblingTool{
 		{"diode_tcpbulk", "/run/diode-tcpbulk", "dtb"},
 		{"diode_vsock_test", "/run/diode-vsock-test", "vsock-test"},
 		{iperfGuestName, iperfGuestShare, "ipf"},
@@ -752,30 +901,23 @@ func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protecte
 		{"diode_tc", "/run/diode-tc", "tc"},
 		{"diode_iptables", "/run/diode-iptables", "ipt"},
 	}
-	if v.role == diodeRole {
-		artifacts = append(artifacts, struct {
-			host, root, destination string
-		}{"ahv-guest-ctl", "/run/ahv-tools", "ahv-guest-ctl"})
+	if role == diodeRole {
+		artifacts = append(artifacts, protectedSiblingTool{"ahv-guest-ctl", "/run/ahv-tools", "ahv-guest-ctl"})
 	}
+	return artifacts
+}
+
+// protectedSiblingToolCommand builds checked copies on one executable tmpfs.
+// runProtectedSibling calls staging once per guest; restaging the diode would
+// hide live early-service tools. Copying the AHV CLI never invokes it.
+func protectedSiblingToolCommand(artifacts []protectedSiblingTool, metadataStage string) string {
 	command := "set -eu; mkdir -p /run/dtb-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec; "
-	metadataStage, err := stagePageMetadata(ctx, c, v.vm, v.role)
-	if err != nil {
-		return err
-	}
 	command += metadataStage
 	for _, a := range artifacts {
-		if err := v.vm.Share(ctx, filepath.Join(filepath.Dir(module), a.host), a.root, true); err != nil {
-			return fmt.Errorf("share required protected tool %s: %w", a.host, err)
-		}
 		command += "cp " + shellSingleQuote(a.root+"/"+a.host) + " /run/dtb-exec/" + a.destination +
 			"; chmod 755 /run/dtb-exec/" + a.destination + "; "
 	}
-	if netModule := siblingNetModuleName(v.role); netModule != "" {
-		if err := v.vm.Share(ctx, filepath.Join(filepath.Dir(module), netModule), "/run/diode-net-module", true); err != nil {
-			return err
-		}
-	}
-	return protectedSiblingGuest(ctx, v, command)
+	return command
 }
 
 // protectedSiblingNetwork configures one role using existing discovery, stock
@@ -899,8 +1041,9 @@ func (p *protectedSiblingPair) interactive() error {
 	return err
 }
 
-// cleanup uses an independent bounded budget to begin teardown, drain attempts,
-// explicitly reclaim, verify scrub, then close VMs/release copies/capabilities.
+// cleanup uses an independent bounded budget to drain attempts, explicitly
+// reclaim, verify scrub, then close VMs/release copies/capabilities. Combined
+// dependencies drain before BeginTeardown; legacy keeps its prior Remove order.
 // VM handles stay owned through reclaim; CloseCtx can delete boot files.
 // Progress is exact and serialized. Unknown startup/control progress or missing VM
 // ownership is retained, not repaired from a cached zero prefix. It still tries
@@ -918,57 +1061,96 @@ func (p *protectedSiblingPair) cleanup() error {
 	// Close and join attached shells before native teardown can invalidate
 	// their borrowed VM. Failed drainage retains every owner; termination
 	// below remains a best-effort way to end execution, never release proof.
-	if p.shells != nil {
+	if p.profile == protectedSiblingDirectRoot && p.shells != nil {
 		if err := p.shells.close(ctx); err != nil {
 			result = errors.Join(result, err)
 			safe = false
 		}
 	}
-	if m != nil && m.initialized != 0 {
+	if p.profile == protectedSiblingDirectRoot && m != nil && m.initialized != 0 {
 		if err := m.advance(ctx, protectedTeardown, &m.teardown); err != nil {
 			result = errors.Join(result, err)
 			safe = false
 		}
 	}
-	for _, v := range p.workers {
-		if v.vm == nil {
-			if v.attempted {
+	if p.profile == protectedSiblingMediatedRoot {
+		drained, err := protectedSiblingDrain(ctx, protectedSiblingDrainOps{
+			// Join borrowers while their relay/provider paths remain live.
+			joinForward: func(ctx context.Context) error {
+				var err error
+				if p.shells != nil {
+					err = p.shells.close(ctx)
+				}
+				return errors.Join(err, p.joinServices(ctx))
+			},
+			// Expected EOF must be marked before terminating its workload peer.
+			beginClosing: func() {
+				if p.mediated != nil {
+					p.mediated.beginClosing()
+				}
+			},
+			// Native termination retains the workload and bundle, without Remove.
+			terminateWorkload: func(ctx context.Context) (bool, error) {
+				return p.terminateRole(ctx, workloadRole)
+			},
+			// No disk release is authorized by unjoined forward borrowers.
+			drainDependencies: func(ctx context.Context, workloadDrained bool) error {
+				if p.mediated == nil {
+					return nil
+				}
+				return p.mediated.drain(ctx, workloadDrained)
+			},
+			// Always try diode native termination, even after dependency failure.
+			terminateDiode: func(ctx context.Context) (bool, error) {
+				return p.terminateRole(ctx, diodeRole)
+			},
+		})
+		result = errors.Join(result, err)
+		safe = safe && drained
+		// Provider I/O and every participant must be drained before changing
+		// protected mapping/backing state. Reclaim still uses its native gate.
+		if safe && m != nil && m.initialized != 0 {
+			if err := m.advance(ctx, protectedTeardown, &m.teardown); err != nil {
+				result = errors.Join(result, err)
 				safe = false
-				result = errors.Join(result, fmt.Errorf("%s create ownership unobservable", v.options.ID))
-			}
-			continue
-		}
-		if v.started && v.region.ProtectedSharedLeaseId != 0 && ctx.Err() == nil {
-			remove := v.region
-			remove.ProtectedSharedOperation = hcsschema.ProtectedSharedRemove
-			_, err := v.vm.ModifyProtectedShared(ctx, remove, m.resource)
-			// Remove's cache alone is not drain/reclaim proof. Even failed
-			// Remove may be safely superseded by observed VM termination.
-			if err != nil {
-				result = errors.Join(result, fmt.Errorf("%s Remove: %w", v.options.ID, err))
 			}
 		}
-		terminateErr := v.vm.Terminate(ctx)
-		if terminateErr != nil {
-			result = errors.Join(result, fmt.Errorf("%s terminate: %w", v.options.ID, terminateErr))
+	} else {
+		for _, v := range p.workers {
+			if v.vm == nil {
+				if v.attempted {
+					safe = false
+					result = errors.Join(result, fmt.Errorf("%s create ownership unobservable", v.options.ID))
+				}
+				continue
+			}
+			if v.started && v.region.ProtectedSharedLeaseId != 0 && ctx.Err() == nil {
+				remove := v.region
+				remove.ProtectedSharedOperation = hcsschema.ProtectedSharedRemove
+				_, err := v.vm.ModifyProtectedShared(ctx, remove, m.resource)
+				// Remove's cache alone is not drain/reclaim proof. Even failed
+				// Remove may be safely superseded by observed VM termination.
+				if err != nil {
+					result = errors.Join(result, fmt.Errorf("%s Remove: %w", v.options.ID, err))
+				}
+			}
+			terminateErr := v.vm.Terminate(ctx)
+			if terminateErr != nil {
+				result = errors.Join(result, fmt.Errorf("%s terminate: %w", v.options.ID, terminateErr))
+			}
+			waitErr := v.vm.WaitCtx(ctx)
+			if waitErr != nil {
+				result = errors.Join(result, fmt.Errorf("%s wait for termination: %w", v.options.ID, waitErr))
+				safe = false
+				continue
+			}
+			// Observed termination, not a cached Remove flag, establishes that
+			// guest execution ended. Reclaim's actual native participant gate
+			// still decides whether backing ownership has drained.
+			v.drained = true
 		}
-		waitErr := v.vm.WaitCtx(ctx)
-		if waitErr != nil {
-			result = errors.Join(result, fmt.Errorf("%s wait for termination: %w", v.options.ID, waitErr))
-			safe = false
-			continue
-		}
-		// Observed termination, not a cached Remove flag, establishes that
-		// guest execution ended. Reclaim's actual native participant gate
-		// still decides whether backing ownership has drained.
-		v.drained = true
-	}
-	for _, service := range p.services {
-		select {
-		case <-service.done:
-			// Cancellation/termination intentionally stops these servers.
-		case <-ctx.Done():
-			result = errors.Join(result, errors.New("protected guest service exit unobserved"), ctx.Err())
+		if err := p.joinServices(ctx); err != nil {
+			result = errors.Join(result, err)
 			safe = false
 		}
 	}
@@ -1037,4 +1219,50 @@ func (p *protectedSiblingPair) cleanup() error {
 			m.lease, m.reclaimed, m.zeroVerifiedBytes)
 	}
 	return errors.Join(result, ctx.Err())
+}
+
+// terminateRole observes native drainage for the combined cleanup without
+// removing protected mappings early or closing/deleting a retained VM bundle.
+// Missing create ownership is uncertain, not a successfully drained attempt.
+func (p *protectedSiblingPair) terminateRole(ctx context.Context, role string) (bool, error) {
+	for _, v := range p.workers {
+		if v.role != role {
+			continue
+		}
+		if v.vm == nil {
+			if v.attempted {
+				return false, fmt.Errorf("%s create ownership unobservable", v.options.ID)
+			}
+			return true, nil
+		}
+		terminateErr := v.vm.Terminate(ctx)
+		waitErr := v.vm.WaitCtx(ctx)
+		if waitErr == nil {
+			v.drained = true
+		}
+		var result error
+		if terminateErr != nil {
+			result = fmt.Errorf("%s terminate: %w", v.options.ID, terminateErr)
+		}
+		if waitErr != nil {
+			result = errors.Join(result, fmt.Errorf("%s wait for termination: %w", v.options.ID, waitErr))
+		}
+		return v.drained, result
+	}
+	return true, nil
+}
+
+// joinServices retains forward command borrowers until Wait completes; a
+// cleanup timeout prevents dependency release and keeps all necessary owners.
+func (p *protectedSiblingPair) joinServices(ctx context.Context) error {
+	var result error
+	for _, service := range p.services {
+		select {
+		case <-service.done:
+			// Forward cancellation intentionally stops these servers.
+		case <-ctx.Done():
+			result = errors.Join(result, errors.New("protected guest service exit unobserved"), ctx.Err())
+		}
+	}
+	return result
 }
