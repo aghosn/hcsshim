@@ -46,8 +46,14 @@ successfully linked partial proxy is insufficient.
 
 Beside the selected `sibling_bus.ko`, provide matching `diode_netvsp.ko`,
 `diode_tcpbulk`, `diode_vsock_test`, `diode_iperf`, `demo.sh`, `covert_udp`,
-`diode_tcpdump`, `diode_tc`, and `diode_iptables`. The workload uses the matched
-kernel's stock `hv_netvsc`/`hv_sock` sibling transport; it does not load a
+`diode_tcpdump`, `diode_tc`, `diode_iptables`, `collect-page-metadata.sh`, and
+`ahv-guest-ctl`. Missing/nonregular tools fail preflight before backing allocation.
+The AHV CLI must match the replacement host ABI, built-in guest collector and
+AHVF v4/AHVW v2 contracts; the integration revisions above are historical
+baselines, not sufficient AHV build pins. Old Linux binaries and Windows
+`ahvtrigger` are incompatible; there is no fallback to retired calls or v1 wire.
+The workload uses the matched kernel's stock `hv_netvsc`/`hv_sock` sibling
+transport; it does not load a
 replacement workload IP driver. Ordinary baseline only also needs the matching
 `hcs_shmem_diag.ko`. A stale module is not repaired by choosing a different GPA.
 
@@ -211,6 +217,9 @@ Protected staging checks copies into executable tmpfs: `dtb` is
 `diode_tcpbulk`, `vsock-test` is `diode_vsock_test`, `ipf` is `diode_iperf`,
 and `tcpdump`, `tc`, `ipt`, `covert`, `demo.sh` are staged aliases. The iptables
 multi-call syntax is `./ipt iptables ...`, not `./ipt ...`.
+`ahv-guest-ctl` is shared read-only and copied/chmodded into this tmpfs **only
+for the diode**; shares remain VM-owned through cleanup. Staging never invokes
+`prepare` or collection. Workload tools and readiness remain unchanged.
 
 In the **diode** shell, inspect the pre-NAT workload interface and rules:
 
@@ -350,8 +359,16 @@ if ($null -eq $ready) { throw 'No complete ready JSON; inspect launcher, do not 
 $ready | ConvertTo-Json -Depth 6
 ```
 
-After inspecting identity and completing debugging, exclusively create a new
-resume file. UTF-8 bytes must be **exactly** `continue` followed by LF: no BOM,
+For optional AHV preallocation (M3 below), attach the diode while this same run
+is paused and run `./ahv-guest-ctl prepare` from `/run/dtb-exec`. Require exit
+zero and `Prepared response capacity=0x200000` before authorizing resume.
+If it fails, do not resume for the AHV scenario: preserve the error and stop.
+Use actual approved diode/workload seal masks, not this section's numeric
+forwarding examples. Preparation occurs after checked networking/backing page
+admission sealing but before partition seals; never move or weaken those seals.
+
+After inspecting identity and completing debugging/preparation, exclusively
+create a new resume file. UTF-8 bytes must be **exactly** `continue` followed by LF: no BOM,
 CR, or extras. `Set-Content` defaults are not this protocol.
 
 ```powershell
@@ -395,7 +412,95 @@ of native entry or effects. First failure/uncertainty skips later calls; earlier
 success is not rolled back. Preserve individual results, never "atomic pair
 success" or inferred unseal.
 
-## 5. Stop, failure and conservative cleanup
+## 5. Manual diode AHV collection (M1-M4)
+
+Use the complete canonical companion runtime (`artifacts\runtime-inputs` ->
+`dist\runtime` / `dist\runtime.zip`) and matched HV/SK/VID/Linux artifacts.
+The existing source staging, static CLI builder and manifest packaging carry
+the tool; do not make a separate package or copy mismatched binaries into one.
+All compilation/tests for this AHV change are deferred to plan 000025 S6;
+all `C:\os\src` builds remain manual operator work.
+
+From the diode's `/run/dtb-exec`, invoke `./ahv-guest-ctl` with these forms
+(angle brackets are operator inputs, brackets denote optional arguments):
+
+```text
+ahv-guest-ctl self --nonce <u64> --report <file> [--wbcl <file>]
+ahv-guest-ctl dump-peers <report-file>
+ahv-guest-ctl target --partition-id <u64> --nonce <u64> --report <file> [--wbcl <file>]
+ahv-guest-ctl prepare
+```
+
+Perform the three steps separately. For example, enter two distinct fresh
+caller-chosen unsigned 64-bit nonces and copy an explicit candidate ID after
+inspecting the dump:
+
+```sh
+cd /run/dtb-exec
+printf 'Fresh self nonce (u64): '; read -r SELF_NONCE
+./ahv-guest-ctl self --nonce "$SELF_NONCE" --report /tmp/diode.ahvf --wbcl /tmp/diode.wbcl
+# Continue only after success; this dump is offline and opens no AHV device.
+./ahv-guest-ctl dump-peers /tmp/diode.ahvf
+printf 'Explicit selected partition ID (u64): '; read -r SUBJECT_ID
+printf 'Different fresh target nonce (u64): '; read -r TARGET_NONCE
+./ahv-guest-ctl target --partition-id "$SUBJECT_ID" --nonce "$TARGET_NONCE" --report /tmp/workload.ahvf --wbcl /tmp/workload.wbcl
+```
+
+Inspect each exit/status before continuing; use distinct output paths for each
+attempt so stale files are not mistaken for new evidence. IDs/nonces accept
+full-width decimal or `0x` hex; do not truncate them. A peer-table index, vSock
+CID or VM GUID is not a numeric partition ID. TARGET rejects SELF/NONE sentinels.
+The selector supports live root-direct VM subjects, not root-as-third-party or
+nested targeting; sharing is not an authorization condition on this prototype.
+The dump shows protected-peer candidates, not an automatic selection. Correlate
+the known link's subject-local GPA with backing `LifetimeId`, lifecycle and
+per-registration state/permissions; retain aliases and removed/historical
+registrations, including historical-only subject participation. `LifetimeId`
+names a backing-page lifetime, not a whole group/section. Peer-local GPAs belong
+to that peer and need not equal diode GPAs. A valid empty candidate set is not
+a malformed dump and must not trigger a fallback.
+
+All claims, nonce equality and target-ID equality are **UNVERIFIED structural
+diagnostics**, not signature/attachment-hash/expected-identity verification.
+SELF has no independently authenticated expected identity. No trusted/ready/
+isolated verdict, whole-region coverage/exclusivity policy, forwarding gate or
+key release follows. Raw root-VTL0 WBCL is separate, unsigned and not an AHVF
+attachment; saving it does not authenticate it against TPM evidence.
+
+Only the diode issues AHV requests and owns their input/response memory and
+completion, including when the report describes the workload. Do not run AHV
+or a bootstrap report in the workload. Device presence in either guest and
+staging are not attestation success and allocate no AHV response slot. Explicit
+AHV failure is not an ordinary startup/networking gate.
+
+Normal allocation stays lazy. Where approved diode seals prevent later response
+allocation/sharing/growth, use only the optional manual `prepare` in section 4's
+existing ready/resume pause. It reserves the maximum 2-MiB (`0x200000`) slot,
+survives CLI close and performs no attestation, evidence or firmware query.
+Post-seal self/target reuse it without sharing growth. A failure is explicit:
+never weaken seals, reopen workload sharing or fall back to workload pages.
+
+Do not overlap collection with save/migration/HV replacement. Finish first;
+after replacement rediscover via a new self report and explicitly reselect.
+Numeric IDs are HV-instance selectors, not portable identities. No migration
+guard, drain/remapping support or safe pending continuation is implemented.
+
+Record actual observations separately from source expectations:
+
+| AHV ID (plan 000025) | Manual check and required evidence |
+| --- | --- |
+| M1 | Matched protected pair, cold workload SNP cache and no preceding workload AHV request: complete self/offline dump/explicit target flow. Record cold-cache evidence and root preparation of the selected workload, not just CLI success. Trace only diode-owned request/response buffers, access and completion; workload supplies none. Self discovery must not need acquisition of peer identity. |
+| M2 | Safely exercise actual nonexistent/deleted targets, supported ways to reach unsupported subjects, large inventories/logs (including beyond the old slot), and allocation/preparation/native failures. Record errno, HV/outer/inner statuses, requester completion/resume and cleanup. Expect complete responses with bounded resize or explicit terminal limit/failure, no usable partial report or alternate-subject/legacy fallback. Do not add fault-injection seams; unsafe/unexercisable failures remain unverified. |
+| M3 | Verify diode-only delivery and no workload AHV allocation; record actual approved masks, ready identity, successful `0x200000` preparation before guarded resume, persistence after CLI exit and post-seal self/target reuse without sharing growth. Preserve failures rather than relaxing the policy. |
+| M4 | Matched current-ABI self works; ordinary and protected startup/networking require no AHV request or preparation. Where available, explicitly request AHV on an unsupported host and verify failure without fallback while ordinary networking remains operational. |
+
+These are pending hardware checks, not claims that U1-U3 fixtures or source
+review establish firmware, cold-cache or sealing success. Preserve source/build/
+deployed hashes, VM IDs, exact commands, nonces, selected IDs, artifacts,
+timestamps, layered statuses and cleanup observations. Cases not safely
+inducible remain explicitly unverified.
+
+## 6. Stop, failure and conservative cleanup
 
 Prefer `uvmboot stop` and wait for launcher completion. Ctrl-C, VM exit or a
 required service failure also cancels forward work. Do not force-kill the
@@ -439,7 +544,7 @@ including worker inputs, before changing COM contracts. Targeted proxy
 regeneration is recovery for confirmed malformed output, not a mandatory
 permanent clean rebuild. Traces and successful links are not experiment proof.
 
-## 6. S8: user-only build/deployment handoff
+## 7. S8: user-only build/deployment handoff
 
 In a matched AMD64 FRE Razzle environment, with the established OS tools and
 `SDXROOT` including `src`,
@@ -492,9 +597,10 @@ try {
     -HcsshimPath $Hcs -OutputPath $Output
 ```
 
-Verify the companion checkout is `protected-shared-hcs-v1-upstream-20261110` at
-`203341899db940bc4165507f0371a1eed10d5949`, and that script/resolver match
-that exact revision before use. Explicit `-HcsshimPath` wins over `.hcs_path`
+Verify the companion checkout is `protected-shared-hcs-v1-upstream-20261110`
+with the current AHV changes, and record its actual revision and script/resolver
+contents before use; the earlier integration pin alone lacks the replacement ABI.
+Explicit `-HcsshimPath` wins over `.hcs_path`
 and `HCS_PATH`; the resolver checks checkout
 root and markers. The script builds `.\internal\tools\uvmboot` with
 `GOOS=windows`, `GOARCH=amd64`, `CGO_ENABLED=0`, `-mod=readonly`; it does not do
@@ -507,7 +613,7 @@ native build results separately, then deployment and Windows hardware results.
 Use the existing toolchain without dependency upgrades. A successful Go build
 or fixture test is neither a native-build nor a Windows hardware execution pass.
 
-## 7. Manual evidence checklist and remaining gaps
+## 8. Manual evidence checklist and remaining gaps
 
 Leave actual results blank until observed. Repeat M04/M05 for intended accepted
 masks, including filtering during pause and after calls. Record rejected masks
