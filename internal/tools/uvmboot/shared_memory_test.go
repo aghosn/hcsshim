@@ -316,6 +316,60 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 	}
 }
 
+// TestProtectedSiblingDelayedInstanceDiscovery exercises the production shell
+// guard when the native peer link appears only after its first failed poll.
+// Re-expansion must admit one ready current link while preserving rejection of
+// multiple links, unready instances, protocol mismatch and wrong local CID.
+func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell is required to exercise the generated Linux startup command")
+	}
+	for _, test := range []struct {
+		name, instance, failure string
+		multiple                bool
+	}{
+		{name: "delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1"},
+		{name: "delayed-multiple", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1",
+			failure: "expected one configured link", multiple: true},
+		{name: "delayed-unready", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=0",
+			failure: "common peer instance timed out"},
+		{name: "delayed-old-version", instance: "bus_id=1 local_cid=4 peer_cid=3 version=3 ready=1",
+			failure: "protocol version mismatch expected=4"},
+		{name: "delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
+			failure: "local CID mismatch"},
+	} {
+		// Each fixture publishes sysfs-shaped files only from the polling
+		// sleep callback; no VM, transport or native receipt is simulated.
+		t.Run(test.name, func(t *testing.T) {
+			publish := `mkdir -p "$fixture/link-1"; printf '%s\n' ` +
+				shellSingleQuote(test.instance) + ` >"$fixture/link-1/sibling_instance"; `
+			if test.multiple {
+				publish += `mkdir -p "$fixture/link-2"; cp "$fixture/link-1/sibling_instance" "$fixture/link-2/sibling_instance"; `
+			}
+			// The fixture sleep publishes once, after discovery has already
+			// seen an unmatched glob, and makes timeout cases deterministic.
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; polls=0; ` +
+				`sleep() { polls=$((polls+1)); if [ "$polls" -eq 1 ]; then ` + publish + `fi; }; `
+			command := siblingInstanceDiscoveryCommand() + siblingVsockReadyCommand(diodeRole)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance",
+				`"$fixture"/*-*/sibling_instance`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/hv_sock", `"$fixture"`)
+			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
+			command = setup + command + `echo "INSTANCE_ACCEPTED polls=$polls bus=$sb_bus local=$sb_local peer=$sb_peer"`
+			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
+			if test.failure == "" {
+				if err != nil || !strings.Contains(string(output), "INSTANCE_ACCEPTED polls=1 bus=1 local=4 peer=3") {
+					t.Fatalf("delayed link was not re-discovered: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), test.failure) ||
+				strings.Contains(string(output), "INSTANCE_ACCEPTED") {
+				t.Fatalf("delayed invalid link was not rejected with %q: %v\n%s", test.failure, err, output)
+			}
+		})
+	}
+}
+
 func TestSharedMemorySectionNames(t *testing.T) {
 	win32Name, hcsName, err := sharedMemorySectionNames("hcsshim-test", 3)
 	if err != nil {

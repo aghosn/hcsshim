@@ -1959,12 +1959,14 @@ const siblingTransportVersion = sibling.TransportVersion
 // reads the pinned sysfs field order into sb_bus/sb_local/sb_peer, and exits
 // nonzero on link-count, readiness or exact transport-version failure. Both
 // ordinary and protected callers use this guard; it does not parse the native
-// discovery descriptor or implement the guest-to-guest wire protocol.
+// discovery descriptor or implement the guest-to-guest wire protocol. Each poll
+// re-expands the glob because the peer's native Start may not have offered a
+// link when early diode bootstrap begins.
 func siblingInstanceDiscoveryCommand() string {
-	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
-		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; ` +
-		`sb_instance=$1; ` +
-		guestWaitFor(`[ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance"`, "common peer instance") +
+	return guestWaitFor(`set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; `+
+		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; `+
+		`sb_instance=$1; `+
+		`[ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance"`, "common peer instance") +
 		`set -- $(cat "$sb_instance"); sb_bus=${1#*=}; sb_local=${2#*=}; sb_peer=${3#*=}; ` +
 		fmt.Sprintf(`[ "${4#*=}" = %d ] || { echo "sibling_vmbus: protocol version mismatch expected=%d actual=${4#*=}" >&2; `+
 			`%sexit 1; }; `, siblingTransportVersion, siblingTransportVersion, siblingFailureDiagnosticsCommand())
