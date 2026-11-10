@@ -249,6 +249,7 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 		filepath.Join(filepath.Dir(module), "diode_tcpdump"),
 		filepath.Join(filepath.Dir(module), "diode_tc"),
 		filepath.Join(filepath.Dir(module), "diode_iptables"),
+		filepath.Join(filepath.Dir(module), pageMetadataCollector),
 	} {
 		info, err := os.Stat(path)
 		if err != nil {
@@ -669,6 +670,11 @@ func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protecte
 		{"diode_iptables", "/run/diode-iptables", "ipt"},
 	}
 	command := "set -eu; mkdir -p /run/dtb-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec; "
+	metadataStage, err := stagePageMetadata(ctx, c, v.vm, v.role)
+	if err != nil {
+		return err
+	}
+	command += metadataStage
 	for _, a := range artifacts {
 		if err := v.vm.Share(ctx, filepath.Join(filepath.Dir(module), a.host), a.root, true); err != nil {
 			return fmt.Errorf("share required protected tool %s: %w", a.host, err)

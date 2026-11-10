@@ -79,7 +79,7 @@ var lcowCommand = cli.Command{
 	Usage: "Boot an LCOW UVM",
 	Flags: []cli.Flag{
 		cli.BoolFlag{
-			Name:  protectedSharedMemoryArgName,
+			Name: protectedSharedMemoryArgName,
 			Usage: "Run the interactive SNP diode/workload pair with native protected Bootstrap/Import startup; " +
 				"seal backing admission after checked networking; partitions remain unsealed unless independently selected.",
 		},
@@ -251,6 +251,10 @@ var lcowCommand = cli.Command{
 			Usage: "Export disposable VHD backends through the Linux diode using this JSON plan. " +
 				"The existing workload RP root stays unchanged; startup performs no test writes.",
 		},
+		cli.StringFlag{
+			Name:  pageMetadataOutputArgName,
+			Usage: "Existing local host directory for per-run, per-role writable page metadata exports; interactive Linux pairs only.",
+		},
 		cli.BoolFlag{
 			Name: siblingStorageRootArgName,
 			Usage: "Boot the workload from the plan's read-only root LUN 0 using sibling-root.vmgs; " +
@@ -359,6 +363,9 @@ var lcowCommand = cli.Command{
 	// the run rather than allowing wrapped addresses into success diagnostics.
 	Action: func(c *cli.Context) (resultErr error) {
 		if err := validateProtectedPartitionCLI(c); err != nil {
+			return err
+		}
+		if err := preparePageMetadataOutput(c); err != nil {
 			return err
 		}
 		if c.Bool(protectedSharedMemoryArgName) {
@@ -1385,6 +1392,14 @@ func runLCOW(
 		}
 		if busModulePath := c.String(siblingBusGuestModuleArgName); busModulePath != "" {
 			const busModuleRoot = "/run/sibling-bus-module"
+			metadataStage := ""
+			if c.Bool(siblingInteractiveArgName) && c.String(siblingOpenShellBundleArgName) == "" {
+				stage, err := stagePageMetadata(ctx, c, vm, role)
+				if err != nil {
+					return err
+				}
+				metadataStage = stage
+			}
 
 			if err := vm.Share(ctx, busModulePath, busModuleRoot, true); err != nil {
 				return fmt.Errorf("share sibling-bus module: %w", err)
@@ -1488,6 +1503,7 @@ func runLCOW(
 						uplink,
 					)
 				}
+				execCommand += "; " + metadataStage
 				if storagePlan != nil {
 					storageModulePath := ""
 					if role == diodeRole {
