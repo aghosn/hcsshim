@@ -32,6 +32,7 @@ const (
 	storageBenchmarkStatsArgName      = "storage-benchmark-stats"
 	storageBenchmarkLatencyArgName    = "storage-benchmark-latency"
 	storageBenchmarkThroughputArgName = "storage-benchmark-throughput"
+	storageBenchmarkIdleArgName       = "storage-benchmark-idle"
 )
 
 type storageBenchmarkContent struct {
@@ -109,7 +110,7 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 			storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
 			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName,
-			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName} {
+			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName} {
 			if c.IsSet(name) {
 				return errors.New("storage benchmark options require --storage-benchmark-script")
 			}
@@ -117,14 +118,17 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		return nil
 	}
 	count := c.GlobalInt(countArgName)
-	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != 2 ||
+	unikraft := c.String(unikraftPackageArgName) != ""
+	cpus := c.GlobalUint64(cpusArgName)
+	if !useGCS || !c.Bool(securityHardwareFlag) || (cpus != 1 && cpus != 2) ||
+		(count == 2 && ((unikraft && cpus != 1) || (!unikraft && cpus != 2))) ||
 		count != c.GlobalInt(parallelArgName) || len(groups) != count ||
 		(count != 1 && count != 2) {
-		return errors.New("storage benchmark requires SNP, GCS, two VPs and explicit CPU affinity per concurrently launched VM")
+		return errors.New("storage benchmark requires SNP, GCS, explicit CPU affinity, two VPs for Linux pairs or one VP for Unikraft pairs")
 	}
 	if c.String(networkBenchmarkScriptArgName) != "" || c.Bool(siblingInteractiveArgName) ||
 		c.Bool(siblingStorageRootArgName) || c.String(siblingOpenShellBundleArgName) != "" ||
-		c.String("unikraft-diode-package") != "" || c.Bool(siblingDiodeUplinkArgName) ||
+		c.Bool(siblingDiodeUplinkArgName) ||
 		c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) ||
 		c.IsSet(execCommandLineArgName) || c.IsSet(execFileArgName) ||
 		c.IsSet(scsiMountsArgName) || c.IsSet(vpmemMountsArgName) || debug ||
@@ -138,7 +142,7 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 			return errors.New("standalone storage baseline must not create a diode, sibling link or provider counters")
 		}
 	} else if plan == nil || !c.Bool(sharedMemoryTwoUVMArgName) ||
-		c.String(siblingBusGuestModuleArgName) == "" || c.String(sharedMemoryGuestModuleArgName) == "" ||
+		c.String(siblingBusGuestModuleArgName) == "" || (!unikraft && c.String(sharedMemoryGuestModuleArgName) == "") ||
 		len(plan.Disks) != 1 || plan.Disks[0].Role != "data" || plan.Disks[0].Access != "read-write" ||
 		plan.Disks[0].ID != "fio-data" || plan.Disks[0].ExportLUN == nil ||
 		*plan.Disks[0].ExportLUN != 1 ||
@@ -168,6 +172,12 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	throughput := c.Bool(storageBenchmarkThroughputArgName)
 	if latency && throughput {
 		return errors.New("select only one storage benchmark experiment per launch")
+	}
+	if idle := c.String(storageBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
+		return errors.New("storage benchmark idle must be poll or halt")
+	}
+	if unikraft && c.Bool(storageBenchmarkStatsArgName) {
+		return errors.New("Linux provider counters are unavailable for Unikraft storage")
 	}
 	fileMiB := c.Int(storageBenchmarkSizeArgName)
 	if latency || throughput {
@@ -225,12 +235,16 @@ func storageBenchmarkClient(c *cli.Context, device string, content storageBenchm
 		content.ReadSHA256, content.WriteSHA256, content.SyncReadSHA, content.SyncWriteSHA, mode)
 }
 
-func storageBenchmarkPreflight() string {
+func storageBenchmarkPreflight(cpus uint64, idle string) string {
+	online := "0"
+	if cpus == 2 {
+		online = "0-1"
+	}
 	return `set -eu; mkdir -p /run/dtb-exec; ` +
 		`mount -t tmpfs -o exec,nosuid,nodev,size=16m tmpfs /run/dtb-exec; ` +
 		`dmesg | grep -F 'Memory Encryption Features active:' | grep -qw SEV-SNP; ` +
-		`[ "$(cat /sys/devices/system/cpu/online)" = 0-1 ]; ` +
-		`grep -qw idle=halt /proc/cmdline; `
+		`[ "$(cat /sys/devices/system/cpu/online)" = ` + online + ` ]; ` +
+		`grep -qw ` + shellSingleQuote("idle="+idle) + ` /proc/cmdline; `
 }
 
 func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityVM,
@@ -267,7 +281,7 @@ func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.Utilit
 			return "", noCleanup, fmt.Errorf("share storage benchmark input/results: %w", err)
 		}
 	}
-	command := storageBenchmarkPreflight()
+	command := storageBenchmarkPreflight(c.GlobalUint64(cpusArgName), c.String(storageBenchmarkIdleArgName))
 	if plan == nil {
 		attachment, err := attachSiblingStorageDisk(ctx, vm, siblingStorageDisk{
 			HostPath: c.String(storageBenchmarkDiskArgName), Access: "read-write",
@@ -309,6 +323,10 @@ func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.Utilit
 	}
 	command += storageCommand + "; "
 	if role == workloadRole {
+		if c.String(unikraftPackageArgName) != "" {
+			command += `echo 'backend_path=unikraft-raw-scsi' >/run/storage-benchmark-results/backend-policy.txt; `
+			return command + storageBenchmarkClient(c, "/run/diode-storage/fio-data", content), noCleanup, nil
+		}
 		ready := `[ -f /run/storage-benchmark-results/provider-ready ]`
 		return command + guestWaitFor(ready, "provider snapshot") +
 			storageBenchmarkClient(c, "/run/diode-storage/fio-data", content), noCleanup, nil

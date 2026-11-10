@@ -54,8 +54,8 @@ func TestUnikraftManifestAndStorageAssignments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attachments := devices[cfg.controller].Attachments
-	if cfg.memoryMB != 128 || len(devices) != 1 || len(attachments) != 2 ||
+	attachments := devices[cfg.Controller].Attachments
+	if cfg.MemoryMB != 128 || len(devices) != 1 || len(attachments) != 2 ||
 		attachments["3"].Path != plan.Disks[0].HostPath || !attachments["3"].ReadOnly ||
 		attachments["5"].Path != plan.Disks[1].HostPath || attachments["5"].ReadOnly ||
 		reports[1].LUN != 5 || reports[1].ExportLUN != 1 {
@@ -72,6 +72,71 @@ func TestUnikraftManifestAndStorageAssignments(t *testing.T) {
 	*plan.Disks[1].ExportLUN = 7
 	if _, _, err := cfg.storageDevices(plan); err == nil {
 		t.Fatal("accepted an export mismatch")
+	}
+}
+
+func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.T) {
+	directory := t.TempDir()
+	for _, name := range []string{"guest.vmgs", "sibling_bus.ko", "diode_storage_test", "fio.sh"} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := "console=ttyS0 libukbus_vmbus.idle=poll libukbus_vmbus.storage_controller=" +
+		guestrequest.ScsiControllerGuids[0] + " libukbus_vmbus.storage_luns=0:1:rw --"
+	writeManifest := func(command string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(directory, "launch-manifest.json"),
+			[]byte(unikraftTestManifest(command)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeManifest(command)
+	oldGCS := useGCS
+	useGCS = true
+	t.Cleanup(func() { useGCS = oldGCS })
+	c := benchmarkTestContext(t, "--security-hardware", "--shared-memory-two-uvm-proof",
+		"--shared-memory-size", "33554432", "--sibling-bus-guest-module", filepath.Join(directory, "sibling_bus.ko"),
+		"--unikraft-diode-package", directory, "--storage-benchmark-script", filepath.Join(directory, "fio.sh"),
+		"--storage-benchmark-idle", "poll")
+	for flag, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+		if err := c.Parent().Set(flag, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lun := uint8(1)
+	plan := &siblingStoragePlan{Version: 1, Disks: []siblingStorageDisk{
+		{ID: "fio-data", Role: "data", Access: "read-write", HostPath: filepath.Join(directory, "data.vhdx"), ExportLUN: &lun},
+	}}
+	cfg, err := loadUnikraftConfig(c, plan)
+	if err != nil || cfg.Network != nil || cfg.Idle != "poll" {
+		t.Fatalf("storage-only benchmark rejected: cfg=%+v err=%v", cfg, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(command, "idle=poll", "idle=halt", 1),
+		strings.Replace(command, "0:1:rw", "0:0:ro", 1),
+	} {
+		writeManifest(invalid)
+		if _, err := loadUnikraftConfig(c, plan); err == nil {
+			t.Fatalf("accepted incompatible storage firmware: %s", invalid)
+		}
+	}
+}
+
+func TestUnikraftIdleManifest(t *testing.T) {
+	for _, mode := range []string{"halt", "poll"} {
+		cfg, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(
+			unikraftTestParams() + " libukbus_vmbus.idle=" + mode + " --")))
+		if err != nil || cfg.Idle != mode {
+			t.Fatalf("idle mode %s: cfg=%+v err=%v", mode, cfg, err)
+		}
+	}
+	for _, mode := range []string{"spin", "0", "HALT"} {
+		_, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(
+			unikraftTestParams() + " libukbus_vmbus.idle=" + mode + " --")))
+		if err == nil {
+			t.Fatalf("accepted invalid idle mode %q", mode)
+		}
 	}
 }
 
@@ -149,6 +214,7 @@ func TestUnikraftIndependentServicesAndWorkloadBootstrap(t *testing.T) {
 
 func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 	lines := []string{
+		"vmbus: idle=halt scheduler=cooperative",
 		"hyperv: isolation type 2 (SNP), paravisor absent",
 		"vmbus: all offers delivered, 2 channel(s)",
 		"sibling: provider ready protocol=4; waiting for Linux workload",
@@ -163,7 +229,7 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 		ready := make(chan time.Time, 1)
 		var log bytes.Buffer
 		before := time.Now()
-		err := captureUnikraftConsole(strings.NewReader(strings.Join(input, "\n")), &log, ready)
+		err := captureUnikraftConsole(strings.NewReader(strings.Join(input, "\n")), &log, ready, "halt")
 		if !errors.Is(err, io.EOF) {
 			t.Fatal(err)
 		}
@@ -184,7 +250,7 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 	for _, version := range []string{"2", "3", "40", ""} {
 		input := strings.Replace(strings.Join(lines, "\n"), "protocol=4", "protocol="+version, 1)
 		ready := make(chan time.Time, 1)
-		err := captureUnikraftConsole(strings.NewReader(input), io.Discard, ready)
+		err := captureUnikraftConsole(strings.NewReader(input), io.Discard, ready, "halt")
 		if err == nil || errors.Is(err, io.EOF) {
 			t.Fatalf("accepted incompatible provider version %q: %v", version, err)
 		}
@@ -194,15 +260,27 @@ func TestUnikraftConsoleRequiresSNPAndProvider(t *testing.T) {
 		default:
 		}
 	}
+	input := strings.Replace(strings.Join(lines, "\n"), "idle=halt", "idle=poll", 1)
+	if err := captureUnikraftConsole(strings.NewReader(input), io.Discard, make(chan time.Time, 1), "halt"); err == nil || errors.Is(err, io.EOF) {
+		t.Fatal("accepted firmware reporting a different idle policy")
+	}
+	pollReady := make(chan time.Time, 1)
+	if err := captureUnikraftConsole(strings.NewReader(input), io.Discard, pollReady, "poll"); !errors.Is(err, io.EOF) {
+		t.Fatalf("rejected matching poll firmware: %v", err)
+	}
+	if len(pollReady) != 1 {
+		t.Fatal("matching poll firmware did not satisfy startup readiness")
+	}
 }
 
 func TestUnikraftConsoleTimestampsReadinessOnlyOnce(t *testing.T) {
-	input := "hyperv: isolation type 2 (SNP), paravisor absent\n" +
+	input := "vmbus: idle=halt scheduler=cooperative\n" +
+		"hyperv: isolation type 2 (SNP), paravisor absent\n" +
 		"vmbus: all offers delivered\n" +
 		"sibling: provider ready protocol=4; waiting for Linux workload\n"
 	ready := make(chan time.Time, 1)
 	var output bytes.Buffer
-	err := captureUnikraftConsole(strings.NewReader(input+input), &output, ready)
+	err := captureUnikraftConsole(strings.NewReader(input+input), &output, ready, "halt")
 	if !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
@@ -256,7 +334,7 @@ func TestUnikraftRootOnlyPairUsesStaticManifestAndSharedWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.network != nil {
+	if cfg.Network != nil {
 		t.Fatal("root-only appliance unexpectedly enabled networking")
 	}
 	command, err := unikraftWorkloadCommand("/run/sibling-bus-module/sibling_bus.ko", cfg, plan, "")
@@ -326,9 +404,10 @@ func TestUnikraftPairPreflight(t *testing.T) {
 		}
 	}
 	for name, contents := range map[string]string{
-		"launch-manifest.json": unikraftTestManifest(strings.Join(network, " ")),
+		"launch-manifest.json": unikraftTestManifest(strings.Join(network, " ") + " libukbus_vmbus.idle=poll"),
 		"guest.vmgs":           "fixture",
 		"sibling_bus.ko":       "fixture",
+		"bench.sh":             "exit 0\n",
 	} {
 		if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0600); err != nil {
 			t.Fatal(err)
@@ -364,5 +443,26 @@ func TestUnikraftPairPreflight(t *testing.T) {
 			(err != nil && !strings.Contains(err.Error(), test.error)) {
 			t.Fatalf("preflight error = %v, cpus = %s, extra = %v", err, test.cpus, test.extra)
 		}
+	}
+	benchmarkArgs := append(append([]string{}, args[:len(args)-2]...),
+		"--network-benchmark-script", filepath.Join(directory, "bench.sh"),
+		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-single-vp")
+	c := benchmarkTestContext(t, benchmarkArgs...)
+	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+		if err := c.GlobalSet(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := loadUnikraftConfig(c, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateNetworkBenchmark(c, [][]uint32{{8, 24}, {9, 25}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(networkBenchmarkIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, nil); err == nil || !strings.Contains(err.Error(), "does not match benchmark") {
+		t.Fatalf("mismatched benchmark firmware was accepted: %v", err)
 	}
 }

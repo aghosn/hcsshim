@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -159,6 +160,58 @@ func TestPairBootstrapOverlapsWorkloadRootAndDiodeStartup(t *testing.T) {
 	}
 }
 
+func TestPairGCSRelayOptIn(t *testing.T) {
+	uplink := &Uplink{Address: "172.31.250.2/24", Gateway: UplinkGateway}
+	for _, enabled := range []bool{false, true} {
+		config := testConfig()
+		config.MediateGCS = enabled
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := decodeConfig(strings.NewReader(string(data)))
+		if err != nil || decoded.MediateGCS != enabled {
+			t.Fatalf("relay opt-in did not survive config decoding: %+v %v", decoded, err)
+		}
+		command := diodeBootstrapCommand(uplink, decoded.MediateGCS)
+		if enabled {
+			if command != diodeNetworkCommand(uplink)+"; "+GCSRelayCommand() {
+				t.Fatal("owned bootstrap did not use the shared relay after network setup")
+			}
+		} else if command != diodeNetworkCommand(uplink) {
+			t.Fatal("default bootstrap changed or launched a relay")
+		}
+	}
+}
+
+func TestPairGCSRelayReadiness(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell unavailable")
+	}
+	for _, ready := range []bool{false, true} {
+		t.Run(fmt.Sprint(ready), func(t *testing.T) {
+			mock := `echo 'synthetic relay startup failure'; return 7`
+			if ready {
+				mock = `touch "$fixture/gcs-relay.ready"`
+			}
+			script := `fixture=$(mktemp -d); trap 'rm -f "$fixture/gcs-relay.ready" "$fixture/gcs-relay.pid" "$fixture/gcs-relay.log"; rmdir "$fixture"' EXIT; ` +
+				`mock_gcs() { ` + mock + `; }; ` +
+				strings.ReplaceAll(strings.ReplaceAll(GCSRelayCommand(), "/bin/gcs", "mock_gcs"), "/run/gcs-relay", "$fixture/gcs-relay")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec", script).CombinedOutput()
+			if ready {
+				if err != nil || !strings.Contains(string(output), "GCS_RELAY_READY") {
+					t.Fatalf("relay readiness was not reported: %v %s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), "synthetic relay startup failure") {
+				t.Fatalf("relay failure was not propagated: %v %s", err, output)
+			}
+		})
+	}
+}
+
 type closeFunc func() error
 
 func (f closeFunc) Close() error { return f() }
@@ -194,6 +247,8 @@ func TestPairBootstrapShellSyntax(t *testing.T) {
 	}
 	for _, script := range []string{
 		diodeNetworkCommand(&Uplink{Address: "172.31.250.2/24", Gateway: UplinkGateway}),
+		diodeBootstrapCommand(&Uplink{Address: "172.31.250.2/24", Gateway: UplinkGateway}, true),
+		demoToolsStage + workloadNICCommand(),
 		workloadNICCommand(),
 		resolve + `printf '%s\n' "1 0 42 $storage_dev" >` + exportParameters + "export_add",
 	} {

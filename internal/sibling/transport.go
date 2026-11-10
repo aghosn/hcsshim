@@ -17,8 +17,9 @@ import (
 type Role string
 
 const (
-	Diode    Role = "a"
-	Workload Role = "b"
+	TransportVersion      = 4
+	Diode            Role = "a"
+	Workload         Role = "b"
 )
 
 func Quote(value string) string {

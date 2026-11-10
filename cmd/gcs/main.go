@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/guest/bridge"
 	"github.com/Microsoft/hcsshim/internal/guest/cgroup"
+	"github.com/Microsoft/hcsshim/internal/guest/gcsrelay"
 	"github.com/Microsoft/hcsshim/internal/guest/kmsg"
 	"github.com/Microsoft/hcsshim/internal/guest/prot"
 	"github.com/Microsoft/hcsshim/internal/guest/runtime/hcsv2"
@@ -297,6 +299,8 @@ func main() {
 	initialPolicyStance := flag.String("initial-policy-stance",
 		"allow",
 		"Stance: allow, deny.")
+	siblingRelay := flag.Bool("sibling-relay", false, "Relay workload GCS and stdio through the diode's native sibling vsock.")
+	relayReady := flag.String("relay-ready", "/run/gcs-relay.ready", "Readiness file for -sibling-relay.")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "\nUsage of %s:\n", os.Args[0])
@@ -307,6 +311,15 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if *siblingRelay {
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		if err := gcsrelay.Run(ctx, *relayReady); err != nil {
+			logrus.WithError(err).Fatal("sibling GCS relay stopped")
+		}
+		return
+	}
 
 	// If v4 enable otel tracing
 	if *v4 {
@@ -457,7 +470,16 @@ func main() {
 		logrus.WithError(err).Fatal("failed add gcs pid to gcs cgroup")
 	}
 
-	tport := &transport.VsockTransport{}
+	commandLine, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		logrus.WithError(err).Fatal("read GCS vsock peer selection")
+	}
+	peerCID, err := gcsPeerFromCommandLine(string(commandLine))
+	if err != nil {
+		logrus.WithError(err).Fatal("invalid GCS vsock peer selection")
+	}
+	tport := &transport.VsockTransport{PeerCID: peerCID, PeerPortStart: prot.LinuxGcsVsockPort}
+	logrus.WithField("peer_cid", peerCID).Info("GCS control and stdio peer selected; Plan9 retains root route")
 	rtime, err := runc.NewRuntime()
 	if err != nil {
 		logrus.WithError(err).Fatal("failed to initialize new runc runtime")
@@ -514,7 +536,7 @@ func main() {
 	b.Sequential = sequential
 	b.AssignHandlers(mux, h)
 
-	// Reconnect loop: dial the host, serve until the connection drops, then
+	// Reconnect loop: dial the selected peer, serve until the connection drops, then
 	// re-dial. During live migration the VM is frozen and only wakes up when
 	// the destination host shim is ready, so the vsock port should be
 	// immediately available.
@@ -527,7 +549,7 @@ func main() {
 		} else {
 			bridgeCon, dialErr := tport.Dial(prot.LinuxGcsVsockPort)
 			if dialErr != nil {
-				logrus.WithError(dialErr).Warn("failed to dial host, retrying")
+				logrus.WithError(dialErr).WithField("peer_cid", peerCID).Warn("failed to dial GCS peer, retrying")
 				time.Sleep(reconnectInterval)
 				continue
 			}

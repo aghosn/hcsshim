@@ -52,6 +52,59 @@ func EnsureUplinkNetwork() (*hcn.HostComputeNetwork, error) {
 	return network.Create()
 }
 
+// PrepareUnikraftUplink reserves the image's fixed address before VM creation.
+func PrepareUnikraftUplink(name string, cfg *UnikraftNetwork) (_ *hcn.HostComputeEndpoint, _ func() error, resultErr error) {
+	if cfg == nil {
+		return nil, nil, errors.New("Unikraft uplink requires its launch configuration")
+	}
+	network, err := EnsureUplinkNetwork()
+	if err != nil {
+		return nil, nil, err
+	}
+	endpoint, err := network.CreateEndpoint(&hcn.HostComputeEndpoint{
+		Name: name, SchemaVersion: hcn.V2SchemaVersion(),
+		IpConfigurations: []hcn.IpConfig{{IpAddress: cfg.Uplink.String(), PrefixLength: 24}},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("allocate configured Unikraft uplink %s: %w", cfg.Uplink, err)
+	}
+	var namespace *hcn.HostComputeNamespace
+	joined := false
+	cleanup := func() error {
+		var err error
+		if joined {
+			err = errors.Join(err, hcn.RemoveNamespaceEndpoint(namespace.Id, endpoint.Id))
+		}
+		err = errors.Join(err, endpoint.Delete())
+		if namespace != nil {
+			err = errors.Join(err, namespace.Delete())
+		}
+		return err
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, cleanup())
+		}
+	}()
+	namespace, err = hcn.NewNamespace(hcn.NamespaceTypeGuest).Create()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := hcn.AddNamespaceEndpoint(namespace.Id, endpoint.Id); err != nil {
+		return nil, nil, err
+	}
+	joined = true
+	actual, err := hcn.GetEndpointByID(endpoint.Id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(actual.IpConfigurations) != 1 || actual.IpConfigurations[0].IpAddress != cfg.Uplink.String() ||
+		actual.IpConfigurations[0].PrefixLength != 24 || actual.MacAddress == "" {
+		return nil, nil, errors.New("HNS did not assign the address embedded in the Unikraft image")
+	}
+	return actual, cleanup, nil
+}
+
 // AttachUplink is deliberately diode-only; callers must never pass the workload.
 func AttachUplink(ctx context.Context, vm *uvm.UtilityVM) (*Uplink, func() error, error) {
 	if vm.UsesSiblingNetworking() {

@@ -101,8 +101,17 @@ func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 	previousGCS := useGCS
 	useGCS = true
 	defer func() { useGCS = previousGCS }()
-	root := t.TempDir()
-	for _, selected := range []bool{false, true} {
+	for _, test := range []struct {
+		selected bool
+		relay    bool
+		wantFail bool
+	}{
+		{false, false, false},
+		{true, false, false},
+		{false, true, false},
+		{true, true, true},
+	} {
+		root := t.TempDir()
 		global := flag.NewFlagSet("global", flag.ContinueOnError)
 		global.Int(countArgName, 2, "")
 		global.Int(parallelArgName, 2, "")
@@ -110,23 +119,25 @@ func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 		local.String(pageMetadataOutputArgName, "", "")
 		local.Bool(siblingInteractiveArgName, true, "")
 		local.Bool(siblingDiodeUplinkArgName, true, "")
+		local.Bool(siblingGCSRelayArgName, test.relay, "")
 		local.String(siblingBusGuestModuleArgName, "sibling_bus.ko", "")
-		if selected {
+		if test.selected {
 			if err := local.Set(pageMetadataOutputArgName, root); err != nil {
 				t.Fatal(err)
 			}
 		}
 		c := cli.NewContext(nil, local, cli.NewContext(nil, global, nil))
-		if err := preparePageMetadataOutput(c); err != nil {
-			t.Fatal(err)
+		err := preparePageMetadataOutput(c)
+		if (err != nil) != test.wantFail {
+			t.Fatalf("selected=%t relay=%t: %v", test.selected, test.relay, err)
 		}
-		if selected {
+		if test.selected && !test.wantFail {
 			run := c.String(pageMetadataOutputArgName)
 			if run == root || filepath.Dir(run) != root {
 				t.Fatal("collector did not receive the isolated run directory")
 			}
 		} else if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
-			t.Fatal("omitted option created output directories")
+			t.Fatal("omitted or rejected option created output directories")
 		}
 	}
 }

@@ -143,6 +143,24 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatal(err)
 	}
+	if err := pair.Set(unikraftPackageArgName, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := pair.Parent().Set(cpusArgName, "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
+		t.Fatalf("single-VP Unikraft storage pair rejected: %v", err)
+	}
+	if err := pair.Parent().Set(cpusArgName, "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
+		t.Fatal("Unikraft storage accepted an unsupported two-VP appliance")
+	}
+	if err := pair.Set(unikraftPackageArgName, ""); err != nil {
+		t.Fatal(err)
+	}
 	plan.Disks[0].Role = "root"
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
 		t.Fatal("paired benchmark accepted a root export")
@@ -154,9 +172,17 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 	}
 }
 
+func TestStorageBenchmarkSingleVPAndPlacementIdlePreflight(t *testing.T) {
+	command := storageBenchmarkPreflight(1, "poll")
+	if !strings.Contains(command, `/sys/devices/system/cpu/online)" = 0 ]`) ||
+		!strings.Contains(command, "'idle=poll'") || strings.Contains(command, "idle=halt") {
+		t.Fatalf("single-VP separate-core preflight is incorrect: %s", command)
+	}
+}
+
 func TestStorageBenchmarkCommandsUseResolvedAttachmentAndNoNetwork(t *testing.T) {
 	c := benchmarkTestContext(t, "--storage-benchmark-script", `C:\some path\it's fio.sh`)
-	command := storageBenchmarkPreflight() + storageRPDeviceCommand("test-controller", 7) +
+	command := storageBenchmarkPreflight(2, "halt") + storageRPDeviceCommand("test-controller", 7) +
 		storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{
 			ReadSHA256: "read-hash", WriteSHA256: "write-hash",
 			SyncReadSHA: "sync-read-hash", SyncWriteSHA: "sync-write-hash",

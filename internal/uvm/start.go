@@ -60,6 +60,7 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
+	uvm.startInvoked.Store(true)
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
 	ctx, cancel := context.WithTimeout(pCtx, timeout.GCSConnectionTimeout)
@@ -188,8 +189,7 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	}
 
 	if opts, ok := uvm.createOpts.(*OptionsLCOW); ok && opts.Appliance != nil {
-		// An appliance has no guest connection or guest-side mount manager.
-		return nil
+		return uvm.startApplianceStorage(ctx, opts.Appliance)
 	}
 
 	if uvm.gcListener != nil {
@@ -225,9 +225,15 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 			IoListen:       gcs.HvsockIoListen(uvm.runtimeID),
 			InitGuestState: initGuestState,
 		}
+		if uvm.gcIoListen != nil {
+			gcc.IoListen = uvm.gcIoListen
+		}
 		uvm.gc, err = gcc.Connect(ctx, true)
 		if err != nil {
 			return err
+		}
+		if uvm.gcIoPortStart != 0 {
+			uvm.gc.SetNextPort(uvm.gcIoPortStart)
 		}
 		uvm.guestCaps = uvm.gc.Capabilities()
 		uvm.protocol = uvm.gc.Protocol()

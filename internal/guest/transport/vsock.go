@@ -16,7 +16,19 @@ import (
 
 // VsockTransport is an implementation of Transport which uses vsock
 // sockets.
-type VsockTransport struct{}
+type VsockTransport struct {
+	// PeerCID applies only to ports at or above PeerPortStart. Lower ports
+	// retain their root route, including the independent Plan9 service.
+	PeerCID       uint32
+	PeerPortStart uint32
+}
+
+func (t *VsockTransport) peerForPort(port uint32) uint32 {
+	if t.PeerCID != 0 && port >= t.PeerPortStart {
+		return t.PeerCID
+	}
+	return vsock.CIDHost
+}
 
 var _ Transport = &VsockTransport{}
 
@@ -31,7 +43,7 @@ func (t *VsockTransport) Dial(port uint32) (Connection, error) {
 	// Retry 10 times because vsock.Dial can return connection time out
 	// due to some underlying kernel bug.
 	for i := 0; i < 10; i++ {
-		conn, err := vsock.Dial(vsock.CIDHost, port)
+		conn, err := vsock.Dial(t.peerForPort(port), port)
 		if err == nil {
 			return conn, nil
 		}

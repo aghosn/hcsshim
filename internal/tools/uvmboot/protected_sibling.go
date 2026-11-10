@@ -216,14 +216,14 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 	for _, name := range []string{
 		sharedMemoryGuestModuleArgName, sharedMemoryTwoUVMArgName, sharedMemoryMappingOnlyArgName, sharedMemoryGuestInventoryArgName,
 		sharedMemoryObserveArgName, sharedMemoryNameArgName, siblingStorageBackendsArgName,
-		siblingStorageRootArgName, validateStorageBackendsArgName, unikraftPackageArgName,
-		siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName,
+		siblingStorageRootArgName, validateStorageBackendsArgName, unikraftPackageArgName, siblingGCSRelayArgName,
+		siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName, baselineVsockArgName,
 		networkBenchmarkScriptArgName, networkBenchmarkServerArgName, networkBenchmarkPortArgName,
-		networkBenchmarkTimeoutArgName, networkBenchmarkNoSMTArgName, networkBenchmarkIdleArgName,
+		networkBenchmarkTimeoutArgName, networkBenchmarkNoSMTArgName, networkBenchmarkIdleArgName, networkBenchmarkSingleVPArgName,
 		storageBenchmarkScriptArgName, storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 		storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
 		storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName,
-		storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName,
+		storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName,
 		execCommandLineArgName, execFileArgName, scsiMountsArgName, vpmemMountsArgName,
 		shareFilesArgName, noVerityBoot, siblingTestsArgName, benchSecondsArgName,
 	} {

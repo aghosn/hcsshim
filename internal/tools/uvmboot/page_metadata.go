@@ -50,8 +50,8 @@ func preparePageMetadataOutput(c *cli.Context) error {
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		c.String(siblingBusGuestModuleArgName) == "" ||
 		c.String(siblingOpenShellBundleArgName) != "" || c.String(unikraftPackageArgName) != "" ||
-		c.Bool(validateStorageBackendsArgName) {
-		return fmt.Errorf("--%s requires an interactive Linux diode/workload pair", pageMetadataOutputArgName)
+		c.Bool(siblingGCSRelayArgName) || c.Bool(validateStorageBackendsArgName) {
+		return fmt.Errorf("--%s requires an interactive Linux diode/workload pair without --%s", pageMetadataOutputArgName, siblingGCSRelayArgName)
 	}
 	run, err := newPageMetadataOutput(c.String(pageMetadataOutputArgName))
 	if err != nil {

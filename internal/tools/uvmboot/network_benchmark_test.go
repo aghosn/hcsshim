@@ -62,6 +62,34 @@ func benchmarkTestContext(t *testing.T, args ...string) *cli.Context {
 	return cli.NewContext(cli.NewApp(), set, parent)
 }
 
+func TestNetworkBenchmarkCPUSamplingPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "benchmark.sh")
+	for _, test := range []struct {
+		script string
+		want   bool
+	}{
+		{"session\n", true},
+		{"session\ncpu_measurements=0\n", false},
+		{"cpu_measurements=0\r\nsession\r\n", false},
+		{"# cpu_measurements=0\n", true},
+		{"cpu_measurements=0\ncpu_measurements=1\n", true},
+	} {
+		if err := os.WriteFile(path, []byte(test.script), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := networkBenchmarkCPUEnabled(benchmarkTestContext(t, "--network-benchmark-script", path))
+		if err != nil || got != test.want {
+			t.Fatalf("script %q: enabled=%v err=%v, want %v", test.script, got, err, test.want)
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := networkBenchmarkCPUEnabled(benchmarkTestContext(t, "--network-benchmark-script", path)); err == nil {
+		t.Fatal("missing policy script must not silently disable sampling")
+	}
+}
+
 func TestNetworkBenchmarkValidationFailsClosed(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "bench.sh")
 	if err := os.WriteFile(script, []byte("exit 0\n"), 0600); err != nil {
@@ -138,6 +166,74 @@ func TestNetworkBenchmarkValidationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "bench.sh")
+	if err := os.WriteFile(script, []byte("exit 0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldGCS, oldInteractive, oldDebug := useGCS, siblingInteractive, debug
+	useGCS, siblingInteractive, debug = true, false, false
+	t.Cleanup(func() { useGCS, siblingInteractive, debug = oldGCS, oldInteractive, oldDebug })
+	base := []string{"--network-benchmark-script", script,
+		"--network-benchmark-server", "192.0.2.10", "--security-hardware",
+		"--network-benchmark-single-vp"}
+	for _, tc := range []struct {
+		name      string
+		flags     []string
+		count     string
+		wantError bool
+	}{
+		{"Unikraft pair", []string{"--unikraft-diode-package", "bundle", "--sibling-bus-guest-module", "bus.ko",
+			"--shared-memory-two-uvm-proof", "--sibling-diode-uplink"}, "2", false},
+		{"standalone reference", []string{"--baseline-nic-tcpbulk", "tool"}, "1", false},
+		{"Linux comparison pair", []string{"--sibling-bus-guest-module", "bus.ko",
+			"--shared-memory-two-uvm-proof", "--sibling-diode-uplink"}, "2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := benchmarkTestContext(t, append(append([]string{}, base...), tc.flags...)...)
+			for key, value := range map[string]string{cpusArgName: "1", countArgName: tc.count, parallelArgName: tc.count} {
+				if err := c.GlobalSet(key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			groups := [][]uint32{{8, 24}}
+			if tc.count == "2" {
+				groups = append(groups, []uint32{9, 25})
+			}
+			if err := validateNetworkBenchmark(c, groups); (err != nil) != tc.wantError {
+				t.Fatalf("validation=%v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+	c := benchmarkTestContext(t, "--network-benchmark-single-vp")
+	if err := validateNetworkBenchmark(c, nil); err == nil {
+		t.Fatal("accepted flag without benchmark")
+	}
+	for _, single := range []bool{false, true} {
+		command := networkBenchmarkVPPreflight("workload", "192.0.2.10", false, "poll", single)
+		want := "vcpus=2"
+		if single {
+			want = "vcpus=1"
+		}
+		if !strings.Contains(command, want) || !strings.Contains(command, "SEV-SNP") ||
+			strings.Contains(command, "guest virtual SMT pair missing") == single {
+			t.Fatalf("wrong VP/SNP/SMT requirements: %s", command)
+		}
+		args := []string{"--network-benchmark-script", script, "--network-benchmark-server", "192.0.2.10"}
+		if single {
+			args = append(args, "--network-benchmark-single-vp")
+		}
+		diode := networkBenchmarkSiblingCommand(benchmarkTestContext(t, args...), "/bus.ko", "/net.ko", diodeRole,
+			siblingNetConfig{ifName: "dvsp0", address: "10.200.0.1/30"},
+			&diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
+		if !strings.Contains(diode, want) || !strings.Contains(diode, "grep -qx 'receive_diagnostics=1'") ||
+			strings.Count(diode, "net-diagnostics -interface") != 2 ||
+			!strings.Contains(diode, "NETBENCH_DIODE_DIAGNOSTICS_BEGIN") {
+			t.Fatalf("Linux diode lost matched topology or buffered driver snapshots: %s", diode)
+		}
+	}
+}
+
 func TestNetworkBenchmarkHostGateway(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -204,6 +300,13 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 	if strings.Contains(workload, "insmod ''") || strings.Contains(workload, "netvsc.ko") ||
 		!strings.Contains(workload, "bus${sb_bus}-relid*") {
 		t.Fatal("stock peer NIC must be selected by its owning bus without loading a consumer module")
+	}
+	for _, command := range []string{workload, baseline} {
+		stage := strings.Index(command, "cp /run/diode-controller/diode-controller /run/dtb-exec/diode-controller")
+		run := strings.Index(command, "/bin/sh /run/dtb-exec/network-benchmark.sh")
+		if stage < 0 || stage >= run {
+			t.Fatal("diagnostic helper must be staged before the workload or baseline benchmark starts")
+		}
 	}
 }
 

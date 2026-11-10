@@ -18,6 +18,7 @@ import (
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/copyfile"
+	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
@@ -68,10 +69,11 @@ const (
 type LCOWSharedMemoryRegion = hcsschema.SharedMemoryRegion
 
 // LCOWApplianceOptions describes a VMGS guest with no Linux guest services.
-// Devices are provisioned at creation and remain attached until VM teardown.
+// NativeStorageControl opts into live disk management without a guest agent.
 type LCOWApplianceOptions struct {
-	SCSI            map[string]hcsschema.Scsi
-	NetworkAdapters map[string]hcsschema.NetworkAdapter
+	SCSI                 map[string]hcsschema.Scsi
+	NetworkAdapters      map[string]hcsschema.NetworkAdapter
+	NativeStorageControl bool
 }
 
 type ConfidentialLCOWOptions struct {
@@ -435,7 +437,15 @@ func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
 	}
 
 	if opts.Appliance != nil {
-		doc.VirtualMachine.Devices.HvSocket = nil
+		if !opts.Appliance.NativeStorageControl {
+			doc.VirtualMachine.Devices.HvSocket = nil
+		} else {
+			doc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable[winio.VsockServiceID(diodecontrol.Port).String()] = hcsschema.HvSocketServiceConfig{
+				AllowWildcardBinds:        true,
+				BindSecurityDescriptor:    "D:P(A;;FA;;;WD)",
+				ConnectSecurityDescriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+			}
+		}
 		doc.VirtualMachine.Devices.Plan9 = nil
 		doc.VirtualMachine.Devices.NetworkAdapters = maps.Clone(opts.Appliance.NetworkAdapters)
 		doc.VirtualMachine.Devices.ComPorts = map[string]hcsschema.ComPort{
@@ -1079,6 +1089,12 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 		uvm.entropyListener, err = uvm.listenVsock(vmutils.LinuxEntropyVsockPort)
 		if err != nil {
 			return nil, err
+		}
+	}
+	if opts.Appliance != nil && opts.Appliance.NativeStorageControl {
+		uvm.applianceControlListener, err = uvm.listenVsock(diodecontrol.Port)
+		if err != nil {
+			return nil, fmt.Errorf("create native diode storage listener: %w", err)
 		}
 	}
 

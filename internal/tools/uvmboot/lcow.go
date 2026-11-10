@@ -67,6 +67,7 @@ const (
 	diodePartitionSealMaskArgName     = "diode-partition-seal-mask"
 	workloadPartitionSealMaskArgName  = "workload-partition-seal-mask"
 	partitionSealPausePrefixArgName   = "partition-seal-pause-prefix"
+	siblingGCSRelayArgName            = "sibling-gcs-relay"
 )
 
 var (
@@ -98,6 +99,10 @@ var lcowCommand = cli.Command{
 			Usage: "Protected mode with at least one mask: fresh absolute local-drive prefix for .ready/.resume; " +
 				"pause after checked networking/admission with attach/stop live. Read complete .ready, then exclusively " +
 				"create .resume containing exactly continue followed by LF; never overwrite markers. Debugging only, not authentication.",
+		},
+		cli.BoolFlag{
+			Name:  siblingGCSRelayArgName,
+			Usage: "Experimental: route workload GCS and stdio through the Linux diode; requires interactive sibling-root boot.",
 		},
 		cli.StringFlag{
 			Name: unikraftPackageArgName,
@@ -318,6 +323,10 @@ var lcowCommand = cli.Command{
 			Usage: "Run this network-only benchmark shell script against an external LAN iperf2 server.",
 		},
 		cli.StringFlag{
+			Name:  baselineVsockArgName,
+			Usage: "Runtime directory for the two-SNP-UVM host-relayed vSock/TUN benchmark (no sibling shared memory)",
+		},
+		cli.StringFlag{
 			Name:  networkBenchmarkServerArgName,
 			Usage: "External LAN server IPv4 address (not this host or a test-network endpoint).",
 		},
@@ -335,6 +344,10 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkNoSMTArgName,
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
+		cli.BoolFlag{
+			Name:  networkBenchmarkSingleVPArgName,
+			Usage: "Use one VP for a matched Linux/Unikraft network comparison or its standalone reference (Linux default remains two)",
+		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
 			Value: "poll",
@@ -351,6 +364,7 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
+		cli.StringFlag{Name: storageBenchmarkIdleArgName, Value: "halt", Usage: "Storage workload idle policy: poll or halt."},
 	},
 	// Action validates LCOW flags, owns the shared section and worker lifetimes,
 	// and returns setup/worker/mapping failures through the existing cleanup.
@@ -423,7 +437,7 @@ var lcowCommand = cli.Command{
 		}
 		benchmarkCtx := context.Background()
 		var cancelBenchmark context.CancelFunc
-		if unikraft != nil {
+		if unikraft != nil || c.Bool(siblingGCSRelayArgName) {
 			benchmarkCtx, cancelBenchmark = context.WithCancel(benchmarkCtx)
 			defer cancelBenchmark()
 		}
@@ -537,6 +551,13 @@ var lcowCommand = cli.Command{
 			if _, err := os.Stat(c.String(siblingBusGuestModuleArgName)); err != nil {
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
+		}
+		if c.Bool(siblingGCSRelayArgName) && (!useGCS || !siblingInteractive ||
+			!c.Bool(sharedMemoryTwoUVMArgName) || !c.Bool(siblingStorageRootArgName) ||
+			c.String(siblingBusGuestModuleArgName) == "" ||
+			c.String(siblingOpenShellBundleArgName) != "" || c.String(networkBenchmarkScriptArgName) != "" ||
+			c.String(storageBenchmarkScriptArgName) != "") {
+			return fmt.Errorf("--%s requires an interactive sibling-root pair without other experiments", siblingGCSRelayArgName)
 		}
 		for _, flag := range []struct {
 			name  string
@@ -666,6 +687,15 @@ var lcowCommand = cli.Command{
 			mappingMu      sync.Mutex
 			mappingAddress = make(map[string]uint64)
 		)
+		var gcsRelay *siblingGCSRelay
+		if c.String(baselineVsockArgName) != "" {
+			benchmarkCtx = context.WithValue(benchmarkCtx, baselineVsockKey{}, &baselineVsockSession{
+				workload: make(chan string, 1), ready: make(chan struct{}),
+			})
+		}
+		if c.Bool(siblingGCSRelayArgName) {
+			gcsRelay = &siblingGCSRelay{diode: make(chan *uvm.UtilityVM, 1)}
+		}
 		// Each worker owns its VM through runLCOW and records its first failure
 		// under errMu. The shared section remains owned by this Action.
 		runMany(c, func(id string) (workerErr error) {
@@ -680,7 +710,7 @@ var lcowCommand = cli.Command{
 					if cancelBenchmark != nil {
 						cancelBenchmark()
 					}
-				} else if unikraft != nil && id == "uvmboot-1" {
+				} else if (unikraft != nil || gcsRelay != nil) && id == "uvmboot-1" {
 					cancelBenchmark()
 				}
 			}()
@@ -690,7 +720,7 @@ var lcowCommand = cli.Command{
 				if err != nil {
 					return err
 				}
-				return runUnikraftProvider(ctx, c, unikraft, storagePlan, siblingCommunicationGroupID, cpuGroup, section)
+				return runUnikraftProvider(ctx, c, unikraft, storagePlan, siblingCommunicationGroupID, cpuGroup, section, gcsRelay)
 			}
 			options, err := createLCOWOptions(ctx, c, id)
 			if err != nil {
@@ -699,6 +729,9 @@ var lcowCommand = cli.Command{
 			options.CPUGroupID, err = cpuGroups.groupForVM(id)
 			if err != nil {
 				return err
+			}
+			if c.String(baselineVsockArgName) != "" {
+				options.ExtraVSockPorts = append(options.ExtraVSockPorts, 1024)
 			}
 			if options.CPUGroupID != "" {
 				fmt.Printf("cpu group: %s id=%s\n", id, options.CPUGroupID)
@@ -739,6 +772,7 @@ var lcowCommand = cli.Command{
 				c,
 				storagePlan,
 				unikraft,
+				gcsRelay,
 				execCommand,
 				// In mapping-only mode, require one mapping before publishing
 				// its full native page index under mappingMu. Other modes do
@@ -1134,6 +1168,7 @@ func runLCOW(
 	c *cli.Context,
 	storagePlan *siblingStoragePlan,
 	unikraft *unikraftConfig,
+	gcsRelay *siblingGCSRelay,
 	execCommand string,
 	mappingObserver func(
 		string,
@@ -1171,7 +1206,7 @@ func runLCOW(
 			resultErr = errors.Join(resultErr, closeStorageBenchmark(ctx, vm.CloseCtx, storageReleases))
 			return
 		}
-		if c.String(networkBenchmarkScriptArgName) == "" && c.String(unikraftPackageArgName) == "" {
+		if c.String(networkBenchmarkScriptArgName) == "" && c.String(unikraftPackageArgName) == "" && gcsRelay == nil {
 			_ = vm.CloseCtx(ctx)
 			return
 		}
@@ -1181,6 +1216,11 @@ func runLCOW(
 			resultErr = errors.Join(resultErr, fmt.Errorf("close UVM %s: %w", vm.ID(), err))
 		}
 	}()
+	if gcsRelay != nil {
+		if err := gcsRelay.configure(ctx, vm); err != nil {
+			return err
+		}
+	}
 
 	var (
 		preStartRegions []hcsschema.SharedMemoryRegionInfo
@@ -1213,20 +1253,26 @@ func runLCOW(
 	}
 	var stopSampling func() error
 	if c.String(networkBenchmarkScriptArgName) != "" {
-		if vm.ProcessorCount() != 2 {
-			return fmt.Errorf("network benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != networkBenchmarkProcessors(c) {
+			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", networkBenchmarkProcessors(c), vm.ProcessorCount())
 		}
-		stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
-		defer func() {
-			resultErr = errors.Join(resultErr, stopSampling())
-		}()
+		sampleCPU, err := networkBenchmarkCPUEnabled(c)
+		if err != nil {
+			return err
+		}
+		if sampleCPU {
+			stopSampling = sampleNetworkBenchmarkCPU(ctx, vm)
+			defer func() {
+				resultErr = errors.Join(resultErr, stopSampling())
+			}()
+		}
 		if err := shareNetworkBenchmark(ctx, c, vm); err != nil {
 			return err
 		}
 	}
 	if c.String(storageBenchmarkScriptArgName) != "" {
-		if vm.ProcessorCount() != 2 {
-			return fmt.Errorf("storage benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		if vm.ProcessorCount() != int32(c.GlobalUint64(cpusArgName)) {
+			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", c.GlobalUint64(cpusArgName), vm.ProcessorCount())
 		}
 	}
 
@@ -1334,6 +1380,19 @@ func runLCOW(
 			if err := vm.Share(ctx, tool, "/run/diode-storage-test", true); err != nil {
 				return err
 			}
+		}
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			iperfPath := filepath.Join(filepath.Dir(module), iperfGuestName)
+			if err := vm.Share(ctx, iperfPath, iperfGuestShare, true); err != nil {
+				return fmt.Errorf("share %s: %w", iperfGuestName, err)
+			}
+			controllerPath := filepath.Join(filepath.Dir(module), "diode-controller")
+			if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
+				return fmt.Errorf("share benchmark diagnostics: %w", err)
+			}
+			execCommand = iperfStage + "set -eu; " +
+				`ping -c 3 -W 3 ` + unikraft.Network.Provider.String() + `; ` +
+				networkBenchmarkClient(c, "workload")
 		}
 		execCommand, err = unikraftWorkloadCommand("/run/sibling-bus-module/"+filepath.Base(module),
 			unikraft, storagePlan, execCommand)
@@ -1450,8 +1509,11 @@ func runLCOW(
 				if err := vm.Share(ctx, tcpBulkPath, "/run/diode-tcpbulk", true); err != nil {
 					return fmt.Errorf("share diode_tcpbulk: %w", err)
 				}
-				// Interactive demo helpers, staged on both roles (the diode runs
-				// capture/filter/smooth, the workload runs the covert client).
+				// The same executable serves the diode UI and the manually started workload SNP responder.
+				controllerPath := filepath.Join(filepath.Dir(busModulePath), "diode-controller")
+				if err := vm.Share(ctx, controllerPath, "/run/diode-controller", true); err != nil {
+					return fmt.Errorf("share diode-controller: %w", err)
+				}
 				for shareName, guestDir := range map[string]string{
 					"demo.sh":       "/run/diode-demo",
 					"covert_udp":    "/run/diode-covert",
@@ -1534,7 +1596,14 @@ func runLCOW(
 		}
 	}
 
-	if c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) {
+	if c.String(baselineVsockArgName) != "" {
+		command, cleanup, err := prepareBaselineVsock(ctx, c, vm)
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, cleanup()) }()
+		execCommand = command
+	} else if c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) {
 		cmd, cleanup, err := baselineCommand(ctx, c, vm)
 		if err != nil {
 			return err
@@ -1556,6 +1625,9 @@ func runLCOW(
 	}
 
 	if options.UseGuestConnection {
+		if gcsRelay != nil && vm.ID() == "uvmboot-0" {
+			execCommand += "; " + siblingGCSRelayCommand()
+		}
 		var output io.Writer = os.Stdout
 		if diodeTiming != nil {
 			output = diodeTiming
@@ -1717,10 +1789,11 @@ func siblingNetModuleName(role string) string {
 // before the relay-check window. $dtb is the binary to run; iperfStage adds
 // $ipf and ipbench.
 const siblingTCPBulkStage = `dtb=/run/diode-tcpbulk/diode_tcpbulk; mkdir -p /run/dtb-exec && ` +
-	`mount -t tmpfs -o exec,size=16m tmpfs /run/dtb-exec 2>/dev/null && ` +
+	`mount -t tmpfs -o exec,size=32m tmpfs /run/dtb-exec 2>/dev/null && ` +
 	`cp $dtb /run/dtb-exec/dtb && chmod 755 /run/dtb-exec/dtb && dtb=/run/dtb-exec/dtb; ` +
 	`for m in demo.sh:demo.sh:/run/diode-demo covert:covert_udp:/run/diode-covert ` +
-	`tcpdump:diode_tcpdump:/run/diode-tcpdump tc:diode_tc:/run/diode-tc; do ` +
+	`tcpdump:diode_tcpdump:/run/diode-tcpdump tc:diode_tc:/run/diode-tc ` +
+	`diode-controller:diode-controller:/run/diode-controller; do ` +
 	`d=${m%%:*}; r=${m#*:}; s=${r#*:}/${r%%:*}; ` +
 	`if [ -f "$s" ]; then cp "$s" /run/dtb-exec/$d && chmod 755 /run/dtb-exec/$d; fi; done; ` +
 	iperfStage
@@ -1879,12 +1952,7 @@ func guestWaitFor(cond, what string) string {
 		"sleep 1; done; "
 }
 
-// siblingTransportVersion is the exact guest transport version required by both
-// ordinary and protected sibling startup. The temporary whole-checkout baseline
-// is vsock-tun-forward f9a32c7ad6c8949e4909d3fa23d1f2559ddffd91: transport v3,
-// distinct from its v1, 52-byte native discovery descriptor with one doorbell.
-// This guard does not negotiate versions or accept transport v4.
-const siblingTransportVersion = 3
+const siblingTransportVersion = sibling.TransportVersion
 
 // siblingInstanceDiscoveryCommand returns shell setup for exactly one ready
 // sibling link. When executed in the guest, it waits up to guestWaitFor's budget,

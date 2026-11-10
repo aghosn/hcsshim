@@ -173,6 +173,14 @@ func VerifyOptions(_ context.Context, options interface{}) error {
 			return err
 		}
 		if opts.Appliance != nil {
+			if opts.Appliance.NativeStorageControl {
+				if _, err := applianceStorageSlots(opts.Appliance); err != nil {
+					return err
+				}
+				if opts.SCSIControllerCount != 1 {
+					return errors.New("native appliance storage requires exactly one SCSI controller")
+				}
+			}
 			if opts.GuestStateFilePath == "" || !opts.SecurityPolicyEnabled ||
 				opts.HclEnabled == nil || *opts.HclEnabled ||
 				opts.UseGuestConnection || opts.ForwardStdout || opts.ForwardStderr ||
@@ -376,6 +384,15 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 	// TODO: check if uVM already closed
 
 	windows.Close(uvm.vmmemProcess)
+	if uvm.applianceControlListener != nil {
+		_ = uvm.applianceControlListener.Close()
+		uvm.applianceControlListener = nil
+	}
+	if uvm.applianceControl != nil {
+		if err := uvm.applianceControl.Close(); err != nil {
+			log.G(ctx).WithError(err).Error("close native diode control failed")
+		}
+	}
 
 	if uvm.hcsSystem != nil {
 		_ = uvm.hcsSystem.Terminate(ctx)

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Microsoft/go-winio"
+	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 )
@@ -53,6 +55,33 @@ func TestVMGSApplianceBootDocument(t *testing.T) {
 	if err != nil || len(files) != 1 || files[0].Name() != "guest.vmgs" {
 		t.Fatalf("appliance staged Linux rootfs files: %v %v", files, err)
 	}
+	opts.Appliance.NativeStorageControl, opts.SCSIControllerCount = true, 1
+	opts.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"] =
+		hcsschema.Attachment{Type_: "VirtualDisk", Path: `C:\fixture\root.vhd`, ReadOnly: true}
+	if err := VerifyOptions(context.Background(), opts); err != nil {
+		t.Fatal(err)
+	}
+	nativeDoc, err := makeLCOWVMGSBootDoc(context.Background(), opts, vm,
+		&hcsschema.VirtualMachineProcessor{Count: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sockets := nativeDoc.VirtualMachine.Devices.HvSocket.HvSocketConfig.ServiceTable
+	if _, ok := sockets[winio.VsockServiceID(diodecontrol.Port).String()]; !ok || len(sockets) != 1 {
+		t.Fatalf("appliance enabled unrelated Linux/GCS services: %v", sockets)
+	}
+	slots, err := applianceStorageSlots(opts.Appliance)
+	if err != nil || len(slots) != 2 || slots[0].LUN != 0 || slots[1].LUN != 3 {
+		t.Fatalf("boot attachment reservations: %v, %v", slots, err)
+	}
+	if err := verifyApplianceExports(opts.Appliance,
+		[]diodecontrol.Export{{LUN: 0, RootLUN: 0, Flags: diodecontrol.Boot | diodecontrol.ReadOnly}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyApplianceExports(opts.Appliance,
+		[]diodecontrol.Export{{LUN: 0, RootLUN: 3, Flags: diodecontrol.Boot | diodecontrol.ReadOnly}}); err == nil {
+		t.Fatal("accepted a root export using a different boot backing")
+	}
 	opts.UseGuestConnection = true
 	if err := VerifyOptions(context.Background(), opts); err == nil {
 		t.Fatal("accepted GCS in appliance mode")
@@ -60,6 +89,22 @@ func TestVMGSApplianceBootDocument(t *testing.T) {
 	opts.UseGuestConnection, opts.KernelBootOptions = false, "ignored arguments"
 	if err := VerifyOptions(context.Background(), opts); err == nil {
 		t.Fatal("accepted ignored runtime VMGS command line")
+	}
+}
+
+func TestApplianceStorageRejectsAmbiguousBootSlots(t *testing.T) {
+	for _, invalid := range []string{"00", "64", "255", "not-a-lun"} {
+		t.Run(invalid, func(t *testing.T) {
+			opts := &LCOWApplianceOptions{SCSI: map[string]hcsschema.Scsi{
+				guestrequest.ScsiControllerGuids[0]: {Attachments: map[string]hcsschema.Attachment{
+					"0":     {Type_: "VirtualDisk", Path: "root.vhd", ReadOnly: true},
+					invalid: {Type_: "VirtualDisk", Path: "extra.vhd", ReadOnly: true},
+				}},
+			}}
+			if _, err := applianceStorageSlots(opts); err == nil {
+				t.Fatal("accepted an ambiguous/out-of-range boot slot")
+			}
+		})
 	}
 }
 

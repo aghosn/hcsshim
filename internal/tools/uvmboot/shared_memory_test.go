@@ -3,12 +3,56 @@
 package main
 
 import (
+	"flag"
 	"os/exec"
 	"strings"
 	"testing"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/urfave/cli"
 )
+
+func TestProtectedSiblingRejectsUnsupportedUpstreamModes(t *testing.T) {
+	previousGCS := useGCS
+	useGCS = true
+	defer func() { useGCS = previousGCS }()
+	for _, test := range []struct{ name, value string }{
+		{siblingGCSRelayArgName, "true"},
+		{siblingGCSRelayArgName, "false"},
+		{baselineVsockArgName, "runtime"},
+		{networkBenchmarkSingleVPArgName, "true"},
+		{storageBenchmarkIdleArgName, "halt"},
+		{siblingStorageRootArgName, "true"},
+	} {
+		t.Run(test.name+"="+test.value, func(t *testing.T) {
+			global := flag.NewFlagSet("global", flag.ContinueOnError)
+			global.Int(countArgName, 2, "")
+			global.Int(parallelArgName, 2, "")
+			local := flag.NewFlagSet("lcow", flag.ContinueOnError)
+			for _, option := range lcowCommand.Flags {
+				option.Apply(local)
+			}
+			for name, value := range map[string]string{
+				protectedSharedMemoryArgName: "true",
+				securityHardwareFlag:         "true",
+				siblingInteractiveArgName:    "true",
+				siblingDiodeUplinkArgName:    "true",
+				siblingBusGuestModuleArgName: "missing-fixture-module",
+				rootFSTypeArgName:            "none",
+				test.name:                    test.value,
+			} {
+				if err := local.Set(name, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := cli.NewContext(nil, local, cli.NewContext(nil, global, nil))
+			err := validateProtectedSiblingCLI(c)
+			if err == nil || !strings.Contains(err.Error(), "--"+test.name+" is incompatible") {
+				t.Fatalf("unsupported mode reached artifact/resource preparation: %v", err)
+			}
+		})
+	}
+}
 
 func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 	shell, err := exec.LookPath("wsl.exe")
