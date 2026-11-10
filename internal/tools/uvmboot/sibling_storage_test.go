@@ -200,6 +200,90 @@ func storageTestContext(t *testing.T, args ...string) *cli.Context {
 	return cli.NewContext(cli.NewApp(), set, parent)
 }
 
+// TestProtectedSiblingStoragePlan binds the combined root-only export to its
+// selected dm-verity input without enabling proof mode or attaching any disk.
+// Extra/writable/removable/mismatched inputs must fail before runtime ownership.
+func TestProtectedSiblingStoragePlan(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, name := range []string{
+		"valid", "extra", "wrong-id", "wrong-role", "writable", "removable",
+		"wrong-lun", "missing-lun", "mismatched-root", "unknown-field", "trailing-json",
+	} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, true)...)
+		plan, err := loadSiblingStoragePlan(c)
+		if err != nil || plan == nil {
+			t.Fatalf("valid protected root plan: %+v, %v", plan, err)
+		}
+		if c.Bool(sharedMemoryTwoUVMArgName) || c.IsSet(sharedMemoryTwoUVMArgName) {
+			t.Fatal("protected storage enabled the ordinary proof lifecycle")
+		}
+		root := &plan.Disks[0]
+		switch name {
+		case "extra":
+			extra := storageTestPlan(t).Disks[1]
+			plan.Disks = append(plan.Disks, extra)
+		case "wrong-id":
+			root.ID = "other-root"
+		case "wrong-role":
+			root.Role = "data"
+		case "writable":
+			root.Access = "read-write"
+		case "removable":
+			root.Removable = true
+		case "wrong-lun":
+			*root.ExportLUN = 1
+		case "missing-lun":
+			root.ExportLUN = nil
+		case "mismatched-root":
+			root.HostPath = storageTestPlan(t).Disks[0].HostPath
+		}
+		input := storagePlanJSON(t, plan)
+		switch name {
+		case "unknown-field":
+			input = strings.Replace(input, `"version":1`, `"version":1,"unknown":true`, 1)
+		case "trailing-json":
+			input += "{}"
+		}
+		if err := os.WriteFile(c.String(siblingStorageBackendsArgName), []byte(input), 0600); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := loadSiblingStoragePlan(c)
+		if (err != nil) != (name != "valid") {
+			t.Fatalf("%s: plan=%+v error=%v", name, loaded, err)
+		}
+	}
+}
+
+// TestProtectedSiblingRootPlanIdentity rejects a different regular VHD even if
+// its contents match, while accepting an alias of the selected root input. File
+// identity binds configuration, not dm-verity authenticity or attachment lifetime.
+func TestProtectedSiblingRootPlanIdentity(t *testing.T) {
+	plan := storageTestPlan(t)
+	plan.Disks = plan.Disks[:1]
+	rootPath := plan.Disks[0].HostPath
+	if err := validateProtectedSiblingRootPlan(plan, rootPath); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias.vhd")
+	if err := os.Link(rootPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	plan.Disks[0].HostPath = alias
+	if err := validateProtectedSiblingRootPlan(plan, rootPath); err != nil {
+		t.Fatalf("rejected same root input via file identity: %v", err)
+	}
+	other := storageTestPlan(t).Disks[0].HostPath
+	if err := validateProtectedSiblingRootPlan(plan, other); err == nil {
+		t.Fatal("accepted a different root input with identical contents")
+	}
+	if err := validateProtectedSiblingRootPlan(nil, rootPath); err == nil {
+		t.Fatal("accepted missing protected root plan")
+	}
+}
+
 func TestSiblingStorageCLIRejectsInvalidModesBeforeHostWork(t *testing.T) {
 	oldGCS := useGCS
 	t.Cleanup(func() { useGCS = oldGCS })

@@ -26,6 +26,14 @@ import (
 const (
 	protectedSetupBudget   = 5 * time.Minute
 	protectedCleanupBudget = 2 * time.Minute
+	protectedCombinedBytes = 32 * 1024 * 1024
+)
+
+type protectedSiblingProfile uint8
+
+const (
+	protectedSiblingDirectRoot protectedSiblingProfile = iota
+	protectedSiblingMediatedRoot
 )
 
 // protectedSiblingVM owns one attempt, including options before Create returns.
@@ -199,24 +207,32 @@ var protectedSiblingRetained struct {
 	pairs []*protectedSiblingPair
 }
 
-// validateProtectedSiblingCLI rejects unsupported combinations before backing,
-// CPU groups, HNS endpoints or temporary boot copies are allocated. The route
-// requires two direct-SNP Linux workers and GCS only for subsequent tools.
-// It returns no partially valid configuration; explicit diagnostic, baseline,
-// benchmark, storage export and appliance options never fall through. Geometry
-// must satisfy the matched merged transport's descriptor gate as well as native
-// alignment/schema bounds; acceptance is not a service-allocation guarantee.
-func validateProtectedSiblingCLI(c *cli.Context) error {
+// classifyProtectedSiblingProfile describes the intended profiles for
+// runProtectedSibling without acquiring native resources. Root mediation and
+// relay are a single opt-in profile, selected by values rather than presence;
+// legacy geometry and exact optional partition-mask selection stay unchanged.
+func classifyProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, error) {
+	profile := protectedSiblingDirectRoot
+	if !c.Bool(protectedSharedMemoryArgName) {
+		return profile, errors.New("protected profile requires --protected-shared-memory")
+	}
+	root, relay := c.Bool(siblingStorageRootArgName), c.Bool(siblingGCSRelayArgName)
+	if root != relay {
+		return profile, errors.New("protected root mediation and GCS relay must be selected together")
+	}
+	if root {
+		profile = protectedSiblingMediatedRoot
+	}
 	if !useGCS || c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		!c.Bool(securityHardwareFlag) || !c.Bool(siblingInteractiveArgName) ||
 		!c.Bool(siblingDiodeUplinkArgName) || c.String(siblingBusGuestModuleArgName) == "" ||
 		strings.ToLower(c.String(rootFSTypeArgName)) != "none" {
-		return errors.New("protected shared memory requires --gcs --count 2 --parallel 2, --security-hardware, --root-fs-type none, --sibling-interactive, --sibling-diode-uplink and --sibling-bus-guest-module")
+		return profile, errors.New("protected shared memory requires --gcs --count 2 --parallel 2, --security-hardware, --root-fs-type none, --sibling-interactive, --sibling-diode-uplink and --sibling-bus-guest-module")
 	}
 	for _, name := range []string{
 		sharedMemoryGuestModuleArgName, sharedMemoryTwoUVMArgName, sharedMemoryMappingOnlyArgName, sharedMemoryGuestInventoryArgName,
-		sharedMemoryObserveArgName, sharedMemoryNameArgName, siblingStorageBackendsArgName,
-		siblingStorageRootArgName, validateStorageBackendsArgName, unikraftPackageArgName, siblingGCSRelayArgName,
+		sharedMemoryObserveArgName, sharedMemoryNameArgName,
+		validateStorageBackendsArgName, unikraftPackageArgName,
 		siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName, baselineVsockArgName,
 		networkBenchmarkScriptArgName, networkBenchmarkServerArgName, networkBenchmarkPortArgName,
 		networkBenchmarkTimeoutArgName, networkBenchmarkNoSMTArgName, networkBenchmarkIdleArgName, networkBenchmarkSingleVPArgName,
@@ -228,18 +244,39 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 		shareFilesArgName, noVerityBoot, siblingTestsArgName, benchSecondsArgName,
 	} {
 		if c.IsSet(name) {
-			return fmt.Errorf("--%s is incompatible with --%s", name, protectedSharedMemoryArgName)
+			return profile, fmt.Errorf("--%s is incompatible with --%s", name, protectedSharedMemoryArgName)
 		}
+	}
+	if profile == protectedSiblingDirectRoot && c.IsSet(siblingStorageBackendsArgName) {
+		return profile, errors.New("protected direct-root mode does not support storage exports")
+	}
+	if profile == protectedSiblingMediatedRoot && c.String(siblingStorageBackendsArgName) == "" {
+		return profile, errors.New("protected mediated root requires a storage backend plan")
 	}
 	size := c.Uint64(sharedMemorySizeArgName)
 	if size < protectedTransportMinBytes || size > protectedTransportMaxBytes ||
 		size%protectedPageBytes != 0 || size > protectedMaxBytes {
-		return fmt.Errorf("protected --shared-memory-size must be page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
+		return profile, fmt.Errorf("protected --shared-memory-size must be page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
+	}
+	if profile == protectedSiblingMediatedRoot && size != protectedCombinedBytes {
+		return profile, errors.New("protected mediated root requires 32 MiB (8192 pages)")
+	}
+	return profile, nil
+}
+
+// preflightProtectedSiblingProfile checks file inputs for runProtectedSibling
+// without allocating backing, boot copies or VMs. It validates the intended
+// combined contract even while validateProtectedSiblingCLI keeps startup gated.
+// File checks establish input shape, not image authenticity or native authority.
+func preflightProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, error) {
+	profile, err := classifyProtectedSiblingProfile(c)
+	if err != nil {
+		return profile, err
 	}
 	// Missing artifacts are input errors, not a reason to allocate protected
 	// backing and discover the mismatch after root access has been revoked.
 	module := c.String(siblingBusGuestModuleArgName)
-	for _, path := range []string{
+	paths := []string{
 		module, filepath.Join(filepath.Dir(module), siblingNetModuleName(diodeRole)),
 		filepath.Join(filepath.Dir(module), "diode_tcpbulk"),
 		filepath.Join(filepath.Dir(module), "diode_vsock_test"),
@@ -251,14 +288,53 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 		filepath.Join(filepath.Dir(module), "diode_iptables"),
 		filepath.Join(filepath.Dir(module), "ahv-guest-ctl"),
 		filepath.Join(filepath.Dir(module), pageMetadataCollector),
-	} {
+	}
+	if profile == protectedSiblingMediatedRoot {
+		if _, err := loadSiblingStoragePlan(c); err != nil {
+			return profile, err
+		}
+		paths = append(paths, filepath.Join(filepath.Dir(module), "diode_storvsp.ko"))
+		for i := 0; i < 2; i++ {
+			options, err := createLCOWOptions(context.Background(), c, fmt.Sprintf("uvmboot-%d", i))
+			if err != nil {
+				return profile, err
+			}
+			if options.GuestStateFilePath == "" || !options.SecurityPolicyEnabled ||
+				options.HclEnabled == nil || *options.HclEnabled || options.AllowOvercommit ||
+				options.EnableDeferredCommit || !options.DmVerityMode || options.SiblingRoot != (i == 1) ||
+				options.Appliance != nil || !options.UseGuestConnection ||
+				len(options.SharedMemoryRegions) != 0 || len(options.SiblingCommunicationEndpoints) != 0 {
+				return profile, errors.New("protected combined profile requires direct SNP Linux options with only the workload root mediated")
+			}
+			if err := uvm.VerifyOptions(context.Background(), options); err != nil {
+				return profile, err
+			}
+			paths = append(paths, filepath.Join(options.BootFilesPath, options.GuestStateFilePath),
+				filepath.Join(options.BootFilesPath, options.DmVerityRootFsVhd))
+		}
+	}
+	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
-			return fmt.Errorf("inspect protected guest artifact %q: %w", path, err)
+			return profile, fmt.Errorf("inspect protected guest artifact %q: %w", path, err)
 		}
 		if !info.Mode().IsRegular() {
-			return fmt.Errorf("protected guest artifact %q is not a regular file", path)
+			return profile, fmt.Errorf("protected guest artifact %q is not a regular file", path)
 		}
+	}
+	return profile, nil
+}
+
+// validateProtectedSiblingCLI preflights runProtectedSibling before any resource
+// acquisition. Combined startup stays closed until its dependency owner is wired:
+// it must never enter the legacy serial Start sequence and deadlock on GCS/root.
+func validateProtectedSiblingCLI(c *cli.Context) error {
+	profile, err := preflightProtectedSiblingProfile(c)
+	if err != nil {
+		return err
+	}
+	if profile == protectedSiblingMediatedRoot {
+		return errors.New("protected mediated-root/GCS startup is not enabled")
 	}
 	return validateProtectedControllerABI()
 }

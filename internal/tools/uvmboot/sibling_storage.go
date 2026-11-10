@@ -43,7 +43,16 @@ type siblingStorageDisk struct {
 	Removable bool   `json:"removable,omitempty"`
 }
 
+// loadSiblingStoragePlan decodes export inputs without attaching disks. Protected
+// combined runs use their own root-only contract, never ordinary proof mode;
+// runProtectedSibling remains responsible for runtime ownership and admission.
 func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
+	protected := c.Bool(protectedSharedMemoryArgName)
+	if protected {
+		if _, err := classifyProtectedSiblingProfile(c); err != nil {
+			return nil, err
+		}
+	}
 	if !c.IsSet(siblingStorageBackendsArgName) {
 		if c.Bool(siblingStorageRootArgName) {
 			return nil, fmt.Errorf("--%s requires --%s", siblingStorageRootArgName, siblingStorageBackendsArgName)
@@ -53,7 +62,7 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 		}
 		return nil, nil
 	}
-	if !c.Bool(validateStorageBackendsArgName) && (!useGCS || !c.Bool(sharedMemoryTwoUVMArgName) ||
+	if !protected && !c.Bool(validateStorageBackendsArgName) && (!useGCS || !c.Bool(sharedMemoryTwoUVMArgName) ||
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		c.String(siblingBusGuestModuleArgName) == "") {
 		return nil, fmt.Errorf("--%s requires a two-VM sibling pair with a GCS workload and --%s",
@@ -90,8 +99,50 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 		if err := validateSiblingRootPlan(plan); err != nil {
 			return nil, err
 		}
+		if protected {
+			// Bind the template input now; the runtime owner must later attach
+			// the workload bundle's copy, not this caller-owned template.
+			options, err := createLCOWOptions(context.Background(), c, "uvmboot-1")
+			if err != nil {
+				return nil, err
+			}
+			if !options.SiblingRoot || !options.DmVerityMode || options.Appliance != nil ||
+				options.DmVerityRootFsVhd == "" {
+				return nil, errors.New("protected sibling root requires a verified Linux root input")
+			}
+			if err := validateProtectedSiblingRootPlan(plan,
+				filepath.Join(options.BootFilesPath, options.DmVerityRootFsVhd)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return plan, nil
+}
+
+// validateProtectedSiblingRootPlan narrows loadSiblingStoragePlan to one fixed,
+// read-only workload root and binds it to the selected dm-verity input file.
+// This validates identity only; it acquires no attachment or file ownership.
+func validateProtectedSiblingRootPlan(plan *siblingStoragePlan, rootPath string) error {
+	if plan == nil || len(plan.Disks) != 1 {
+		return errors.New("protected sibling root requires exactly one workload-root export")
+	}
+	disk := plan.Disks[0]
+	if disk.ID != "workload-root" || disk.Role != "root" || disk.Removable ||
+		disk.Access != "read-only" || disk.ExportLUN == nil || *disk.ExportLUN != 0 {
+		return errors.New("protected sibling root requires a fixed read-only workload-root export at LUN 0")
+	}
+	root, err := os.Stat(rootPath)
+	if err != nil {
+		return fmt.Errorf("inspect selected protected root input: %w", err)
+	}
+	export, err := os.Stat(disk.HostPath)
+	if err != nil {
+		return fmt.Errorf("inspect protected root export: %w", err)
+	}
+	if !root.Mode().IsRegular() || !export.Mode().IsRegular() || !os.SameFile(root, export) {
+		return errors.New("protected root export does not match the selected verified root input")
+	}
+	return nil
 }
 
 func validateSiblingRootPlan(plan *siblingStoragePlan) error {
