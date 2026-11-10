@@ -109,6 +109,25 @@ the existing pipe names and VM IDs are shared across runs.
 
 For the protected run, **omit** both ordinary diagnostic flags:
 
+For opt-in page metadata exports, add
+`--page-metadata-output C:\ahv-deploy\page-metadata-results` with an existing
+local host directory. A fresh run gets isolated `diode` and `workload`
+directories, mounted separately as `/run/page-metadata-results` before sealing.
+The matched runtime must include `collect-page-metadata.sh`, staged read-only
+and copied into `/run/dtb-exec` on both roles. From attach run
+`./collect-page-metadata.sh /run/page-metadata-results` manually.
+Results persist after shutdown; no automatic collection or generic share
+permission is enabled. Requested-share failure fails startup.
+
+The matched diagnostic kernel enables page owner with `page_owner=on`.
+The collector preserves raw kpageflags, full available page_owner records/PFNs,
+runtime context, statuses, timestamps and hashes. Optional missing evidence is
+marked partial. Required failures retain partial evidence without COMPLETE.
+These are unsigned guest observations, not confidential/attested results;
+export and collection perturb allocations and use the existing host-management
+path. Compare only within the same VM incarnation and account for PFN reuse.
+Allocation stacks do not prove sharing cause, and early stacks can be incomplete.
+
 ```powershell
 # M02-M04: protected backing, neither partition mask selected.
 & $Launcher @globalFlags lcow @pairFlags --protected-shared-memory
