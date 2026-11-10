@@ -108,17 +108,45 @@ func TestApplianceStorageRejectsAmbiguousBootSlots(t *testing.T) {
 	}
 }
 
+// TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment keeps diode Bootstrap roots
+// direct/read-only and Import workload roots mediated, just like ordinary sibling
+// routing. Document fixtures dispatch no model capability and allocate no VM.
 func TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment(t *testing.T) {
-	for _, siblingRoot := range []bool{false, true} {
-		t.Run(map[bool]string{false: "ordinary", true: "sibling"}[siblingRoot], func(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		siblingRoot bool
+		protected   bool
+	}{
+		{"ordinary", false, false}, {"sibling", true, false},
+		{"protected-diode", false, true}, {"protected-workload", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Compare only document routing after validating the role's option
+			// shape; no native receipt or capability is fabricated by dispatch.
+			siblingRoot := test.siblingRoot
 			opts := NewDefaultOptionsLCOW(t.Name(), "")
+			if test.protected {
+				mode := hcsschema.ProtectedSharedBackingBootstrap
+				if siblingRoot {
+					mode = hcsschema.ProtectedSharedBackingImport
+				}
+				opts = protectedSharedOptionsFixture(t, siblingRoot, mode)
+			}
 			opts.PreferredRootFSType, opts.DmVerityMode = PreferredRootFSTypeNA, true
 			opts.SiblingRoot = siblingRoot
+			if err := VerifyOptions(context.Background(), opts); err != nil {
+				t.Fatal(err)
+			}
 			vm := &UtilityVM{id: t.Name(), scsiControllerCount: 1}
 			doc := &hcsschema.ComputeSystem{VirtualMachine: &hcsschema.VirtualMachine{
 				Devices: &hcsschema.Devices{},
 			}}
 			applyLCOWVMGSStorage(doc, opts, vm, `C:\fixture\rootfs.vhd`)
+			applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+			if test.protected && (doc.VirtualMachine.Devices.SharedMemory == nil ||
+				doc.VirtualMachine.Devices.SharedMemory.Regions[0] != opts.SharedMemoryRegions[0]) {
+				t.Fatal("document lost the protected startup region")
+			}
 			controller := doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]]
 			attachment, attached := controller.Attachments["0"]
 			if attached == siblingRoot || (attached && !attachment.ReadOnly) {

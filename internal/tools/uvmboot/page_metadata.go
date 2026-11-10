@@ -42,6 +42,8 @@ func newPageMetadataOutput(root string) (string, error) {
 	return run, nil
 }
 
+// preparePageMetadataOutput isolates opt-in results for standalone Linux pairs,
+// including relayed GCS. The writable diagnostic share remains direct to the host.
 func preparePageMetadataOutput(c *cli.Context) error {
 	if !c.IsSet(pageMetadataOutputArgName) {
 		return nil
@@ -50,8 +52,9 @@ func preparePageMetadataOutput(c *cli.Context) error {
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		c.String(siblingBusGuestModuleArgName) == "" ||
 		c.String(siblingOpenShellBundleArgName) != "" || c.String(unikraftPackageArgName) != "" ||
-		c.Bool(siblingGCSRelayArgName) || c.Bool(validateStorageBackendsArgName) {
-		return fmt.Errorf("--%s requires an interactive Linux diode/workload pair without --%s", pageMetadataOutputArgName, siblingGCSRelayArgName)
+		c.String(networkBenchmarkScriptArgName) != "" || c.String(storageBenchmarkScriptArgName) != "" ||
+		c.Bool(validateStorageBackendsArgName) {
+		return fmt.Errorf("--%s requires a standalone interactive Linux diode/workload pair", pageMetadataOutputArgName)
 	}
 	run, err := newPageMetadataOutput(c.String(pageMetadataOutputArgName))
 	if err != nil {

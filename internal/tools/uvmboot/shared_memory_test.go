@@ -3,26 +3,30 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 	"github.com/urfave/cli"
 )
 
+// TestProtectedSiblingRejectsUnsupportedUpstreamModes keeps diagnostics and
+// unsupported families out of protected startup before any artifact/native work.
 func TestProtectedSiblingRejectsUnsupportedUpstreamModes(t *testing.T) {
 	previousGCS := useGCS
 	useGCS = true
 	defer func() { useGCS = previousGCS }()
 	for _, test := range []struct{ name, value string }{
-		{siblingGCSRelayArgName, "true"},
-		{siblingGCSRelayArgName, "false"},
 		{baselineVsockArgName, "runtime"},
 		{networkBenchmarkSingleVPArgName, "true"},
 		{storageBenchmarkIdleArgName, "halt"},
-		{siblingStorageRootArgName, "true"},
 	} {
 		t.Run(test.name+"="+test.value, func(t *testing.T) {
 			global := flag.NewFlagSet("global", flag.ContinueOnError)
@@ -51,6 +55,228 @@ func TestProtectedSiblingRejectsUnsupportedUpstreamModes(t *testing.T) {
 				t.Fatalf("unsupported mode reached artifact/resource preparation: %v", err)
 			}
 		})
+	}
+}
+
+// protectedSiblingTestArgs supplies regular input-shape fixtures for protected
+// preflight, including diode-only AHV tooling. No file is a bootable image and
+// no native controller or VM is created.
+func protectedSiblingTestArgs(t *testing.T, combined bool) []string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{
+		"sibling_bus.ko", siblingNetModuleName(diodeRole), "diode_tcpbulk",
+		"diode_vsock_test", iperfGuestName, "demo.sh", "covert_udp", "diode_tcpdump",
+		"diode_tc", "diode_iptables", "ahv-guest-ctl", pageMetadataCollector,
+		"diode_storvsp.ko", vmutils.DefaultGuestStateFile, siblingStorageRootVMGS,
+		vmutils.DefaultDmVerityRootfsVhd,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("shape fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{
+		"--" + protectedSharedMemoryArgName, "--" + securityHardwareFlag,
+		"--" + siblingInteractiveArgName, "--" + siblingDiodeUplinkArgName,
+		"--" + siblingBusGuestModuleArgName, filepath.Join(dir, "sibling_bus.ko"),
+		"--" + bootFilesPathArgName, dir, "--" + rootFSTypeArgName, "none",
+		"--" + sharedMemorySizeArgName, "2097152",
+	}
+	if combined {
+		lun := uint8(0)
+		plan := &siblingStoragePlan{Version: 1, Disks: []siblingStorageDisk{{
+			ID: "workload-root", Role: "root", HostPath: filepath.Join(dir, vmutils.DefaultDmVerityRootfsVhd),
+			Access: "read-only", ExportLUN: &lun,
+		}}}
+		path := filepath.Join(dir, "backends.json")
+		if err := os.WriteFile(path, []byte(storagePlanJSON(t, plan)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args = append(args, "--"+siblingStorageRootArgName, "--"+siblingGCSRelayArgName,
+			"--"+siblingStorageBackendsArgName, path, "--"+sharedMemorySizeArgName,
+			strconv.FormatUint(protectedCombinedBytes, 10))
+	}
+	return args
+}
+
+// TestProtectedSiblingProfilesPreflight admits both complete profiles without
+// native authority. The combined workload selects relay-root VMGS while the
+// diode/legacy roots remain direct; neither enables ordinary proof mappings.
+func TestProtectedSiblingProfilesPreflight(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, combined := range []bool{false, true} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, combined)...)
+		if !combined {
+			// The legacy route must not gain the combined provider/image
+			// dependencies or a new geometry requirement.
+			for _, name := range []string{"diode_storvsp.ko", siblingStorageRootVMGS} {
+				if err := os.Remove(filepath.Join(c.String(bootFilesPathArgName), name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.Uint64(sharedMemorySizeArgName) != 2<<20 {
+				t.Fatal("legacy fixture lost its 2-MiB launcher geometry")
+			}
+		}
+		profile, err := preflightProtectedSiblingProfile(c)
+		want := protectedSiblingDirectRoot
+		if combined {
+			want = protectedSiblingMediatedRoot
+		}
+		if err != nil || profile != want || c.Bool(sharedMemoryTwoUVMArgName) {
+			t.Fatalf("combined=%t: profile=%v err=%v (must not enable proof mode)", combined, profile, err)
+		}
+		if err := validateProtectedSiblingCLI(c); err != nil {
+			t.Fatalf("supported profile did not reach protected owner admission: %v", err)
+		}
+		for i, id := range []string{"uvmboot-0", "uvmboot-1"} {
+			options, err := createLCOWOptions(context.Background(), c, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mediated := combined && i == 1
+			image := vmutils.DefaultGuestStateFile
+			if mediated {
+				image = siblingStorageRootVMGS
+			}
+			if options.SiblingRoot != mediated || options.GuestStateFilePath != image ||
+				options.BundleDirectory != "" || !options.DmVerityMode ||
+				len(options.SharedMemoryRegions) != 0 ||
+				strings.Contains(options.KernelBootOptions, "hcs_shmem_diag.role=") {
+				t.Fatalf("combined=%t role=%s: incorrect root image, premature bundle or ordinary proof state", combined, id)
+			}
+		}
+	}
+}
+
+// TestProtectedSiblingProfileSelections checks paired values, legacy geometry
+// and combined-only size/route requirements so explicit false cannot opt in or
+// silently downgrade a partial protected route.
+func TestProtectedSiblingProfileSelections(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, test := range []struct {
+		name     string
+		combined bool
+		args     []string
+		fail     bool
+	}{
+		{"omitted", false, nil, false},
+		{"false-pair", false, []string{"--" + siblingStorageRootArgName + "=false", "--" + siblingGCSRelayArgName + "=false"}, false},
+		{"root-only", false, []string{"--" + siblingStorageRootArgName}, true},
+		{"relay-only", false, []string{"--" + siblingGCSRelayArgName}, true},
+		{"root-false", true, []string{"--" + siblingStorageRootArgName + "=false"}, true},
+		{"relay-false", true, []string{"--" + siblingGCSRelayArgName + "=false"}, true},
+		{"legacy-min", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(protectedTransportMinBytes)}, false},
+		{"legacy-max", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(protectedTransportMaxBytes)}, false},
+		{"legacy-unaligned", false, []string{"--" + sharedMemorySizeArgName, "2097153"}, true},
+		{"legacy-small", false, []string{"--" + sharedMemorySizeArgName, "4096"}, true},
+		{"legacy-large", false, []string{"--" + sharedMemorySizeArgName, "33558528"}, true},
+		{"legacy-exports", false, []string{"--" + siblingStorageBackendsArgName, "backends.json"}, true},
+		{"combined-small", true, []string{"--" + sharedMemorySizeArgName, "2097152"}, true},
+		{"combined-large", true, []string{"--" + sharedMemorySizeArgName, "33558528"}, true},
+		{"missing-plan", true, []string{"--" + siblingStorageBackendsArgName, ""}, true},
+		{"proof", true, []string{"--" + sharedMemoryTwoUVMArgName}, true},
+		{"proof-false", true, []string{"--" + sharedMemoryTwoUVMArgName + "=false"}, true},
+		{"mapping", true, []string{"--" + sharedMemoryMappingOnlyArgName}, true},
+		{"inventory", true, []string{"--" + sharedMemoryGuestInventoryArgName}, true},
+		{"unikraft", true, []string{"--" + unikraftPackageArgName, "package"}, true},
+		{"openshell", true, []string{"--" + siblingOpenShellBundleArgName, "bundle"}, true},
+		{"benchmark", true, []string{"--" + networkBenchmarkScriptArgName, "benchmark"}, true},
+		{"no-snp", true, []string{"--" + securityHardwareFlag + "=false"}, true},
+		{"no-protected", true, []string{"--" + protectedSharedMemoryArgName + "=false"}, true},
+		{"wrong-root-fs", true, []string{"--" + rootFSTypeArgName, "vhd"}, true},
+		{"no-interactive", true, []string{"--" + siblingInteractiveArgName + "=false"}, true},
+		{"no-uplink", true, []string{"--" + siblingDiodeUplinkArgName + "=false"}, true},
+		{"no-verity", true, []string{"--" + noVerityBoot}, true},
+	} {
+		c := storageTestContext(t, append(protectedSiblingTestArgs(t, test.combined), test.args...)...)
+		_, err := classifyProtectedSiblingProfile(c)
+		if (err != nil) != test.fail {
+			t.Fatalf("%s: error=%v, want failure=%t", test.name, err, test.fail)
+		}
+	}
+}
+
+// TestProtectedSiblingProfileWorkerConstraints rejects missing GCS and incorrect
+// worker counts before any native work; both peers are required for root/relay.
+func TestProtectedSiblingProfileWorkerConstraints(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, name := range []string{countArgName, parallelArgName} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, true)...)
+		if err := c.GlobalSet(name, "1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := classifyProtectedSiblingProfile(c); err == nil {
+			t.Fatalf("accepted one-worker %s", name)
+		}
+	}
+	useGCS = false
+	if _, err := classifyProtectedSiblingProfile(storageTestContext(t, protectedSiblingTestArgs(t, true)...)); err == nil {
+		t.Fatal("accepted protected root/relay without GCS")
+	}
+}
+
+// TestProtectedSiblingProfileArtifacts keeps relay-root/provider and AHV inputs
+// mandatory while treating files only as shape fixtures, not native evidence.
+func TestProtectedSiblingProfileArtifacts(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, name := range []string{"diode_storvsp.ko", siblingStorageRootVMGS, vmutils.DefaultGuestStateFile,
+		vmutils.DefaultDmVerityRootfsVhd, "ahv-guest-ctl"} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, true)...)
+		if err := os.Remove(filepath.Join(c.String(bootFilesPathArgName), name)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := preflightProtectedSiblingProfile(c); err == nil {
+			t.Fatalf("accepted missing required artifact %s", name)
+		}
+	}
+}
+
+// TestProtectedSiblingProfilePreservesPartitionMasks proves profile selection
+// leaves omission, explicit zero and all uint64 bits untouched for later native
+// experiments, rather than interpreting optional mask semantics.
+func TestProtectedSiblingProfilePreservesPartitionMasks(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, combined := range []bool{false, true} {
+		for _, value := range []string{"", "0", "18446744073709551615"} {
+			args := protectedSiblingTestArgs(t, combined)
+			if value != "" {
+				args = append(args, "--"+diodePartitionSealMaskArgName, value,
+					"--"+workloadPartitionSealMaskArgName, value)
+			}
+			c := storageTestContext(t, args...)
+			if _, err := classifyProtectedSiblingProfile(c); err != nil {
+				t.Fatal(err)
+			}
+			var want uint64
+			if value != "" {
+				var err error
+				want, err = strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range []string{diodePartitionSealMaskArgName, workloadPartitionSealMaskArgName} {
+				if c.IsSet(name) != (value != "") || c.Uint64(name) != want {
+					t.Fatalf("profile changed optional %s=%q", name, value)
+				}
+			}
+		}
 	}
 }
 
@@ -85,6 +311,60 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 			if test.wantFail && (!strings.Contains(string(output), "protocol version mismatch expected=4") ||
 				strings.Contains(string(output), "INSTANCE_ACCEPTED")) {
 				t.Fatalf("incompatible transport was not explicitly rejected:\n%s", output)
+			}
+		})
+	}
+}
+
+// TestProtectedSiblingDelayedInstanceDiscovery exercises the production shell
+// guard when the native peer link appears only after its first failed poll.
+// Re-expansion must admit one ready current link while preserving rejection of
+// multiple links, unready instances, protocol mismatch and wrong local CID.
+func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell is required to exercise the generated Linux startup command")
+	}
+	for _, test := range []struct {
+		name, instance, failure string
+		multiple                bool
+	}{
+		{name: "delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1"},
+		{name: "delayed-multiple", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1",
+			failure: "expected one configured link", multiple: true},
+		{name: "delayed-unready", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=0",
+			failure: "common peer instance timed out"},
+		{name: "delayed-old-version", instance: "bus_id=1 local_cid=4 peer_cid=3 version=3 ready=1",
+			failure: "protocol version mismatch expected=4"},
+		{name: "delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
+			failure: "local CID mismatch"},
+	} {
+		// Each fixture publishes sysfs-shaped files only from the polling
+		// sleep callback; no VM, transport or native receipt is simulated.
+		t.Run(test.name, func(t *testing.T) {
+			publish := `mkdir -p "$fixture/link-1"; printf '%s\n' ` +
+				shellSingleQuote(test.instance) + ` >"$fixture/link-1/sibling_instance"; `
+			if test.multiple {
+				publish += `mkdir -p "$fixture/link-2"; cp "$fixture/link-1/sibling_instance" "$fixture/link-2/sibling_instance"; `
+			}
+			// The fixture sleep publishes once, after discovery has already
+			// seen an unmatched glob, and makes timeout cases deterministic.
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; polls=0; ` +
+				`sleep() { polls=$((polls+1)); if [ "$polls" -eq 1 ]; then ` + publish + `fi; }; `
+			command := siblingInstanceDiscoveryCommand() + siblingVsockReadyCommand(diodeRole)
+			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance",
+				`"$fixture"/*-*/sibling_instance`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/hv_sock", `"$fixture"`)
+			command = setup + command + `echo "INSTANCE_ACCEPTED polls=$polls bus=$sb_bus local=$sb_local peer=$sb_peer"`
+			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
+			if test.failure == "" {
+				if err != nil || !strings.Contains(string(output), "INSTANCE_ACCEPTED polls=1 bus=1 local=4 peer=3") {
+					t.Fatalf("delayed link was not re-discovered: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), test.failure) ||
+				strings.Contains(string(output), "INSTANCE_ACCEPTED") {
+				t.Fatalf("delayed invalid link was not rejected with %q: %v\n%s", test.failure, err, output)
 			}
 		})
 	}

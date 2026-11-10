@@ -97,6 +97,8 @@ func TestPageMetadataOutputRejectsInvalidRoots(t *testing.T) {
 	}
 }
 
+// TestPageMetadataCLIOptInAndForwarding allows ordinary direct/relayed Linux
+// diagnostics only on request, preserving isolated output and omission behavior.
 func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 	previousGCS := useGCS
 	useGCS = true
@@ -109,7 +111,7 @@ func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 		{false, false, false},
 		{true, false, false},
 		{false, true, false},
-		{true, true, true},
+		{true, true, false},
 	} {
 		root := t.TempDir()
 		global := flag.NewFlagSet("global", flag.ContinueOnError)
@@ -131,6 +133,13 @@ func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 		if (err != nil) != test.wantFail {
 			t.Fatalf("selected=%t relay=%t: %v", test.selected, test.relay, err)
 		}
+		share := &pageMetadataTestShare{}
+		if _, err := stagePageMetadata(context.Background(), c, share, diodeRole); err != nil {
+			t.Fatal(err)
+		}
+		if !test.selected && share.path != "" {
+			t.Fatal("omitted ordinary output created a writable share")
+		}
 		if test.selected && !test.wantFail {
 			run := c.String(pageMetadataOutputArgName)
 			if run == root || filepath.Dir(run) != root {
@@ -138,6 +147,65 @@ func TestPageMetadataCLIOptInAndForwarding(t *testing.T) {
 			}
 		} else if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
 			t.Fatal("omitted or rejected option created output directories")
+		}
+	}
+}
+
+// TestPageMetadataProtectedRelay admits explicit output at both the diagnostic
+// and protected-profile layers without native authority or simulated seals.
+func TestPageMetadataProtectedRelay(t *testing.T) {
+	previousGCS := useGCS
+	useGCS = true
+	// Restore the serial CLI fixture's process-wide GCS selection.
+	defer func() { useGCS = previousGCS }()
+	for _, selected := range []bool{false, true} {
+		root := t.TempDir()
+		args := protectedSiblingTestArgs(t, true)
+		if selected {
+			args = append(args, "--"+pageMetadataOutputArgName, root)
+		}
+		c := storageTestContext(t, args...)
+		if err := preparePageMetadataOutput(c); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := preflightProtectedSiblingProfile(c); err != nil {
+			t.Fatalf("diagnostic export changed protected admission: %v", err)
+		}
+		share := &pageMetadataTestShare{}
+		if _, err := stagePageMetadata(context.Background(), c, share, workloadRole); err != nil {
+			t.Fatal(err)
+		}
+		if selected {
+			run := c.String(pageMetadataOutputArgName)
+			if filepath.Dir(run) != root || share.path != filepath.Join(run, "workload") {
+				t.Fatal("protected relay lost per-run/per-role export")
+			}
+		} else if share.path != "" {
+			t.Fatal("omitted output created a writable share")
+		}
+	}
+}
+
+// TestPageMetadataUnsupportedProfiles keeps requested output out of appliances,
+// OpenShell and benchmarks even when their other interactive settings match.
+func TestPageMetadataUnsupportedProfiles(t *testing.T) {
+	previousGCS := useGCS
+	useGCS = true
+	// Restore the serial CLI fixture's process-wide GCS selection.
+	defer func() { useGCS = previousGCS }()
+	for _, option := range []string{
+		unikraftPackageArgName, siblingOpenShellBundleArgName,
+		networkBenchmarkScriptArgName, storageBenchmarkScriptArgName,
+	} {
+		root := t.TempDir()
+		c := storageTestContext(t, "--"+siblingInteractiveArgName, "--"+siblingDiodeUplinkArgName,
+			"--"+siblingBusGuestModuleArgName, "sibling_bus.ko",
+			"--"+pageMetadataOutputArgName, root, "--"+option, "fixture")
+		if err := preparePageMetadataOutput(c); err == nil {
+			t.Fatalf("accepted output for %s", option)
+		}
+		if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+			t.Fatal("rejected profile created output directories")
 		}
 	}
 }

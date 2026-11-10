@@ -146,8 +146,9 @@ func ValidateProtectedSharedRegion(r hcsschema.SharedMemoryRegion) error {
 // validateProtectedSharedOptions checks startup-only fields and exact borrowed
 // file-capability matches before creation. Bootstrap expects lease zero; Import
 // requires the observed nonzero lease. Ordinary settings remain resource-free
-// and cannot smuggle private fields. Unsupported appliance/sibling-root protected
-// combinations fail without altering those ordinary boot/storage paths.
+// and cannot smuggle private fields. With protected backing, sibling-root boot
+// permits only one Import region; appliances and Bootstrap sibling roots remain
+// unsupported.
 // It neither closes originals nor proves that the underlying handles are valid.
 func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 	controllers := make(map[string]bool)
@@ -166,8 +167,14 @@ func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 		if err := ValidateProtectedSharedRegion(r); err != nil {
 			return err
 		}
-		if opts.Appliance != nil || opts.SiblingRoot {
-			return fmt.Errorf("protected shared-memory does not support appliance or sibling-root boot")
+		if opts.Appliance != nil {
+			return fmt.Errorf("protected shared-memory does not support appliance boot")
+		}
+		// A mediated workload root uses the diode's single installed backing.
+		// Do not admit Bootstrap or a mixture with ordinary/other regions.
+		if opts.SiblingRoot && (len(opts.SharedMemoryRegions) != 1 ||
+			r.ProtectedSharedBackingMode != hcsschema.ProtectedSharedBackingImport) {
+			return fmt.Errorf("protected sibling-root boot requires a single Import region")
 		}
 		if (r.ProtectedSharedOperation != "" && r.ProtectedSharedOperation != hcsschema.ProtectedSharedNone) ||
 			r.ProtectedSharedLifetimeId != 0 || r.ProtectedSharedPageIndex != 0 || r.ProtectedSharedPageCount != 0 ||
