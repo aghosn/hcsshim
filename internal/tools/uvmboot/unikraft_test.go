@@ -75,6 +75,54 @@ func TestUnikraftManifestAndStorageAssignments(t *testing.T) {
 	}
 }
 
+func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.T) {
+	directory := t.TempDir()
+	for _, name := range []string{"guest.vmgs", "sibling_bus.ko", "diode_storage_test", "fio.sh"} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := "console=ttyS0 libukbus_vmbus.idle=poll libukbus_vmbus.storage_controller=" +
+		guestrequest.ScsiControllerGuids[0] + " libukbus_vmbus.storage_luns=0:1:rw --"
+	writeManifest := func(command string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(directory, "launch-manifest.json"),
+			[]byte(unikraftTestManifest(command)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeManifest(command)
+	oldGCS := useGCS
+	useGCS = true
+	t.Cleanup(func() { useGCS = oldGCS })
+	c := benchmarkTestContext(t, "--security-hardware", "--shared-memory-two-uvm-proof",
+		"--shared-memory-size", "33554432", "--sibling-bus-guest-module", filepath.Join(directory, "sibling_bus.ko"),
+		"--unikraft-diode-package", directory, "--storage-benchmark-script", filepath.Join(directory, "fio.sh"),
+		"--storage-benchmark-idle", "poll")
+	for flag, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+		if err := c.Parent().Set(flag, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lun := uint8(1)
+	plan := &siblingStoragePlan{Version: 1, Disks: []siblingStorageDisk{
+		{ID: "fio-data", Role: "data", Access: "read-write", HostPath: filepath.Join(directory, "data.vhdx"), ExportLUN: &lun},
+	}}
+	cfg, err := loadUnikraftConfig(c, plan)
+	if err != nil || cfg.Network != nil || cfg.Idle != "poll" {
+		t.Fatalf("storage-only benchmark rejected: cfg=%+v err=%v", cfg, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(command, "idle=poll", "idle=halt", 1),
+		strings.Replace(command, "0:1:rw", "0:0:ro", 1),
+	} {
+		writeManifest(invalid)
+		if _, err := loadUnikraftConfig(c, plan); err == nil {
+			t.Fatalf("accepted incompatible storage firmware: %s", invalid)
+		}
+	}
+}
+
 func TestUnikraftIdleManifest(t *testing.T) {
 	for _, mode := range []string{"halt", "poll"} {
 		cfg, err := parseUnikraftManifest(strings.NewReader(unikraftTestManifest(

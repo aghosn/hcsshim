@@ -293,6 +293,10 @@ var lcowCommand = cli.Command{
 			Usage: "Run this network-only benchmark shell script against an external LAN iperf2 server.",
 		},
 		cli.StringFlag{
+			Name: baselineVsockArgName,
+			Usage: "Runtime directory for the two-SNP-UVM host-relayed vSock/TUN benchmark (no sibling shared memory)",
+		},
+		cli.StringFlag{
 			Name:  networkBenchmarkServerArgName,
 			Usage: "External LAN server IPv4 address (not this host or a test-network endpoint).",
 		},
@@ -330,6 +334,7 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
+		cli.StringFlag{Name: storageBenchmarkIdleArgName, Value: "halt", Usage: "Storage workload idle policy: poll or halt."},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
 		execCommand, err := loadExecCommand(c)
@@ -635,6 +640,11 @@ var lcowCommand = cli.Command{
 			mappingAddress = make(map[string]uint32)
 		)
 		var gcsRelay *siblingGCSRelay
+		if c.String(baselineVsockArgName) != "" {
+			benchmarkCtx = context.WithValue(benchmarkCtx, baselineVsockKey{}, &baselineVsockSession{
+				workload: make(chan string, 1), ready: make(chan struct{}),
+			})
+		}
 		if c.Bool(siblingGCSRelayArgName) {
 			gcsRelay = &siblingGCSRelay{diode: make(chan *uvm.UtilityVM, 1)}
 		}
@@ -669,6 +679,9 @@ var lcowCommand = cli.Command{
 			options.CPUGroupID, err = cpuGroups.groupForVM(id)
 			if err != nil {
 				return err
+			}
+			if c.String(baselineVsockArgName) != "" {
+				options.ExtraVSockPorts = append(options.ExtraVSockPorts, 1024)
 			}
 			if options.CPUGroupID != "" {
 				fmt.Printf("cpu group: %s id=%s\n", id, options.CPUGroupID)
@@ -1178,8 +1191,8 @@ func runLCOW(
 		}
 	}
 	if c.String(storageBenchmarkScriptArgName) != "" {
-		if vm.ProcessorCount() != 2 {
-			return fmt.Errorf("storage benchmark requested two VPs, HCS assigned %d", vm.ProcessorCount())
+		if vm.ProcessorCount() != int32(c.GlobalUint64(cpusArgName)) {
+			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", c.GlobalUint64(cpusArgName), vm.ProcessorCount())
 		}
 	}
 
@@ -1492,7 +1505,14 @@ func runLCOW(
 		}
 	}
 
-	if c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) {
+	if c.String(baselineVsockArgName) != "" {
+		command, cleanup, err := prepareBaselineVsock(ctx, c, vm)
+		if err != nil {
+			return err
+		}
+		defer func() { resultErr = errors.Join(resultErr, cleanup()) }()
+		execCommand = command
+	} else if c.IsSet(baselineNICArgName) || c.IsSet(baselinePairArgName) {
 		cmd, cleanup, err := baselineCommand(ctx, c, vm)
 		if err != nil {
 			return err

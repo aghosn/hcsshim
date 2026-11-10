@@ -77,6 +77,9 @@ func validateNetworkBenchmarkServer(server string, addresses []net.Addr) (bool, 
 }
 
 func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
+	if err := validateBaselineVsock(c, groups); err != nil {
+		return err
+	}
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
 			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
@@ -118,10 +121,11 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if unikraft && !c.Bool(networkBenchmarkSingleVPArgName) {
 		return errors.New("Unikraft network benchmarks require --network-benchmark-single-vp")
 	}
-	if (!baseline && !sibling) || c.IsSet(baselinePairArgName) ||
+	vsock := c.String(baselineVsockArgName) != ""
+	if (!baseline && !sibling && !vsock) || c.IsSet(baselinePairArgName) ||
 		c.String(siblingOpenShellBundleArgName) != "" || siblingInteractive || debug ||
 		c.IsSet(execCommandLineArgName) || c.IsSet(execFileArgName) {
-		return errors.New("network benchmark supports only an untraced standalone baseline or sibling-IP diode pair; no OpenShell, interactive, debug, or custom exec")
+		return errors.New("network benchmark supports only an untraced standalone baseline, sibling-IP diode pair or vsock pair; no OpenShell, interactive, debug, or custom exec")
 	}
 	if info, err := os.Stat(c.String(networkBenchmarkScriptArgName)); err != nil {
 		return fmt.Errorf("inspect network benchmark script: %w", err)
@@ -195,6 +199,12 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 		expected = "$up"
 		deviceCheck = `[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 			`{ echo 'network_benchmark: FAIL baseline is not synthetic hv_netvsc' >&2; exit 1; }; `
+	}
+	if role == "vsock" {
+		expected = "tun0"
+		deviceCheck = `for n in /sys/class/net/*; do [ ! -e "$n/device" ] || ` +
+			`{ echo 'network_benchmark: FAIL vsock workload has an external NIC' >&2; exit 1; }; done; ` +
+			`echo 'network_benchmark: transport=host-hvsock-relay interface=tun0 cid=2 mtu=1500'; `
 	}
 	script := "/run/network-benchmark/" + filepath.Base(c.String(networkBenchmarkScriptArgName))
 	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +

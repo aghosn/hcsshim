@@ -46,13 +46,13 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	}
 	for _, flag := range []string{sharedMemoryGuestModuleArgName, sharedMemoryMappingOnlyArgName,
 		sharedMemoryGuestInventoryArgName, siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName,
-		storageBenchmarkScriptArgName, scsiMountsArgName, vpmemMountsArgName} {
+		scsiMountsArgName, vpmemMountsArgName} {
 		if c.IsSet(flag) {
 			return nil, fmt.Errorf("unikraft diode does not support --%s", flag)
 		}
 	}
 	if !c.Bool(siblingInteractiveArgName) && !c.IsSet(execCommandLineArgName) && !c.IsSet(execFileArgName) &&
-		c.String(networkBenchmarkScriptArgName) == "" {
+		c.String(networkBenchmarkScriptArgName) == "" && c.String(storageBenchmarkScriptArgName) == "" {
 		return nil, errors.New("unikraft pair requires --sibling-interactive or an explicit workload --exec/--exec-file test")
 	}
 	file, err := os.Open(filepath.Join(directory, "launch-manifest.json"))
@@ -88,6 +88,10 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	}
 	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Idle != c.String(networkBenchmarkIdleArgName) {
 		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark idle=%s", cfg.Idle, c.String(networkBenchmarkIdleArgName))
+	}
+	if c.String(storageBenchmarkScriptArgName) != "" &&
+		(cfg.Network != nil || cfg.Idle != c.String(storageBenchmarkIdleArgName)) {
+		return nil, errors.New("Unikraft storage firmware must be network-free and match the requested idle policy")
 	}
 	if _, _, err := cfg.storageDevices(plan); err != nil {
 		return nil, err
