@@ -50,6 +50,11 @@ func baselineCommand(ctx context.Context, c *cli.Context, vm *uvm.UtilityVM) (st
 	if err := vm.Share(ctx, filepath.Join(filepath.Dir(tool), iperfGuestName), iperfGuestShare, true); err != nil {
 		return "", nil, fmt.Errorf("share %s: %w", iperfGuestName, err)
 	}
+	if c.String(networkBenchmarkScriptArgName) != "" {
+		if err := vm.Share(ctx, filepath.Join(filepath.Dir(tool), "diode-controller"), "/run/diode-controller", true); err != nil {
+			return "", nil, fmt.Errorf("share benchmark diagnostics: %w", err)
+		}
+	}
 	nic, cleanup, err := attachDiodeUplink(ctx, vm)
 	if err != nil {
 		return "", nil, err

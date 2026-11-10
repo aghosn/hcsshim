@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,7 @@ type siblingStorageDisk struct {
 	HostPath  string `json:"host_path"`
 	Access    string `json:"access"`
 	ExportLUN *uint8 `json:"export_lun"`
+	Removable bool   `json:"removable,omitempty"`
 }
 
 func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
@@ -76,8 +79,11 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 		return nil, fmt.Errorf("load sibling storage backend plan %q: %w", path, err)
 	}
 	if c.Bool(siblingStorageRootArgName) {
+		unikraftBenchmark := c.String(unikraftPackageArgName) != "" &&
+			c.String(networkBenchmarkScriptArgName) != "" && c.Bool(networkBenchmarkSingleVPArgName)
 		if !c.Bool(securityHardwareFlag) || c.IsSet(noVerityBoot) ||
-			!c.Bool(siblingInteractiveArgName) || c.String(networkBenchmarkScriptArgName) != "" ||
+			(!c.Bool(siblingInteractiveArgName) && !unikraftBenchmark) ||
+			(c.String(networkBenchmarkScriptArgName) != "" && !unikraftBenchmark) ||
 			c.String(siblingOpenShellBundleArgName) != "" {
 			return nil, errors.New("sibling root requires an interactive SNP dm-verity pair without benchmarks or OpenShell")
 		}
@@ -148,6 +154,9 @@ func decodeSiblingStoragePlan(reader io.Reader) (*siblingStoragePlan, error) {
 		}
 		if *disk.ExportLUN == 255 {
 			return nil, fmt.Errorf("disk %q: export_lun must be between 0 and 254", disk.ID)
+		}
+		if disk.Removable && (disk.Role != "data" || *disk.ExportLUN == 0) {
+			return nil, fmt.Errorf("disk %q: removable exports require a data disk at LUN 1..254", disk.ID)
 		}
 		if luns[*disk.ExportLUN] {
 			return nil, fmt.Errorf("duplicate storage export LUN %d", *disk.ExportLUN)
@@ -303,12 +312,38 @@ func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePla
 		}
 		command += `storage_backends=; `
 		var luns, readOnly []string
+		var dynamic string
+		removable := make(map[uint8]bool)
+		for _, disk := range plan.Disks {
+			removable[*disk.ExportLUN] = disk.Removable
+		}
 		for _, report := range reports {
 			// Resolve the RP controller identity, never an assumed sdX name.
+			if removable[report.ExportLUN] {
+				var token uint64
+				for token == 0 {
+					var bytes [8]byte
+					if _, err := rand.Read(bytes[:]); err != nil {
+						return "", fmt.Errorf("generate removable export token: %w", err)
+					}
+					token = binary.LittleEndian.Uint64(bytes[:])
+				}
+				ro := 0
+				if report.ReadOnly {
+					ro = 1
+				}
+				dynamic += storageRPDeviceCommand(report.ControllerID, report.LUN)
+				dynamic += fmt.Sprintf(`printf '%%s\n' "%d %d %d $storage_dev" > /sys/module/diode_storvsp/parameters/export_add || exit 1; `,
+					report.ExportLUN, ro, token)
+				continue
+			}
 			command += storageRPDeviceCommand(report.ControllerID, report.LUN)
 			command += `storage_backends=${storage_backends:+$storage_backends,}$storage_dev; `
 			luns = append(luns, fmt.Sprint(report.ExportLUN))
 			readOnly = append(readOnly, fmt.Sprint(report.ReadOnly))
+		}
+		if len(luns) == 0 {
+			return "", errors.New("removable startup disks require a fixed export, normally root LUN 0")
 		}
 		moduleArgs := ""
 		if directIO {
@@ -316,7 +351,7 @@ func siblingStorageGuestCommand(modulePath, role string, plan *siblingStoragePla
 		}
 		command += "insmod " + shellSingleQuote(modulePath) + moduleArgs +
 			` "backends=$storage_backends" ` + shellSingleQuote("luns="+strings.Join(luns, ",")) +
-			" " + shellSingleQuote("read_only="+strings.Join(readOnly, ",")) + ` || exit 1; ` +
+			" " + shellSingleQuote("read_only="+strings.Join(readOnly, ",")) + ` || exit 1; ` + dynamic +
 			`echo 'diode_storage: provider registered'; ` +
 			`echo '` + linuxDiodeStorageReady + `'; `
 	} else {

@@ -3,173 +3,32 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/Microsoft/go-winio/pkg/guid"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/urfave/cli"
 )
 
 const unikraftPackageArgName = "unikraft-diode-package"
 
-type unikraftNetwork struct {
-	uplink, gateway, provider, peer netip.Addr
-	providerMAC, peerMAC            net.HardwareAddr
-}
-
-type unikraftLUN struct {
-	root, exported uint8
-	readOnly       bool
-}
-
 type unikraftConfig struct {
-	memoryMB   uint64
-	controller string
-	luns       []unikraftLUN
-	network    *unikraftNetwork
+	*sibling.UnikraftConfig
 }
 
-// Read the actual IGVM input, not a second set of runtime kernel arguments.
 func parseUnikraftManifest(reader io.Reader) (*unikraftConfig, error) {
-	var manifest struct {
-		Arch   string `json:"guest_arch"`
-		Guests []struct {
-			Image struct {
-				Direct *struct {
-					Processors uint64 `json:"processor_count"`
-					Pages      uint64 `json:"memory_page_count"`
-					Linux      struct {
-						CommandLine string `json:"command_line"`
-					} `json:"linux"`
-				} `json:"snp_linux_direct"`
-			} `json:"image"`
-		} `json:"guest_configs"`
+	config, err := sibling.ParseUnikraftManifest(reader)
+	if err != nil {
+		return nil, err
 	}
-	limited := &io.LimitedReader{R: reader, N: 65537}
-	decoder := json.NewDecoder(limited)
-	if err := decoder.Decode(&manifest); err != nil {
-		return nil, fmt.Errorf("decode Unikraft launch manifest: %w", err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF || limited.N == 0 {
-		return nil, errors.New("unikraft manifest must contain one JSON document of at most 64 KiB")
-	}
-	if manifest.Arch != "x64" || len(manifest.Guests) != 1 || manifest.Guests[0].Image.Direct == nil {
-		return nil, errors.New("unikraft requires one x64 snp_linux_direct image")
-	}
-	image := manifest.Guests[0].Image.Direct
-	if image.Processors != 1 || image.Pages < 16384 || image.Pages > 1048576 || image.Pages%256 != 0 {
-		return nil, errors.New("unikraft requires one VP and 64..4096 MiB of whole-MiB guest RAM")
-	}
-	cfg := &unikraftConfig{memoryMB: image.Pages / 256}
-	params := map[string]string{}
-	application := false
-	for _, field := range strings.Fields(image.Linux.CommandLine) {
-		if field == "--" {
-			application = true
-		}
-		if !strings.HasPrefix(field, "libukbus_vmbus.") {
-			continue
-		}
-		key, value, ok := strings.Cut(strings.TrimPrefix(field, "libukbus_vmbus."), "=")
-		if application || !ok || value == "" || params[key] != "" {
-			return nil, fmt.Errorf("invalid, duplicate or post-separator Unikraft parameter %q", field)
-		}
-		params[key] = value
-	}
-	take := func(key string) string {
-		value := params[key]
-		delete(params, key)
-		return value
-	}
-	controller, luns := take("storage_controller"), take("storage_luns")
-	if controller != "" || luns != "" {
-		id, err := guid.FromString(controller)
-		if err != nil || luns == "" {
-			return nil, errors.New("unikraft storage requires a controller GUID and explicit LUN mappings")
-		}
-		cfg.controller = id.String()
-		known := false
-		for _, candidate := range guestrequest.ScsiControllerGuids {
-			known = known || strings.EqualFold(candidate, cfg.controller)
-		}
-		if !known {
-			return nil, errors.New("unikraft storage controller must use an existing HCS SCSI controller GUID")
-		}
-		roots, exports := map[uint8]bool{}, map[uint8]bool{}
-		for _, mapping := range strings.Split(luns, ",") {
-			fields := strings.Split(mapping, ":")
-			if len(fields) != 3 {
-				return nil, fmt.Errorf("invalid Unikraft LUN mapping %q", mapping)
-			}
-			root, e1 := strconv.ParseUint(fields[0], 10, 8)
-			exported, e2 := strconv.ParseUint(fields[1], 10, 8)
-			if e1 != nil || e2 != nil || root >= 64 || exported == 255 ||
-				(fields[2] != "ro" && fields[2] != "rw") || roots[uint8(root)] || exports[uint8(exported)] {
-				return nil, fmt.Errorf("invalid or duplicate Unikraft LUN mapping %q", mapping)
-			}
-			roots[uint8(root)], exports[uint8(exported)] = true, true
-			cfg.luns = append(cfg.luns, unikraftLUN{uint8(root), uint8(exported), fields[2] == "ro"})
-		}
-		if len(cfg.luns) > 16 {
-			return nil, errors.New("unikraft supports at most 16 exported LUNs")
-		}
-	}
-	keys := []string{"uplink_device", "uplink_address", "uplink_gateway", "provider_address", "peer_address", "provider_mac", "peer_mac"}
-	values := make([]string, len(keys))
-	network := false
-	for i, key := range keys {
-		values[i] = take(key)
-		network = network || values[i] != ""
-	}
-	if network {
-		if values[0] != "0" {
-			return nil, errors.New("unikraft's single pre-boot uplink must be device 0")
-		}
-		addresses := make([]netip.Addr, 4)
-		for i := range addresses {
-			address, err := netip.ParseAddr(values[i+1])
-			if err != nil || !address.Is4() || address.IsUnspecified() || address.IsMulticast() || address.IsLoopback() {
-				return nil, fmt.Errorf("invalid Unikraft %s", keys[i+1])
-			}
-			addresses[i] = address
-		}
-		subnet := netip.MustParsePrefix(diodeUplinkSubnet)
-		last := addresses[0].As4()[3]
-		peerSubnet := netip.PrefixFrom(addresses[2], 30).Masked()
-		if !subnet.Contains(addresses[0]) || last == 0 || last == 1 || last == 255 ||
-			addresses[1].String() != diodeUplinkGateway ||
-			!peerSubnet.Contains(addresses[3]) || subnet.Contains(addresses[2]) ||
-			addresses[2].As4()[3]%4 != 1 || addresses[3].As4()[3]%4 != 2 {
-			return nil, errors.New("unikraft requires an uplink on diode-uplink and provider/peer host addresses 1/2 on a distinct /30")
-		}
-		macs := make([]net.HardwareAddr, 2)
-		for i := range macs {
-			mac, err := net.ParseMAC(values[i+5])
-			if err != nil || len(mac) != 6 || mac[0]&1 != 0 || mac.String() == "00:00:00:00:00:00" {
-				return nil, fmt.Errorf("invalid Unikraft %s", keys[i+5])
-			}
-			macs[i] = mac
-		}
-		if macs[0].String() == macs[1].String() {
-			return nil, errors.New("unikraft provider and peer MACs must differ")
-		}
-		cfg.network = &unikraftNetwork{addresses[0], addresses[1], addresses[2], addresses[3], macs[0], macs[1]}
-	}
-	if len(params) != 0 || (cfg.network == nil && len(cfg.luns) == 0) {
-		return nil, errors.New("unikraft manifest has unknown parameters or enables no diode services")
-	}
-	return cfg, nil
+	return &unikraftConfig{config}, nil
 }
 
 func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConfig, error) {
@@ -187,12 +46,13 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	}
 	for _, flag := range []string{sharedMemoryGuestModuleArgName, sharedMemoryMappingOnlyArgName,
 		sharedMemoryGuestInventoryArgName, siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName,
-		networkBenchmarkScriptArgName, storageBenchmarkScriptArgName, scsiMountsArgName, vpmemMountsArgName} {
+		scsiMountsArgName, vpmemMountsArgName} {
 		if c.IsSet(flag) {
 			return nil, fmt.Errorf("unikraft diode does not support --%s", flag)
 		}
 	}
-	if !c.Bool(siblingInteractiveArgName) && !c.IsSet(execCommandLineArgName) && !c.IsSet(execFileArgName) {
+	if !c.Bool(siblingInteractiveArgName) && !c.IsSet(execCommandLineArgName) && !c.IsSet(execFileArgName) &&
+		c.String(networkBenchmarkScriptArgName) == "" && c.String(storageBenchmarkScriptArgName) == "" {
 		return nil, errors.New("unikraft pair requires --sibling-interactive or an explicit workload --exec/--exec-file test")
 	}
 	file, err := os.Open(filepath.Join(directory, "launch-manifest.json"))
@@ -203,6 +63,9 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	cfg, err := parseUnikraftManifest(file)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.GCSRelay != c.Bool(siblingGCSRelayArgName) {
+		return nil, errors.New("Unikraft firmware gcs_relay selection must match --sibling-gcs-relay; no direct-GCS fallback")
 	}
 	inputs := []string{filepath.Join(directory, "guest.vmgs"), c.String(siblingBusGuestModuleArgName)}
 	if plan != nil {
@@ -217,8 +80,18 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 			return nil, fmt.Errorf("missing regular, nonempty input %s", path)
 		}
 	}
-	if c.Bool(siblingDiodeUplinkArgName) != (cfg.network != nil) {
+	if c.Bool(siblingDiodeUplinkArgName) != (cfg.Network != nil) {
 		return nil, errors.New("--sibling-diode-uplink must match networking in the Unikraft manifest")
+	}
+	if c.String(networkBenchmarkScriptArgName) != "" && (cfg.Network == nil || !c.Bool(networkBenchmarkSingleVPArgName)) {
+		return nil, errors.New("Unikraft network benchmark requires networking and --network-benchmark-single-vp")
+	}
+	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Idle != c.String(networkBenchmarkIdleArgName) {
+		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark idle=%s", cfg.Idle, c.String(networkBenchmarkIdleArgName))
+	}
+	if c.String(storageBenchmarkScriptArgName) != "" &&
+		(cfg.Network != nil || cfg.Idle != c.String(storageBenchmarkIdleArgName)) {
+		return nil, errors.New("Unikraft storage firmware must be network-free and match the requested idle policy")
 	}
 	if _, _, err := cfg.storageDevices(plan); err != nil {
 		return nil, err
@@ -231,7 +104,7 @@ func (cfg *unikraftConfig) storageDevices(plan *siblingStoragePlan) (map[string]
 	if plan != nil {
 		count = len(plan.Disks)
 	}
-	if count != len(cfg.luns) {
+	if count != len(cfg.LUNs) {
 		return nil, nil, errors.New("unikraft manifest LUNs must exactly match the storage backend plan")
 	}
 	if count == 0 {
@@ -241,26 +114,26 @@ func (cfg *unikraftConfig) storageDevices(plan *siblingStoragePlan) (map[string]
 	var reports []siblingStorageBackendReport
 	for _, disk := range plan.Disks {
 		found := false
-		for _, lun := range cfg.luns {
-			if disk.ExportLUN == nil || *disk.ExportLUN != lun.exported {
+		for _, lun := range cfg.LUNs {
+			if disk.ExportLUN == nil || *disk.ExportLUN != lun.Exported {
 				continue
 			}
-			if lun.readOnly != (disk.Access == "read-only") {
+			if lun.ReadOnly != (disk.Access == "read-only") {
 				return nil, nil, fmt.Errorf("unikraft access mismatch for %s", disk.ID)
 			}
-			attachments[strconv.Itoa(int(lun.root))] = hcsschema.Attachment{
-				Type_: "VirtualDisk", Path: disk.HostPath, ReadOnly: lun.readOnly,
+			attachments[strconv.Itoa(int(lun.Root))] = hcsschema.Attachment{
+				Type_: "VirtualDisk", Path: disk.HostPath, ReadOnly: lun.ReadOnly,
 			}
 			controller := uint(0)
 			for i, id := range guestrequest.ScsiControllerGuids {
-				if strings.EqualFold(id, cfg.controller) {
+				if strings.EqualFold(id, cfg.Controller) {
 					controller = uint(i)
 				}
 			}
 			reports = append(reports, siblingStorageBackendReport{
-				DiskID: disk.ID, Role: disk.Role, HostPath: disk.HostPath, ReadOnly: lun.readOnly,
-				DiodeVM: "uvmboot-0", WorkloadVM: "uvmboot-1", ControllerID: cfg.controller,
-				Controller: controller, LUN: uint(lun.root), ExportLUN: lun.exported, State: "configured-at-boot",
+				DiskID: disk.ID, Role: disk.Role, HostPath: disk.HostPath, ReadOnly: lun.ReadOnly,
+				DiodeVM: "uvmboot-0", WorkloadVM: "uvmboot-1", ControllerID: cfg.Controller,
+				Controller: controller, LUN: uint(lun.Root), ExportLUN: lun.Exported, State: "configured-at-boot",
 			})
 			found = true
 			break
@@ -269,5 +142,5 @@ func (cfg *unikraftConfig) storageDevices(plan *siblingStoragePlan) (map[string]
 			return nil, nil, fmt.Errorf("unikraft manifest has no export for %s", disk.ID)
 		}
 	}
-	return map[string]hcsschema.Scsi{cfg.controller: {Attachments: attachments}}, reports, nil
+	return map[string]hcsschema.Scsi{cfg.Controller: {Attachments: attachments}}, reports, nil
 }

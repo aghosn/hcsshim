@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 
 	"github.com/Microsoft/hcsshim/hcn"
+	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	hcs "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
@@ -34,19 +35,24 @@ type namespaceInfo struct {
 
 // UtilityVM is the object used by clients representing a utility VM
 type UtilityVM struct {
-	id               string               // Identifier for the utility VM (user supplied or generated)
-	runtimeID        guid.GUID            // Hyper-V VM ID
-	owner            string               // Owner for the utility VM (user supplied or generated)
-	operatingSystem  string               // "windows" or "linux"
-	hcsSystem        *hcs.System          // The handle to the compute system
-	gcListener       net.Listener         // The GCS connection listener
-	gc               *gcs.GuestConnection // The GCS connection
-	processorCount   int32
-	physicallyBacked bool       // If the uvm is backed by physical memory and not virtual memory
-	m                sync.Mutex // Lock for adding/removing devices
+	id                       string               // Identifier for the utility VM (user supplied or generated)
+	runtimeID                guid.GUID            // Hyper-V VM ID
+	owner                    string               // Owner for the utility VM (user supplied or generated)
+	operatingSystem          string               // "windows" or "linux"
+	hcsSystem                *hcs.System          // The handle to the compute system
+	gcListener               net.Listener         // The GCS connection listener
+	gc                       *gcs.GuestConnection // The GCS connection
+	gcIoListen               gcs.IoListenFunc
+	gcIoPortStart            uint32
+	applianceControlListener net.Listener
+	applianceControl         *diodecontrol.Client
+	processorCount           int32
+	physicallyBacked         bool       // If the uvm is backed by physical memory and not virtual memory
+	m                        sync.Mutex // Lock for adding/removing devices
 
-	exitErr error
-	exitCh  chan struct{}
+	exitErr      error
+	exitCh       chan struct{}
+	startInvoked atomic.Bool
 
 	// devicesPhysicallyBacked indicates if additional devices added to a uvm should be
 	// entirely physically backed

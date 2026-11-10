@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,12 +10,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/Microsoft/go-winio"
-	"github.com/Microsoft/hcsshim/hcn"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/security"
 	"github.com/Microsoft/hcsshim/internal/sibling"
@@ -24,57 +20,9 @@ import (
 	"github.com/urfave/cli"
 )
 
-func prepareUnikraftUplink(name string, cfg *unikraftNetwork) (_ *hcn.HostComputeEndpoint, _ func() error, resultErr error) {
-	network, err := sibling.EnsureUplinkNetwork()
-	if err != nil {
-		return nil, nil, err
-	}
-	endpoint, err := network.CreateEndpoint(&hcn.HostComputeEndpoint{
-		Name: name, SchemaVersion: hcn.V2SchemaVersion(),
-		IpConfigurations: []hcn.IpConfig{{IpAddress: cfg.uplink.String(), PrefixLength: 24}},
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("allocate configured Unikraft uplink %s: %w", cfg.uplink, err)
-	}
-	var namespace *hcn.HostComputeNamespace
-	joined := false
-	cleanup := func() error {
-		var err error
-		if joined {
-			err = errors.Join(err, hcn.RemoveNamespaceEndpoint(namespace.Id, endpoint.Id))
-		}
-		err = errors.Join(err, endpoint.Delete())
-		if namespace != nil {
-			err = errors.Join(err, namespace.Delete())
-		}
-		return err
-	}
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(resultErr, cleanup())
-		}
-	}()
-	namespace, err = hcn.NewNamespace(hcn.NamespaceTypeGuest).Create()
-	if err != nil {
-		return nil, nil, err
-	}
-	if err := hcn.AddNamespaceEndpoint(namespace.Id, endpoint.Id); err != nil {
-		return nil, nil, err
-	}
-	joined = true
-	actual, err := hcn.GetEndpointByID(endpoint.Id)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(actual.IpConfigurations) != 1 || actual.IpConfigurations[0].IpAddress != cfg.uplink.String() ||
-		actual.IpConfigurations[0].PrefixLength != 24 || actual.MacAddress == "" {
-		return nil, nil, errors.New("HNS did not assign the address embedded in the Unikraft image")
-	}
-	return actual, cleanup, nil
-}
-
 func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfig,
-	plan *siblingStoragePlan, group, cpuGroup string, section *sharedMemorySection) (resultErr error) {
+	plan *siblingStoragePlan, group, cpuGroup string, section *sharedMemorySection,
+	gcsRelay *siblingGCSRelay) (resultErr error) {
 	directory, err := filepath.Abs(c.String(unikraftPackageArgName))
 	if err != nil {
 		return err
@@ -94,7 +42,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	options.UseGuestConnection, options.ForwardStdout, options.ForwardStderr = false, false, false
 	options.PreferredRootFSType, options.DmVerityMode = uvm.PreferredRootFSTypeNA, false
 	options.VPMemDeviceCount, options.SCSIControllerCount = 0, 1
-	options.MemorySizeInMB, options.ProcessorCount = cfg.memoryMB+2, 1
+	options.MemorySizeInMB, options.ProcessorCount = cfg.MemoryMB+2, 1
 	options.AllowOvercommit, options.EnableDeferredCommit = false, false
 	hcl := false
 	options.HclEnabled, options.SecurityPolicyEnabled = &hcl, true
@@ -105,15 +53,15 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	if err != nil {
 		return err
 	}
-	options.Appliance = &uvm.LCOWApplianceOptions{SCSI: scsi}
+	options.Appliance = &uvm.LCOWApplianceOptions{SCSI: scsi, NativeStorageControl: cfg.LiveStorage}
 	for _, report := range reports {
 		if err := security.GrantVmGroupAccessWithMask(report.HostPath, security.AccessMaskAll); err != nil {
 			return fmt.Errorf("grant VM access to %s: %w", report.DiskID, err)
 		}
 	}
 	var releaseEndpoint func() error
-	if cfg.network != nil {
-		endpoint, release, err := prepareUnikraftUplink(filepath.Base(bundle), cfg.network)
+	if cfg.Network != nil {
+		endpoint, release, err := sibling.PrepareUnikraftUplink(filepath.Base(bundle), cfg.Network)
 		if err != nil {
 			return err
 		}
@@ -163,7 +111,7 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 		defer connection.Close()
 		stopRead := context.AfterFunc(consoleCtx, func() { _ = connection.Close() })
 		defer stopRead()
-		consoleDone <- captureUnikraftConsole(connection, io.MultiWriter(log, os.Stdout), ready)
+		consoleDone <- captureUnikraftConsole(connection, io.MultiWriter(log, os.Stdout), ready, cfg.Idle)
 	}()
 	defer func() {
 		cancelConsole()
@@ -184,9 +132,27 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 			resultErr = errors.Join(resultErr, fmt.Errorf("close Unikraft UVM; retaining boot state %s and endpoint: %w", bundle, err))
 		}
 	}()
+	if gcsRelay != nil {
+		if err := gcsRelay.configure(ctx, vm); err != nil {
+			return err
+		}
+	}
 	startRequested := time.Now()
 	if err := vm.Start(ctx); err != nil {
 		return err
+	}
+	if c.String(networkBenchmarkScriptArgName) != "" {
+		if vm.ProcessorCount() != 1 {
+			return fmt.Errorf("Unikraft network benchmark expected one VP, HCS assigned %d", vm.ProcessorCount())
+		}
+		sampleCPU, err := networkBenchmarkCPUEnabled(c)
+		if err != nil {
+			return err
+		}
+		if sampleCPU {
+			stopSampling := sampleNetworkBenchmarkCPU(context.Background(), vm)
+			defer func() { resultErr = errors.Join(resultErr, stopSampling()) }()
+		}
 	}
 	for _, report := range reports {
 		data, err := json.Marshal(report)
@@ -211,6 +177,9 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 			return fmt.Errorf("write Unikraft boot timing: %w", err)
 		}
 		fmt.Println("Unikraft diode: direct SNP/provider startup observed; dataplane tests run in the workload")
+		if c.String(networkBenchmarkScriptArgName) != "" {
+			fmt.Printf("network_benchmark: preflight role=diode implementation=unikraft snp=boot-evidence attestation=not-collected vcpus=1 scheduler=cooperative idle=not-linux worker_idle=%s\n", cfg.Idle)
+		}
 	case <-ctx.Done():
 		return fmt.Errorf("unikraft stopped before SNP/provider startup was observed: %w", ctx.Err())
 	case <-timer.C:
@@ -235,50 +204,21 @@ func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfi
 	}
 }
 
-func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time) error {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 4096), 65536)
-	snp, offers, provider, reported := false, false, false, false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if _, err := fmt.Fprintln(output, line); err != nil {
-			return err
-		}
-		snp = snp || strings.Contains(line, "hyperv: isolation type 2 (SNP), paravisor absent")
-		offers = offers || strings.Contains(line, "vmbus: all offers delivered")
-		if _, version, ok := strings.Cut(line, "sibling: provider ready protocol="); ok {
-			fields := strings.Fields(version)
-			if len(fields) == 0 {
-				return errors.New("unikraft provider omitted its transport version")
-			}
-			actual, err := strconv.Atoi(strings.TrimSuffix(fields[0], ";"))
-			if err != nil || actual != siblingTransportVersion {
-				return fmt.Errorf("unikraft provider transport version mismatch: expected=%d actual=%s", siblingTransportVersion, fields[0])
-			}
-			provider = true
-		}
-		if snp && offers && provider && !reported {
-			ready <- time.Now()
-			reported = true
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return io.EOF
+func captureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time, expectedIdle string) error {
+	return sibling.CaptureUnikraftConsole(reader, output, ready, expectedIdle)
 }
 
 func unikraftWorkloadCommand(module string, cfg *unikraftConfig, plan *siblingStoragePlan, command string) (string, error) {
 	setup := "set -eu; " + siblingBusLoadCommand(module) + siblingInstanceDiscoveryCommand()
 	// The shared interactive shell starts here even for a network-only appliance.
 	setup += `mkdir -p /run/dtb-exec; mountpoint -q /run/dtb-exec || mount -t tmpfs -o mode=0755 tmpfs /run/dtb-exec; `
-	if cfg.network != nil {
-		network := cfg.network
+	if cfg.Network != nil {
+		network := cfg.Network
 		setup += siblingStockNICCommand("dvsc0")
-		setup += `[ "$(cat /sys/class/net/dvsc0/address)" = ` + shellSingleQuote(network.peerMAC.String()) +
+		setup += `[ "$(cat /sys/class/net/dvsc0/address)" = ` + shellSingleQuote(network.PeerMAC.String()) +
 			` ] || { echo 'Unikraft peer MAC does not match launch manifest' >&2; exit 1; }; ` +
-			"ip addr replace " + shellSingleQuote(network.peer.String()+"/30") + " dev dvsc0; " +
-			"ip link set dvsc0 up; ip route replace default via " + shellSingleQuote(network.provider.String()) + "; " +
+			"ip addr replace " + shellSingleQuote(network.Peer.String()+"/30") + " dev dvsc0; " +
+			"ip link set dvsc0 up; ip route replace default via " + shellSingleQuote(network.Provider.String()) + "; " +
 			guestWaitFor(`[ "$(cat /sys/class/net/dvsc0/carrier)" = 1 ]`, "Unikraft peer NIC")
 	}
 	if plan != nil {
