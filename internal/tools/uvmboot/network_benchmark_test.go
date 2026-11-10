@@ -228,6 +228,9 @@ func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
 			&diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
 		if !strings.Contains(diode, want) || !strings.Contains(diode, "grep -qx 'receive_diagnostics=1'") ||
 			strings.Count(diode, "net-diagnostics -interface") != 2 ||
+			strings.Count(diode, "-provider-interface dvsp0") != 2 ||
+			!strings.Contains(diode, "stats=/sys/module/diode_netvsp/parameters/stats_enabled") ||
+			strings.Index(diode, `printf 'Y\n' >"$stats"`) < strings.Index(diode, "grep -qx 'receive_diagnostics=1'") ||
 			!strings.Contains(diode, "NETBENCH_DIODE_DIAGNOSTICS_BEGIN") {
 			t.Fatalf("Linux diode lost matched topology or buffered driver snapshots: %s", diode)
 		}

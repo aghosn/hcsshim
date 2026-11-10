@@ -240,10 +240,13 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 		`diag=/run/dtb-exec/receive-diagnostics.log; ` +
 		`if grep -qx 'receive_diagnostics=1' /run/network-benchmark/` + filepath.Base(c.String(networkBenchmarkScriptArgName)) + `; then ` +
 		`[ -x /run/dtb-exec/diode-controller ] || { echo 'network_benchmark: FAIL diagnostic helper missing' >&2; exit 1; }; ` +
-		`/run/dtb-exec/diode-controller net-diagnostics -interface "$up" >"$diag"; fi; ` +
+		`stats=/sys/module/diode_netvsp/parameters/stats_enabled; ` +
+		`[ -w "$stats" ] || { echo 'network_benchmark: FAIL provider receive counters missing' >&2; exit 1; }; ` +
+		`printf 'Y\n' >"$stats"; ` +
+		`/run/dtb-exec/diode-controller net-diagnostics -interface "$up" -provider-interface dvsp0 >"$diag"; fi; ` +
 		`echo 'network_benchmark: diode forwarding ready'; ` +
 		`until dmesg | grep -qF 'dvsp0: channel closed'; do sleep 1; done; ` +
-		`if [ -f "$diag" ]; then /run/dtb-exec/diode-controller net-diagnostics -interface "$up" >>"$diag"; ` +
+		`if [ -f "$diag" ]; then /run/dtb-exec/diode-controller net-diagnostics -interface "$up" -provider-interface dvsp0 >>"$diag"; ` +
 		`echo 'NETBENCH_DIODE_DIAGNOSTICS_BEGIN'; cat "$diag"; echo 'NETBENCH_DIODE_DIAGNOSTICS_END'; fi; ` +
 		`"$ipt" iptables -t nat -L POSTROUTING -v -n -x; `
 }
