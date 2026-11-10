@@ -81,6 +81,9 @@ type protectedSiblingPair struct {
 	forwardMu   sync.Mutex
 	run         string
 	seals       [2]protectedPartitionSeal
+	// mediated is dormant until the combined runProtectedSibling path is
+	// wired. stop cancels forward work only; its dependencies drain separately.
+	mediated *protectedSiblingDependencies
 }
 
 // protectedPartitionSeal is serial-owner evidence, not native partition state.
@@ -126,6 +129,8 @@ func validateProtectedPartitionCLI(c *cli.Context) error {
 // gate. Once it returns, no later attempt can commit. An already committed
 // synchronous native operation remains owned until return and may have effects;
 // this lock is never held across native/GCS work, close, or watcher joins.
+// Mediated relay/storage dependencies deliberately survive this transition so
+// workload borrowers can finish shutdown before their provider is destroyed.
 func (p *protectedSiblingPair) stop(cause error) {
 	p.forwardMu.Lock()
 	p.cancel(cause)
