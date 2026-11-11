@@ -29,6 +29,7 @@ const (
 	storageBenchmarkSyncIOArgName     = "storage-benchmark-sync-io-mib"
 	storageBenchmarkSizeArgName       = "storage-benchmark-size-mib"
 	storageBenchmarkSmokeArgName      = "storage-benchmark-smoke"
+	storageBenchmarkTestArgName       = "storage-benchmark-test"
 	storageBenchmarkStatsArgName      = "storage-benchmark-stats"
 	storageBenchmarkLatencyArgName    = "storage-benchmark-latency"
 	storageBenchmarkThroughputArgName = "storage-benchmark-throughput"
@@ -109,7 +110,7 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	if c.String(storageBenchmarkScriptArgName) == "" {
 		for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 			storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
-			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName,
+			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkTestArgName, storageBenchmarkStatsArgName,
 			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName} {
 			if c.IsSet(name) {
 				return errors.New("storage benchmark options require --storage-benchmark-script")
@@ -173,6 +174,9 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	if latency && throughput {
 		return errors.New("select only one storage benchmark experiment per launch")
 	}
+	if c.Bool(storageBenchmarkTestArgName) && ((!latency && !throughput) || c.Bool(storageBenchmarkSmokeArgName)) {
+		return errors.New("short storage test requires latency or throughput without smoke")
+	}
 	if idle := c.String(storageBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
 		return errors.New("storage benchmark idle must be poll or halt")
 	}
@@ -184,6 +188,11 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		expected := 64
 		if throughput {
 			expected = 1024
+			if c.Bool(storageBenchmarkTestArgName) {
+				expected = 64
+			}
+		} else if c.Bool(storageBenchmarkTestArgName) {
+			expected = 1
 		}
 		if c.Bool(storageBenchmarkSmokeArgName) {
 			expected = 1
@@ -220,6 +229,10 @@ func storageBenchmarkClient(c *cli.Context, device string, content storageBenchm
 		smoke = 1
 	}
 	mode := ""
+	testEnvironment := ""
+	if c.Bool(storageBenchmarkTestArgName) {
+		testEnvironment = "STORAGE_TEST=1 "
+	}
 	if c.Bool(storageBenchmarkLatencyArgName) {
 		mode = " latency"
 	} else if c.Bool(storageBenchmarkThroughputArgName) {
@@ -228,7 +241,8 @@ func storageBenchmarkClient(c *cli.Context, device string, content storageBenchm
 	return fmt.Sprintf(
 		`cp /run/storage-benchmark-tool/diode_fio /run/dtb-exec/diode_fio; `+
 			`chmod 755 /run/dtb-exec/diode_fio; `+
-			`/bin/sh %s %s /run/storage-benchmark-results %d %d %d %d %s %s %s %s%s; `,
+			`%s/bin/sh %s %s /run/storage-benchmark-results %d %d %d %d %s %s %s %s%s; `,
+		testEnvironment,
 		shellSingleQuote("/run/storage-benchmark-script/"+filepath.Base(c.String(storageBenchmarkScriptArgName))), device,
 		c.Int(storageBenchmarkIOArgName), c.Int(storageBenchmarkSyncIOArgName),
 		c.Int(storageBenchmarkSizeArgName), smoke,

@@ -111,6 +111,7 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 		{"--storage-benchmark-io-mib", "0"}, {"--storage-benchmark-size-mib", "1"},
 		{"--storage-benchmark-io-mib", "10241"}, {"--storage-benchmark-sync-io-mib", "3"},
 		{"--storage-benchmark-timeout", "0s"},
+		{"--storage-benchmark-test"},
 	} {
 		candidate := benchmarkTestContext(t, append(append([]string{}, args...), extra...)...)
 		if err := validateStorageBenchmark(candidate, groups, nil); err == nil {
@@ -118,9 +119,9 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 		}
 	}
 	for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
-		storageBenchmarkStatsArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName} {
+		storageBenchmarkStatsArgName, storageBenchmarkTestArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName} {
 		value := "1"
-		if name == storageBenchmarkStatsArgName {
+		if name == storageBenchmarkStatsArgName || name == storageBenchmarkTestArgName {
 			value = "true"
 		}
 		if err := validateStorageBenchmark(benchmarkTestContext(t, "--"+name+"="+value), nil, nil); err == nil {
@@ -257,9 +258,11 @@ func TestStorageBenchmarkExperimentSelection(t *testing.T) {
 		mode  string
 		size  string
 		smoke bool
+		short bool
 	}{
 		{mode: "latency", size: "64"}, {mode: "latency", size: "1", smoke: true},
 		{mode: "throughput", size: "1024"}, {mode: "throughput", size: "1", smoke: true},
+		{mode: "latency", size: "1", short: true}, {mode: "throughput", size: "64", short: true},
 	} {
 		args := []string{"--storage-benchmark-script", script, "--storage-benchmark-disk", disk,
 			"--storage-benchmark-output", t.TempDir(), "--security-hardware",
@@ -267,12 +270,29 @@ func TestStorageBenchmarkExperimentSelection(t *testing.T) {
 		if test.smoke {
 			args = append(args, "--storage-benchmark-smoke")
 		}
+		if test.short {
+			args = append(args, "--storage-benchmark-test")
+		}
 		c := benchmarkTestContext(t, args...)
 		if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err != nil {
 			t.Fatal(err)
 		}
 		if command := storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{}); !strings.HasSuffix(command, " "+test.mode+"; ") {
 			t.Fatalf("experiment selection was not forwarded: %s", command)
+		}
+		if command := storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{}); strings.Contains(command, "STORAGE_TEST=1 /bin/sh") != test.short {
+			t.Fatalf("short-test guest mode was not forwarded: %s", command)
+		}
+		if test.short {
+			if err := c.Set(storageBenchmarkSmokeArgName, "true"); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err == nil {
+				t.Fatal("short test accepted functional smoke")
+			}
+			if err := c.Set(storageBenchmarkSmokeArgName, "false"); err != nil {
+				t.Fatal(err)
+			}
 		}
 		other := storageBenchmarkLatencyArgName
 		if test.mode == "latency" {

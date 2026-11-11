@@ -293,7 +293,7 @@ var lcowCommand = cli.Command{
 			Usage: "Run this network-only benchmark shell script against an external LAN iperf2 server.",
 		},
 		cli.StringFlag{
-			Name: baselineVsockArgName,
+			Name:  baselineVsockArgName,
 			Usage: "Runtime directory for the two-SNP-UVM host-relayed vSock/TUN benchmark (no sibling shared memory)",
 		},
 		cli.StringFlag{
@@ -331,6 +331,7 @@ var lcowCommand = cli.Command{
 		cli.IntFlag{Name: storageBenchmarkSyncIOArgName, Value: 128},
 		cli.IntFlag{Name: storageBenchmarkSizeArgName, Value: 1024},
 		cli.BoolFlag{Name: storageBenchmarkSmokeArgName},
+		cli.BoolFlag{Name: storageBenchmarkTestArgName, Usage: "Run the reduced storage performance-validation campaign."},
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
