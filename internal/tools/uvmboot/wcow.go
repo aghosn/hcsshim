@@ -54,9 +54,14 @@ var wcowCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
+		if err := prepareVMResources(c); err != nil {
+			return err
+		}
 		runMany(c, func(id string) error {
 			options := uvm.NewDefaultOptionsWCOW(id, "")
-			setGlobalOptions(c, options.Options)
+			if err := setGlobalOptions(c, options.Options); err != nil {
+				return err
+			}
 			var layerFolders []string
 			if wcowImage != "" {
 				layer, err := filepath.Abs(wcowImage)

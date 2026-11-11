@@ -144,16 +144,16 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatal(err)
 	}
-	if err := pair.Set(storageBenchmarkSingleVPArgName, "true"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatalf("single-VP Linux storage pair rejected: %v", err)
 	}
-	if benchmarkVMProcessors(pair, "uvmboot-0") != 1 || benchmarkVMProcessors(pair, "uvmboot-1") != 2 {
-		t.Fatal("SingleVP must change only the storage diode")
+	if requestedVMProcessors(pair, "uvmboot-0") != 1 || requestedVMProcessors(pair, "uvmboot-1") != 2 {
+		t.Fatal("storage pair ignored independently requested CPU counts")
 	}
-	if err := pair.Parent().Set(cpusArgName, "3"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,3"); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
@@ -162,17 +162,17 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 	if err := pair.Set(unikraftPackageArgName, dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := pair.Parent().Set(cpusArgName, "2"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatalf("single-VP Unikraft storage pair rejected: %v", err)
 	}
-	if err := pair.Parent().Set(cpusArgName, "1"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
-		t.Fatal("Unikraft storage accepted a one-VP workload")
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
+		t.Fatalf("Unikraft storage rejected independently selected one-VP workload: %v", err)
 	}
 	if err := pair.Set(unikraftPackageArgName, ""); err != nil {
 		t.Fatal(err)

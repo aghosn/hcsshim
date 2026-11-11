@@ -80,7 +80,7 @@ func loadSiblingStoragePlan(c *cli.Context) (*siblingStoragePlan, error) {
 	}
 	if c.Bool(siblingStorageRootArgName) {
 		unikraftBenchmark := c.String(unikraftPackageArgName) != "" &&
-			c.String(networkBenchmarkScriptArgName) != "" && c.Bool(networkBenchmarkSingleVPArgName)
+			c.String(networkBenchmarkScriptArgName) != ""
 		if !c.Bool(securityHardwareFlag) || c.IsSet(noVerityBoot) ||
 			(!c.Bool(siblingInteractiveArgName) && !unikraftBenchmark) ||
 			(c.String(networkBenchmarkScriptArgName) != "" && !unikraftBenchmark) ||

@@ -424,9 +424,9 @@ func TestUnikraftPairPreflight(t *testing.T) {
 	}{
 		{cpus: "2"},
 		{cpus: "2", extra: []string{"--" + sharedMemoryGuestModuleArgName, "marker.ko"}, error: "does not support"},
-		{cpus: "0", error: "Linux workload"},
-		{cpus: "1", error: "Linux workload"},
-		{cpus: "4", error: "Linux workload"},
+		{cpus: "0", error: "processor_count"},
+		{cpus: "1"},
+		{cpus: "4"},
 	} {
 		context := benchmarkTestContext(t, append(append([]string{}, args...), test.extra...)...)
 		if err := context.GlobalSet(cpusArgName, test.cpus); err != nil {
@@ -446,7 +446,7 @@ func TestUnikraftPairPreflight(t *testing.T) {
 	}
 	benchmarkArgs := append(append([]string{}, args[:len(args)-2]...),
 		"--network-benchmark-script", filepath.Join(directory, "bench.sh"),
-		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-single-vp")
+		"--network-benchmark-server", "192.0.2.10")
 	c := benchmarkTestContext(t, benchmarkArgs...)
 	for name, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.GlobalSet(name, value); err != nil {

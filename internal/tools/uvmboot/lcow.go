@@ -314,10 +314,6 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkNoSMTArgName,
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
-		cli.BoolFlag{
-			Name:  networkBenchmarkSingleVPArgName,
-			Usage: "Use one diode VP; the network workload and standalone baseline always use two",
-		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
 			Value: "poll",
@@ -335,10 +331,12 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
-		cli.BoolFlag{Name: storageBenchmarkSingleVPArgName, Usage: "Use one Linux diode VP; the storage workload and standalone baseline always use two."},
 		cli.StringFlag{Name: storageBenchmarkIdleArgName, Value: "halt", Usage: "Storage workload idle policy: poll or halt."},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
+		if err := prepareVMResources(c); err != nil {
+			return err
+		}
 		execCommand, err := loadExecCommand(c)
 		if err != nil {
 			return err
@@ -400,7 +398,7 @@ var lcowCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			if err := validateBenchmarkCPUs(topology, cpuGroupLPs, c.Bool(networkBenchmarkNoSMTArgName), c.GlobalUint64(cpusArgName)); err != nil {
+			if err := validateBenchmarkCPUs(topology, cpuGroupLPs, c.Bool(networkBenchmarkNoSMTArgName), requestedVMProcessors(c, "uvmboot-0")); err != nil {
 				return err
 			}
 			siblingTests = map[string]bool{}
@@ -678,9 +676,6 @@ var lcowCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			if c.String(networkBenchmarkScriptArgName) != "" || c.String(storageBenchmarkScriptArgName) != "" {
-				options.ProcessorCount = int32(benchmarkVMProcessors(c, id))
-			}
 			options.CPUGroupID, err = cpuGroups.groupForVM(id)
 			if err != nil {
 				return err
@@ -917,7 +912,9 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		return nil, fmt.Errorf("unexpect uVM create options type: %T", opt)
 	}
 
-	setGlobalOptions(c, options.Options)
+	if err := setGlobalOptions(c, options.Options); err != nil {
+		return nil, err
+	}
 	options.ConsolePipe = fmt.Sprintf(`\\.\pipe\uvmpipe-%s`, id)
 	if !useGCS && c.Duration(sharedMemoryObserveArgName) > 0 {
 		options.ConsolePipe = ""
@@ -1178,8 +1175,8 @@ func runLCOW(
 	}
 	var stopSampling func() error
 	if c.String(networkBenchmarkScriptArgName) != "" {
-		if uint64(vm.ProcessorCount()) != benchmarkVMProcessors(c, vm.ID()) {
-			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", benchmarkVMProcessors(c, vm.ID()), vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != requestedVMProcessors(c, vm.ID()) {
+			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", requestedVMProcessors(c, vm.ID()), vm.ProcessorCount())
 		}
 		sampleCPU, err := networkBenchmarkCPUEnabled(c)
 		if err != nil {
@@ -1196,8 +1193,8 @@ func runLCOW(
 		}
 	}
 	if c.String(storageBenchmarkScriptArgName) != "" {
-		if uint64(vm.ProcessorCount()) != benchmarkVMProcessors(c, vm.ID()) {
-			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", benchmarkVMProcessors(c, vm.ID()), vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != requestedVMProcessors(c, vm.ID()) {
+			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", requestedVMProcessors(c, vm.ID()), vm.ProcessorCount())
 		}
 	}
 

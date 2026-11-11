@@ -1,0 +1,206 @@
+//go:build windows
+
+package sibling
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/Microsoft/hcsshim/internal/cpugroup"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/uvm"
+)
+
+func testResources() []VMResources {
+	return []VMResources{{ProcessorCount: 1, MemoryMB: 512}, {ProcessorCount: 8, MemoryMB: 4096}}
+}
+
+func TestPairIndependentResourcesKeepBaseAndSecurity(t *testing.T) {
+	config := testConfig()
+	config.VMResources = testResources()
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := decodeConfig(strings.NewReader(string(data)))
+	if err != nil || !reflect.DeepEqual(config, decoded) {
+		t.Fatalf("resources did not round-trip: %+v %v", decoded, err)
+	}
+	base := testOptions()
+	base.ProcessorCount, base.MemorySizeInMB, base.CPUGroupID = 4, 2048, "inherited"
+	workload, diode, err := pairOptions(base, config, "group", &Section{HCSName: "owned", Size: 16 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, options := range []*uvm.OptionsLCOW{diode, workload} {
+		resource := config.VMResources[i]
+		if options.ProcessorCount != resource.ProcessorCount || options.MemorySizeInMB != resource.MemoryMB ||
+			options.SecurityPolicy != base.SecurityPolicy || options.SecurityPolicyEnforcer != base.SecurityPolicyEnforcer ||
+			!options.SecurityPolicyEnabled || !options.DmVerityMode || options.CPUGroupID != base.CPUGroupID {
+			t.Fatalf("role %d resources/security changed: %+v", i, options)
+		}
+	}
+	workload.ProcessorCount, workload.MemorySizeInMB = 16, 8192
+	if base.ProcessorCount != 4 || base.MemorySizeInMB != 2048 ||
+		diode.ProcessorCount != 1 || diode.MemorySizeInMB != 512 ||
+		config.VMResources[1].ProcessorCount != 8 || config.VMResources[1].MemoryMB != 4096 {
+		t.Fatal("resource application mutated caller, sibling or config")
+	}
+}
+
+func TestPairInvalidResourcesFailBeforeAllocation(t *testing.T) {
+	for _, resources := range [][]VMResources{
+		{},
+		{{ProcessorCount: 1, MemoryMB: 512}},
+		{{ProcessorCount: 1, MemoryMB: 512}, {ProcessorCount: 2, MemoryMB: 1024}, {ProcessorCount: 3, MemoryMB: 2048}},
+		{{ProcessorCount: 0, MemoryMB: 512}, {ProcessorCount: 2, MemoryMB: 1024}},
+		{{ProcessorCount: 1, MemoryMB: 512}, {ProcessorCount: 257, MemoryMB: 1024}},
+		{{ProcessorCount: 1, MemoryMB: 0}, {ProcessorCount: 2, MemoryMB: 1024}},
+		{{ProcessorCount: 1, MemoryMB: 512}, {ProcessorCount: 2, MemoryMB: MaxMemoryMB + 1}},
+		{{ProcessorCount: 1, MemoryMB: 512, CPUGroupLPs: []uint32{}}, {ProcessorCount: 2, MemoryMB: 1024}},
+		{{ProcessorCount: 1, MemoryMB: 512, CPUGroupLPs: []uint32{8, 8}}, {ProcessorCount: 2, MemoryMB: 1024}},
+		{{ProcessorCount: 1, MemoryMB: 512, CPUGroupLPs: []uint32{8, 24}}, {ProcessorCount: 2, MemoryMB: 1024, CPUGroupLPs: []uint32{24, 9}}},
+	} {
+		config := testConfig()
+		config.VMResources = resources
+		if _, err := Start(context.Background(), testOptions(), config); err == nil || !strings.Contains(err.Error(), "vm_resources") {
+			t.Fatalf("invalid resources reached input loading/allocation: %+v, %v", resources, err)
+		}
+		if _, _, err := pairOptions(testOptions(), config, "group", &Section{}); err == nil {
+			t.Fatalf("invalid resources reached cloned options: %+v", resources)
+		}
+	}
+	data, _ := json.Marshal(testConfig())
+	text := strings.TrimSuffix(string(data), "}") + `,"vm_resources":[]}`
+	if _, err := decodeConfig(strings.NewReader(text)); err == nil {
+		t.Fatal("explicit empty resource array was accepted as omission")
+	}
+}
+
+func fakeResourceCPUGroupOperations(events *[]string) (cpugroup.Operations, map[string][]uint32) {
+	groups := map[string][]uint32{}
+	return cpugroup.Operations{
+		Create: func(_ context.Context, id string, lps []uint32) error {
+			*events = append(*events, "create:"+id)
+			groups[id] = append([]uint32(nil), lps...)
+			return nil
+		},
+		Query: func(_ context.Context, id string) (*hcsschema.CpuGroupConfig, error) {
+			lps := make([]int32, len(groups[id]))
+			for i, lp := range groups[id] {
+				lps[i] = int32(lp)
+			}
+			return &hcsschema.CpuGroupConfig{GroupId: id, Affinity: &hcsschema.CpuGroupAffinity{
+				LogicalProcessorCount: int32(len(lps)), LogicalProcessors: lps,
+			}}, nil
+		},
+		Delete: func(ctx context.Context, id string) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			*events = append(*events, "delete:"+id)
+			delete(groups, id)
+			return nil
+		},
+	}, groups
+}
+
+func TestPairCPUGroupOwnershipAndInheritedAffinity(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		affinities [][]uint32
+		count      int
+	}{
+		{"shared", [][]uint32{{8, 24}, {24, 8}}, 1},
+		{"separate", [][]uint32{{8, 24}, {9, 25}}, 2},
+		{"workload-only", [][]uint32{nil, {8, 24, 9, 25}}, 1},
+		{"no-affinity", [][]uint32{nil, nil}, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var events []string
+			ops, created := fakeResourceCPUGroupOperations(&events)
+			config := testConfig()
+			config.VMResources = testResources()
+			for i := range config.VMResources {
+				config.VMResources[i].CPUGroupLPs = test.affinities[i]
+			}
+			base := testOptions()
+			base.CPUGroupID = "inherited"
+			workload, diode, err := pairOptions(base, config, "group", &Section{HCSName: "owned", Size: 16 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			groups, err := preparePairCPUGroups(context.Background(), config, workload, diode, ops)
+			if err != nil || len(created) != test.count {
+				t.Fatalf("prepare groups: created=%v, error=%v", created, err)
+			}
+			for i, options := range []*uvm.OptionsLCOW{diode, workload} {
+				if test.affinities[i] == nil {
+					if options.CPUGroupID != "inherited" {
+						t.Fatal("unconfigured affinity did not preserve base")
+					}
+				} else if !reflect.DeepEqual(created[options.CPUGroupID], func() []uint32 {
+					lps, _, _ := cpugroup.CanonicalLPs(test.affinities[i])
+					return lps
+				}()) {
+					t.Fatal("VM did not receive its requested CPU group")
+				}
+			}
+			if base.CPUGroupID != "inherited" {
+				t.Fatal("affinity assignment mutated base options")
+			}
+			events = nil
+			pair := &Pair{
+				cpuGroups:      groups,
+				workloadCloser: closeFunc(func() error { events = append(events, "workload"); return nil }),
+				diodeCloser:    closeFunc(func() error { events = append(events, "diode"); return nil }),
+			}
+			for range 2 {
+				if err := pair.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(created) != 0 || len(events) != 2+test.count ||
+				events[0] != "workload" || events[1] != "diode" {
+				t.Fatalf("group ownership/close order changed: %v", events)
+			}
+		})
+	}
+}
+
+func TestPairCPUGroupFailureRollsBackWithoutChangingOptions(t *testing.T) {
+	config := testConfig()
+	config.VMResources = testResources()
+	config.VMResources[0].CPUGroupLPs = []uint32{8, 24}
+	config.VMResources[1].CPUGroupLPs = []uint32{9, 25}
+	var events []string
+	ops, created := fakeResourceCPUGroupOperations(&events)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	query := ops.Query
+	queries := 0
+	failure := errors.New("injected group verification failure")
+	ops.Query = func(ctx context.Context, id string) (*hcsschema.CpuGroupConfig, error) {
+		queries++
+		if queries == 2 {
+			cancel()
+			return nil, failure
+		}
+		return query(ctx, id)
+	}
+	workload, diode := testOptions(), testOptions()
+	workload.CPUGroupID, diode.CPUGroupID = "workload-base", "diode-base"
+	if groups, err := preparePairCPUGroups(ctx, config, workload, diode, ops); groups != nil || !errors.Is(err, failure) {
+		t.Fatalf("verification failure hidden: %+v %v", groups, err)
+	}
+	if len(created) != 0 || len(events) != 4 ||
+		events[2] != strings.Replace(events[1], "create:", "delete:", 1) ||
+		events[3] != strings.Replace(events[0], "create:", "delete:", 1) ||
+		workload.CPUGroupID != "workload-base" || diode.CPUGroupID != "diode-base" {
+		t.Fatalf("partial groups or options escaped failed allocation: %v", events)
+	}
+}

@@ -7,11 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/cpugroup"
@@ -35,8 +33,7 @@ var hostCPUGroupOperations = cpuGroupOperations{
 
 type cpuGroupAssignments struct {
 	ids     []string
-	owned   []string
-	ops     cpuGroupOperations
+	groups  *cpugroup.Assignments
 	reports []cpuGroupReport
 }
 
@@ -66,121 +63,22 @@ func parseCPUGroupPriorities(value string) ([]uint32, error) {
 }
 
 func canonicalLPs(lps []uint32) ([]uint32, string, error) {
-	if len(lps) == 0 {
-		return nil, "", errors.New("CPU affinity cannot be empty")
-	}
-	ordered := append([]uint32(nil), lps...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	parts := make([]string, len(ordered))
-	for i, lp := range ordered {
-		if i > 0 && ordered[i-1] == lp {
-			return nil, "", fmt.Errorf("duplicate logical processor %d", lp)
-		}
-		parts[i] = strconv.FormatUint(uint64(lp), 10)
-	}
-	return ordered, strings.Join(parts, ","), nil
+	return cpugroup.CanonicalLPs(lps)
 }
 
-func prepareCPUGroups(ctx context.Context, groups [][]uint32, vmCount int, ops cpuGroupOperations, priorities ...uint32) (_ *cpuGroupAssignments, resultErr error) {
-	assignments := &cpuGroupAssignments{ops: ops}
-	if len(priorities) != 0 {
-		if len(groups) == 0 || len(priorities) != vmCount {
-			return nil, fmt.Errorf("CPU group priorities require CPU affinity and exactly %d VM priorities", vmCount)
-		}
-		for _, priority := range priorities {
-			if priority > cpugroup.MaxSchedulingPriority {
-				return nil, fmt.Errorf("CPU group scheduling priority %d exceeds %d", priority, cpugroup.MaxSchedulingPriority)
-			}
-		}
+func prepareCPUGroups(ctx context.Context, groups [][]uint32, vmCount int, ops cpuGroupOperations, priorities ...uint32) (*cpuGroupAssignments, error) {
+	owned, err := cpugroup.Prepare(ctx, groups, vmCount, cpugroup.Operations{
+		Create: ops.create, SetPriority: ops.setPriority, Query: ops.query, Delete: ops.delete,
+	}, priorities...)
+	if err != nil {
+		return nil, err
 	}
-	if len(groups) == 0 {
-		return assignments, nil
-	}
-	if len(groups) != vmCount {
-		return nil, fmt.Errorf("CPU affinity has %d VM lists, expected %d", len(groups), vmCount)
-	}
-	ordered := make([][]uint32, len(groups))
-	keys := make([]string, len(groups))
-	lpOwners := map[uint32]string{}
-	for i, group := range groups {
-		var err error
-		ordered[i], keys[i], err = canonicalLPs(group)
-		if err != nil {
-			return nil, err
-		}
-		for _, lp := range ordered[i] {
-			if owner, ok := lpOwners[lp]; ok && owner != keys[i] {
-				return nil, fmt.Errorf("partially overlapping CPU affinities: %s and %s", owner, keys[i])
-			}
-			lpOwners[lp] = keys[i]
-		}
-	}
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(resultErr, assignments.close(context.WithoutCancel(ctx)))
-		}
-	}()
-	created := map[string]string{}
-	for i, lps := range ordered {
-		if id, ok := created[keys[i]]; ok && len(priorities) == 0 {
-			assignments.ids = append(assignments.ids, id)
-			continue
-		}
-		id, err := guid.NewV4()
-		if err != nil {
-			return nil, fmt.Errorf("allocate CPU group ID: %w", err)
-		}
-		if err := ops.create(ctx, id.String(), lps); err != nil {
-			return nil, fmt.Errorf("create CPU affinity %s: %w", keys[i], err)
-		}
-		assignments.owned = append(assignments.owned, id.String())
-		if len(priorities) != 0 {
-			if err := ops.setPriority(ctx, id.String(), priorities[i]); err != nil {
-				return nil, fmt.Errorf("set CPU group %s scheduling priority: %w", id, err)
-			}
-		}
-		config, err := ops.query(ctx, id.String())
-		if err != nil {
-			return nil, fmt.Errorf("verify CPU group %s: %w", id, err)
-		}
-		if config == nil || config.Affinity == nil {
-			return nil, fmt.Errorf("CPU group %s returned no affinity", id)
-		}
-		actual := make([]uint32, len(config.Affinity.LogicalProcessors))
-		for j, lp := range config.Affinity.LogicalProcessors {
-			if lp < 0 {
-				return nil, fmt.Errorf("CPU group %s returned negative LP %d", id, lp)
-			}
-			actual[j] = uint32(lp)
-		}
-		_, actualKey, err := canonicalLPs(actual)
-		if err != nil || actualKey != keys[i] || config.Affinity.LogicalProcessorCount != int32(len(lps)) {
-			return nil, fmt.Errorf("CPU group %s affinity mismatch: requested %s, got %+v", id, keys[i], config.Affinity)
-		}
-		if len(priorities) != 0 {
-			if !strings.EqualFold(config.GroupId, id.String()) {
-				return nil, fmt.Errorf("CPU group %s returned mismatched group ID %q", id, config.GroupId)
-			}
-			found := false
-			for _, property := range config.GroupProperties {
-				if property.PropertyCode == hcsschema.CPUSchedulingPriorityProperty {
-					if found || property.PropertyValue != priorities[i] {
-						return nil, fmt.Errorf("CPU group %s scheduling priority mismatch: requested %d, got %+v",
-							id, priorities[i], config.GroupProperties)
-					}
-					found = true
-				}
-			}
-			if !found {
-				return nil, fmt.Errorf("CPU group %s returned no scheduling priority", id)
-			}
-			assignments.reports = append(assignments.reports, cpuGroupReport{
-				VM: fmt.Sprintf("uvmboot-%d", i), GroupID: config.GroupId,
-				LogicalProcessors: actual, SchedulingPriority: priorities[i],
-			})
-		}
-		created[keys[i]] = id.String()
-		assignments.ids = append(assignments.ids, id.String())
+	assignments := &cpuGroupAssignments{ids: owned.IDs, groups: owned}
+	for i, report := range owned.Reports {
+		assignments.reports = append(assignments.reports, cpuGroupReport{
+			VM: fmt.Sprintf("uvmboot-%d", i), GroupID: report.GroupID,
+			LogicalProcessors: report.LogicalProcessors, SchedulingPriority: report.SchedulingPriority,
+		})
 	}
 	return assignments, nil
 }
@@ -200,14 +98,7 @@ func (a *cpuGroupAssignments) groupForVM(id string) (string, error) {
 }
 
 func (a *cpuGroupAssignments) close(ctx context.Context) error {
-	var result error
-	for i := len(a.owned) - 1; i >= 0; i-- {
-		if err := a.ops.delete(ctx, a.owned[i]); err != nil {
-			result = errors.Join(result, fmt.Errorf("delete CPU group %s: %w", a.owned[i], err))
-		}
-	}
-	a.owned = nil
-	return result
+	return a.groups.Close(ctx)
 }
 
 func hostProcessorTopology(ctx context.Context) (*hcsschema.ProcessorTopology, error) {

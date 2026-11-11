@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/internal/cpugroup"
 	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
@@ -26,14 +27,17 @@ import (
 
 // Config is an explicit host-side opt-in; it never names existing HCS systems.
 // The workload inherits the sandbox's security/integrity options without alteration.
+// VMResources optionally replaces CPU/memory in [diode, workload] order; memory
+// is the HCS allocation in MiB, not embedded guest image memory.
 type Config struct {
-	Version                int    `json:"version"`
-	ModuleDirectory        string `json:"module_directory"`
-	SharedMemoryBytes      uint64 `json:"shared_memory_bytes"`
-	WorkloadGuestStateFile string `json:"workload_guest_state_file"`
-	Interactive            bool   `json:"interactive,omitempty"`
-	MediateGCS             bool   `json:"mediate_gcs,omitempty"`
-	UnikraftPackage        string `json:"unikraft_package,omitempty"`
+	Version                int           `json:"version"`
+	ModuleDirectory        string        `json:"module_directory"`
+	SharedMemoryBytes      uint64        `json:"shared_memory_bytes"`
+	WorkloadGuestStateFile string        `json:"workload_guest_state_file"`
+	Interactive            bool          `json:"interactive,omitempty"`
+	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
+	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
+	VMResources            []VMResources `json:"vm_resources,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -76,6 +80,9 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		config.SharedMemoryBytes != 32<<20) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
 	}
+	if err := config.validateResources(); err != nil {
+		return nil, err
+	}
 	return &config, nil
 }
 
@@ -91,6 +98,7 @@ type Pair struct {
 	done            chan struct{}
 	unikraft        bool
 	unikraftConsole *ownedUnikraftConsole
+	cpuGroups       *cpugroup.Assignments
 	// Closers are captured immediately after acquisition so partial startup
 	// follows the same consumer-before-provider ownership order.
 	workloadCloser    io.Closer
@@ -100,6 +108,9 @@ type Pair struct {
 }
 
 func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	if err := config.validateResources(); err != nil {
+		return nil, nil, err
+	}
 	if base == nil || base.Options == nil || base.ConfidentialLCOWOptions == nil ||
 		base.ConfidentialCommonOptions == nil || !base.UseGuestConnection ||
 		!base.SecurityPolicyEnabled || !base.DmVerityMode || base.GuestStateFilePath == "" ||
@@ -118,6 +129,13 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 		options.Options, options.ConfidentialLCOWOptions = &common, &confidential
 		options.ConfidentialCommonOptions = &security
 		options.ID, options.BundleDirectory = id, bundle
+		if config.VMResources != nil {
+			index := 0
+			if role == Workload {
+				index = 1
+			}
+			config.VMResources[index].Apply(options.Options)
+		}
 		options.KernelBootOptions = strings.TrimSpace(base.KernelBootOptions + " hcs_shmem_diag.role=" + string(role))
 		options.SharedMemoryRegions = []uvm.LCOWSharedMemoryRegion{{
 			SectionName: section.HCSName, Length: int32(section.Size), AllowGuestWrite: true,
@@ -152,6 +170,9 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	defer cancelStartup()
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
+	}
+	if err := config.validateResources(); err != nil {
+		return nil, err
 	}
 	// Validate programmatic callers as strictly as annotation/config-file callers.
 	encoded, err := json.Marshal(config)
@@ -205,6 +226,10 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		if err := configureOwnedUnikraft(workloadOptions, diodeOptions, config, native, group.String()); err != nil {
 			return nil, err
 		}
+	}
+	pair.cpuGroups, err = preparePairCPUGroups(ctx, config, workloadOptions, diodeOptions, cpugroup.HostOperations)
+	if err != nil {
+		return nil, err
 	}
 	if err := os.Mkdir(diodeOptions.BundleDirectory, 0700); err != nil {
 		return nil, fmt.Errorf("create owned diode bundle: %w", err)
@@ -470,6 +495,11 @@ func (p *Pair) close(cause error) error {
 		}
 		if p.sectionCloser != nil {
 			p.closeErr = errors.Join(p.closeErr, p.sectionCloser.Close())
+		}
+		if p.cpuGroups != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.closeErr = errors.Join(p.closeErr, p.cpuGroups.Close(ctx))
 		}
 	})
 	return p.closeErr

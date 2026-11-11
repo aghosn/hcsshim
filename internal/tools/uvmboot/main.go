@@ -53,6 +53,14 @@ func main() {
 			Name:  memoryArgName,
 			Usage: "Amount of memory on the UVM, in MB. Uses hcsshim default if not specified",
 		},
+		cli.StringFlag{
+			Name:  vmCPUsArgName,
+			Usage: "Comma-separated CPU counts in uvmboot-N order; exactly --count entries, each 1..256",
+		},
+		cli.StringFlag{
+			Name:  vmMemoryArgName,
+			Usage: "Comma-separated memory sizes in MiB in uvmboot-N order; exactly --count positive entries",
+		},
 		cli.BoolFlag{
 			Name:  measureArgName,
 			Usage: "Measure wall clock time of the UVM run",
@@ -103,6 +111,9 @@ func main() {
 	}
 
 	app.Before = func(c *cli.Context) error {
+		if err := prepareVMResources(c); err != nil {
+			return err
+		}
 		if !winapi.IsElevated() {
 			return fmt.Errorf("%s must be run in an elevated context", c.App.Name)
 		}
@@ -122,13 +133,10 @@ func main() {
 	}
 }
 
-func setGlobalOptions(c *cli.Context, options *uvm.Options) {
+func setGlobalOptions(c *cli.Context, options *uvm.Options) error {
 	// TODO: create appropriate spec for (conf) WCOW and handle annotations here
-	if c.GlobalIsSet(cpusArgName) {
-		options.ProcessorCount = int32(c.GlobalUint64(cpusArgName))
-	}
-	if c.GlobalIsSet(memoryArgName) {
-		options.MemorySizeInMB = c.GlobalUint64(memoryArgName)
+	if err := setVMResources(c, options); err != nil {
+		return err
 	}
 	if c.GlobalIsSet(allowOvercommitArgName) {
 		options.AllowOvercommit = c.GlobalBool(allowOvercommitArgName)
@@ -149,6 +157,7 @@ func setGlobalOptions(c *cli.Context, options *uvm.Options) {
 	// TODO: create common arg for console pipe and set `uvmConsolePipe` as the default value
 	// Always set the console pipe in uvmboot, it helps with testing/debugging
 	options.ConsolePipe = uvmConsolePipe
+	return nil
 }
 
 // todo: add a context here to propagate cancel/timeouts to runFunc uvm

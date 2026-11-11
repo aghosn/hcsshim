@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -46,6 +47,9 @@ func benchmarkTestContext(t *testing.T, args ...string) *cli.Context {
 	global := flag.NewFlagSet("global", flag.ContinueOnError)
 	for _, f := range []cli.Flag{
 		cli.Uint64Flag{Name: cpusArgName, Value: 2},
+		cli.Uint64Flag{Name: memoryArgName},
+		cli.StringFlag{Name: vmCPUsArgName},
+		cli.StringFlag{Name: vmMemoryArgName},
 		cli.IntFlag{Name: countArgName, Value: 1},
 		cli.IntFlag{Name: parallelArgName, Value: 1},
 	} {
@@ -166,7 +170,7 @@ func TestNetworkBenchmarkValidationFailsClosed(t *testing.T) {
 	}
 }
 
-func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
+func TestNetworkBenchmarkIndependentRequestedProcessors(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "bench.sh")
 	if err := os.WriteFile(script, []byte("exit 0\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -175,8 +179,7 @@ func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
 	useGCS, siblingInteractive, debug = true, false, false
 	t.Cleanup(func() { useGCS, siblingInteractive, debug = oldGCS, oldInteractive, oldDebug })
 	base := []string{"--network-benchmark-script", script,
-		"--network-benchmark-server", "192.0.2.10", "--security-hardware",
-		"--network-benchmark-single-vp"}
+		"--network-benchmark-server", "192.0.2.10", "--security-hardware"}
 	for _, tc := range []struct {
 		name      string
 		flags     []string
@@ -200,49 +203,60 @@ func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
 			if tc.count == "2" {
 				groups = append(groups, []uint32{9, 25})
 			}
+			processors := "2"
+			if tc.count == "2" {
+				processors = "1,2"
+			}
+			if err := c.GlobalSet(vmCPUsArgName, processors); err != nil {
+				t.Fatal(err)
+			}
 			if err := validateNetworkBenchmark(c, groups); (err != nil) != tc.wantError {
 				t.Fatalf("validation=%v, wantError=%v", err, tc.wantError)
 			}
 			workloadID := "uvmboot-0"
 			if tc.count == "2" {
 				workloadID = "uvmboot-1"
-				if got := benchmarkVMProcessors(c, "uvmboot-0"); got != 1 {
-					t.Fatalf("SingleVP diode got %d VPs", got)
+				if got := requestedVMProcessors(c, "uvmboot-0"); got != 1 {
+					t.Fatalf("diode requested %d VPs, want 1", got)
 				}
 			}
-			if got := benchmarkVMProcessors(c, workloadID); got != 2 {
-				t.Fatalf("workload got %d VPs; must always have two", got)
+			if got := requestedVMProcessors(c, workloadID); got != 2 {
+				t.Fatalf("workload requested %d VPs, want 2", got)
 			}
 			if command := networkBenchmarkClient(c, "workload"); !strings.Contains(command, "vcpus=2") {
-				t.Fatalf("SingleVP changed workload preflight: %s", command)
+				t.Fatalf("workload preflight ignored requested count: %s", command)
 			}
-			if err := c.GlobalSet(cpusArgName, "1"); err != nil {
+			processors = "1"
+			if tc.count == "2" {
+				processors = "1,1"
+			}
+			if err := c.GlobalSet(vmCPUsArgName, processors); err != nil {
 				t.Fatal(err)
 			}
-			if err := validateNetworkBenchmark(c, groups); err == nil {
-				t.Fatal("accepted a one-VP workload")
+			if err := validateNetworkBenchmark(c, groups); err != nil {
+				t.Fatalf("rejected independently selected one-VP workload: %v", err)
+			}
+			if command := networkBenchmarkClient(c, "workload"); !strings.Contains(command, "vcpus=1") {
+				t.Fatalf("one-VP workload preflight ignored requested count: %s", command)
 			}
 		})
 	}
-	c := benchmarkTestContext(t, "--network-benchmark-single-vp")
-	if err := validateNetworkBenchmark(c, nil); err == nil {
-		t.Fatal("accepted flag without benchmark")
-	}
-	for _, single := range []bool{false, true} {
-		command := networkBenchmarkVPPreflight("workload", "192.0.2.10", false, "poll", single)
+	for _, processors := range []uint64{2, 1} {
+		command := networkBenchmarkVPPreflight("workload", "192.0.2.10", false, "poll", processors)
 		want := "vcpus=2"
-		if single {
+		if processors == 1 {
 			want = "vcpus=1"
 		}
 		if !strings.Contains(command, want) || !strings.Contains(command, "SEV-SNP") ||
-			strings.Contains(command, "guest virtual SMT pair missing") == single {
+			strings.Contains(command, "guest virtual SMT pair missing") != (processors == 2) {
 			t.Fatalf("wrong VP/SNP/SMT requirements: %s", command)
 		}
 		args := []string{"--network-benchmark-script", script, "--network-benchmark-server", "192.0.2.10"}
-		if single {
-			args = append(args, "--network-benchmark-single-vp")
+		c := benchmarkTestContext(t, args...)
+		if err := c.GlobalSet(vmCPUsArgName, fmt.Sprint(processors)); err != nil {
+			t.Fatal(err)
 		}
-		diode := networkBenchmarkSiblingCommand(benchmarkTestContext(t, args...), "/bus.ko", "/net.ko", diodeRole,
+		diode := networkBenchmarkSiblingCommand(c, "/bus.ko", "/net.ko", diodeRole,
 			siblingNetConfig{ifName: "dvsp0", address: "10.200.0.1/30"},
 			&diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
 		if !strings.Contains(diode, want) || !strings.Contains(diode, "grep -qx 'receive_diagnostics=1'") ||
@@ -334,8 +348,8 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 
 func TestNetworkBenchmarkNoSMTRecordsTopologyAndPreservesPreflight(t *testing.T) {
 	for _, role := range []string{"diode", "workload"} {
-		command := networkBenchmarkPreflight(role, "192.0.2.10", true, "poll")
-		for _, required := range []string{"SEV-SNP", "expected exactly two online VPs",
+		command := networkBenchmarkVPPreflight(role, "192.0.2.10", true, "poll", 2)
+		for _, required := range []string{"SEV-SNP", "expected exactly 2 online VPs",
 			"thread_siblings_list", "guest_topology", "host_smt=disabled", "idle=poll",
 			"iperf version 2.2.1", "ip route get 192.0.2.10"} {
 			if !strings.Contains(command, required) {

@@ -36,9 +36,6 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	if directory == "" {
 		return nil, nil
 	}
-	if c.GlobalUint64(cpusArgName) != 2 {
-		return nil, errors.New("unikraft pair requires --cpus=2 for the Linux workload; the Unikraft diode remains one VP")
-	}
 	if !useGCS || !c.Bool(securityHardwareFlag) || !c.Bool(sharedMemoryTwoUVMArgName) ||
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||
 		c.Uint64(sharedMemorySizeArgName) != 32*1024*1024 || c.String(siblingBusGuestModuleArgName) == "" {
@@ -64,6 +61,9 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	if err != nil {
 		return nil, err
 	}
+	if err := validateUnikraftResources(c, cfg.MemoryMB); err != nil {
+		return nil, err
+	}
 	if cfg.GCSRelay != c.Bool(siblingGCSRelayArgName) {
 		return nil, errors.New("Unikraft firmware gcs_relay selection must match --sibling-gcs-relay; no direct-GCS fallback")
 	}
@@ -83,8 +83,8 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	if c.Bool(siblingDiodeUplinkArgName) != (cfg.Network != nil) {
 		return nil, errors.New("--sibling-diode-uplink must match networking in the Unikraft manifest")
 	}
-	if c.String(networkBenchmarkScriptArgName) != "" && (cfg.Network == nil || !c.Bool(networkBenchmarkSingleVPArgName)) {
-		return nil, errors.New("Unikraft network benchmark requires networking and --network-benchmark-single-vp")
+	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Network == nil {
+		return nil, errors.New("Unikraft network benchmark requires networking")
 	}
 	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Idle != c.String(networkBenchmarkIdleArgName) {
 		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark idle=%s", cfg.Idle, c.String(networkBenchmarkIdleArgName))

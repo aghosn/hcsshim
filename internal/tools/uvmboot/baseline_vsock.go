@@ -260,7 +260,7 @@ func baselineVsockGuestCommand(c *cli.Context, role string, nic *diodeUplink) st
 			`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 			`"$ipt" iptables -w -t nat -A POSTROUTING -s 192.168.127.0/30 -o "$up" -j MASQUERADE; ` +
 			networkBenchmarkVPPreflight("vsock-diode", c.String(networkBenchmarkServerArgName),
-				c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) +
+				c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), requestedVMProcessors(c, "uvmboot-0")) +
 			`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ]; ` +
 			`echo 'network_benchmark: vsock diode forwarding ready'; ` +
 			`(status=0; "$dtb" sink 5001 >/run/dtb-exec/vsock-done.log 2>&1 || status=$?; ` +
