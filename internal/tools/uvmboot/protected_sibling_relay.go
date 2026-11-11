@@ -218,7 +218,7 @@ func protectedSiblingQuiesceProvider(ctx context.Context, diode *protectedSiblin
 type protectedSiblingBootstrapOps struct {
 	bootstrap, create, configure, attach func(context.Context) error
 	stageDiode, startServer              func(context.Context) error
-	startDependencies                   func(context.Context) error
+	startDependencies                    func(context.Context) error
 	startWorkload, ready, stageWorkload  func(context.Context) error
 }
 

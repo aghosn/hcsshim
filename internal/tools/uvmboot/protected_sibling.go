@@ -28,7 +28,7 @@ import (
 const (
 	protectedSetupBudget         = 5 * time.Minute
 	protectedCombinedSetupBudget = 10 * time.Minute
-	protectedWorkloadGCSBudget    = 7 * time.Minute
+	protectedWorkloadGCSBudget   = 7 * time.Minute
 	protectedCleanupBudget       = 2 * time.Minute
 	protectedCombinedBytes       = 32 * 1024 * 1024
 )

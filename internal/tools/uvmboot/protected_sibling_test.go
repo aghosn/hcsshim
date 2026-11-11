@@ -652,7 +652,7 @@ func protectedBootstrapTestOps(call func(context.Context, string) error) protect
 	return protectedSiblingBootstrapOps{
 		bootstrap: step("bootstrap"), create: step("create"), configure: step("configure"),
 		attach: step("attach"), stageDiode: step("stage-diode"),
-		startServer: step("start-server"),
+		startServer:       step("start-server"),
 		startDependencies: step("start-dependencies"), startWorkload: step("start-workload"),
 		ready: step("relay-ready"), stageWorkload: step("stage-workload"),
 	}
