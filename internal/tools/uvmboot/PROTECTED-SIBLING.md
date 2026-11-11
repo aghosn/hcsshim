@@ -255,6 +255,62 @@ mapping before offer/use, **not** before the first guest instruction.
 Metadata-only attachment after page seal may succeed; actual Install still
 faces HV page/partition admission. VID participant counts are not that inventory.
 
+### Retained history and bounded root-pool recovery
+
+The native history/root-pool change (plan 000027) retains **eight registration
+episodes per protected physical page/lifetime**, counting Pending, Installed,
+Removing and Removed records. This is **not eight concurrent VMs**. Records are
+not evicted or recycled to admit another episode. A ninth episode fails with
+`HV_STATUS_INSUFFICIENT_BUFFERS`; capacity exhaustion does not prevent existing
+lifetimes from being sealed, removed, reported or reclaimed. The published
+report maximum remains **64 registrations**, with unchanged versions/layouts,
+actual registration count and variable record length. The internal collection
+scratch remains **2584 bytes**; it does not serialize unused slots.
+
+The root pool funds hypervisor bookkeeping charged to the root partition. It
+is not Windows free RAM, guest RAM or the pinned protected backing. A deposit
+transfers **real physical pages**, not a counter/configuration setting.
+Only Initialize returning exactly `STATUS_HV_INSUFFICIENT_ROOT_MEMORY` with
+validated progress and an unfinished suffix can trigger this recovery:
+
+1. The entire SVC/SK call returns, including release of fallback resources.
+   Normal-kernel VID records each completed prefix in its lease ledger and
+   aggregate result **once**, before considering a deposit.
+2. At PASSIVE_LEVEL, with lease serialization and lease/pin/device owners
+   retained but no partition/VSMM locks, VID invokes the existing exported
+   `WinHvLowMemoryPolicyAutoDeposit` for `HV_PARTITION_ID_SELF`, not the child.
+3. Policy success permits another SVC call on **only the unfinished zero-ID
+   descriptor suffix**. Completed lifetimes are not reinitialized.
+   There are at most **three policy invocations per original bounded request**
+   (startup batches are at most four 4-KiB pages), even when retries make
+   progress. This bounds retries, not the wall time of an executing kernel call.
+
+Policy success is **not Initialize success**. Deposit failure or budget
+exhaustion returns the last actual SVC status and aggregate completed prefix,
+not the policy status or invented success. Malformed progress remains sticky
+uncertainty and fails closed: it does not authorize backing access, unpinning,
+ordinary fallback or a cleanup-success claim. The SK fallback path still makes
+**no deposit**. No new API, ABI, CLI switch or reserve is introduced.
+Child-memory shortages, contiguous/mirroring variants, `NO_RESOURCES`, history
+exhaustion, busy, denied and other errors do not qualify; Seal, BeginTeardown,
+Reclaim and other operations gain no recovery.
+
+The existing policy requests **1088 pages / 4.25 MiB** per invocation, but can
+permit retry after a nonzero partial deposit. Concurrent consumers can use the
+shared pool immediately: neither that amount nor allocation success is
+guaranteed. Deposits are not a private lease reserve and are not withdrawn when
+the request or lease finishes.
+
+The previous 8192-page reproduction propagated `0xC0350073` through
+`MemoryManager.cpp:7839` and `SharedRegionManager.cpp:525`; it did **not** reach
+the workload or relay. Zero cached counters did not prove zero native progress.
+Neither that trace nor successful recovery proves the per-page entry allocator
+was uniquely responsible. Preserve the 32-MiB combined geometry, required
+backing admission sealing, root/GCS routing and diode-only AHV tooling above;
+do not enable ordinary backing or relax receipt checks to obtain a boot.
+Native build, matched deployment and hardware recovery remain pending; use
+section 9's T1-T6 handoff rather than treating source acceptance as execution.
+
 ## 3. Attach, capture and filter actual workload traffic
 
 From separate elevated Windows consoles, using the same actual launcher:
@@ -709,6 +765,125 @@ fix and independent review, then rebuild/regenerate affected matched products,
 redeploy and manually recheck the failing case plus relevant ordinary/regression
 cases. Keep Go/native build, deployment and runtime outcomes separate. Missing
 or lab-unavailable observations stay pending; source acceptance cannot fill them.
+
+## 9. History/root-pool recovery: manual T1-T6 handoff (plan 000027)
+
+This is a manual validation specification, **not execution authorization**.
+All native builds, matched-PDB observations, hardware runs and fault cases below
+are **PENDING**. Plan 000027 S4 is the only compilation/runtime stage for this
+change, after accepted source review, an approved isolated target with matched
+HV/NTOS/SK symbols and separately authorized execution. No new compiled tests,
+harness, test-only retry replica or production fault hook is part of this
+handoff. Unsafe/unavailable subcases remain explicitly unverified; adding a
+harness requires a separate decision.
+
+### Matched products and recording
+
+Reuse section 1's established matched-product lab process, not a new deployment
+script or permission to reboot/replace host products. Record exact source
+revisions, commands and exit statuses, AMD64 FRE configuration, tool versions,
+products rebuilt/retained, running HV identity and matched PDB identities.
+Keep object-output/signing-stage comparisons separate from exact final
+binplaced/package/deployed hashes where no transform intervenes. Rebuilding
+`runtime.zip` alone does **not** install the HV/VID fix; a VID restart alone
+does not replace the running HV.
+
+The current implementation shell has empty `SDXROOT` and no `windows-build`
+helper; native builds remain a manual S4 handoff. In an approved matched AMD64
+FRE Razzle shell, confirm the established command form/configuration before
+using the plan's affected graphs and final consumers:
+
+```powershell
+# S4 only; not a command to run during documentation/source acceptance.
+if (-not $env:SDXROOT) { throw 'A matched Razzle environment is required.' }
+build -parent /dir "$env:SDXROOT\onecore\hv\hvx"
+if ($LASTEXITCODE -ne 0) { throw 'Hypervisor build failed; stop before deployment.' }
+build -parent /dir "$env:SDXROOT\onecore\vm"
+if ($LASTEXITCODE -ne 0) { throw 'Virtualization stack build failed; stop before deployment.' }
+```
+
+Build final HV images and `Vid.sys`, not just the changed libraries. Confirm
+the new policy reference links through the existing WinHv import; retain the
+unchanged matched SK/WinHv products. Do not use standalone `cl`, install a
+substitute toolchain or hand-edit generated exports/proxies to mask a mismatch.
+Section 7's earlier startup-stack handoff does not establish this change's
+native acceptance.
+
+For each T1-T6 case use a fresh evidence directory under the companion's
+`artifacts\evidence`. Record actual run/VM IDs, lease, original page range/count,
+UTC times, layered statuses, native Bootstrap/Import/lifecycle receipts,
+refill traces, debugger observations, exact fault scope/site and cleanup result.
+Unsigned launcher/guest logs and cached counters are correlation aids, not
+native ownership, drain or reclaim authority.
+
+Use the existing short DynMem/Worker/VID/Compute ETW recipe: discover the actual
+providers with `logman query providers`; capture only those providers, all
+keywords at verbose level 5, with a fresh session/provider file and circular
+256-MiB cap (`logman create trace ... -pf ... -f bincirc -max 256 -ets`).
+Stop the same session in `finally`, check native exit codes, preserve ETL and
+decode with `tracerpt`. Correlate actual VM IDs/times and refill/native receipts,
+record lost events/buffers and start a fresh capture for each attempt. Derive
+IOCTLs from the current matched `VidIoctl.h`; no stale constants or unfiltered
+syscall breakpoints. A propagated error identifies a boundary, not uniquely
+the inner allocator.
+
+### Source-grounded observation points and fault limits
+
+Resolve symbols/locals against the **actual matched build**; line ranges below
+are source anchors at OS `515f2a4f900aec27dbae3ec75728b2cf051f5686`, not
+turnkey debugger commands or stable addresses. Read-only observation also
+requires the approved target and a small set of run-filtered conditional/
+one-shot breakpoints; broad per-page stops distort timeouts and pool behavior.
+
+| Point (OS-relative path) | Observe; do not manufacture |
+| --- | --- |
+| `onecore/vm/vid/sys/vsmm/VsmmProtectedShared.c`, `VsmmProtectedSharedpPages:193-198` | Actual returned SVC `status` and per-call `completed` prefix, after the entire call returns. Confirm PASSIVE_LEVEL, retained lease/pin/device ownership and no partition/VSMM locks. The supported user-only buffered WDM preprocessing/controller path supplies this context; do not infer it from a WDF `ExecutionLevelPassive` setting. |
+| Same helper, `204-229` | Descriptors/lifetimes, `Lease->Initialized`, aggregate `*Processed`, `remaining` and `refillAttempts`: each validated prefix enters the ledger once before deposit, leaving only the unfinished suffix. `STATUS_DATA_ERROR` sets sticky `Lease->Uncertain`. |
+| Same helper, `239-259` | Actual policy invocations 1-3 and `policyStatus`, followed by suffix SVC retries only after policy success. The scalar VID trace carries `Lease->LeaseId`, `Code`, original `Start`/`Count`, aggregate processed, attempts, actual SVC status and policy status, not native addresses or contents. |
+| `onecore/vm/vid/sys/vsmm/VsmmSvc.c:2074-2090,2186-2248` | Status/count/reserved/full-success framing validation, zero-ID input requirements and transfer of real completed SPA/lifetime descriptors even on failure. Preserve earlier valid progress; never reinterpret malformed framing as zero ownership. |
+| `onecore/hv/hvx/am/gpa/GpaProtectedShared.c`, `GpaReserveProtectedShared:791` | Entry allocation is a **candidate only** for verify-before-mutation fault-facility/debugger investigation. Verify actual control flow and selected allocator's side effects first; it is neither a preauthorized fault command nor the only possible failing allocator. |
+
+Use only a verified existing safe fault facility or separately approved narrowly
+conditional one-shot debugger intervention filtered to this run, **before**
+the selected allocator/operation mutates allocation, lifetime, publication or
+permissions. Never overwrite successful allocator returns or lifetime-transition
+statuses after mutation. No arbitrary `.call`, manual registration-count edits,
+forged receipts, raw protected-backing access, broad host exhaustion or
+disruption of unrelated VMs is authorized. If a safe pre-mutation site cannot
+be established, stop that subcase and record it unverified.
+
+With matched HV symbols, resolve `MmRootCompartment` and record
+`Stats.DepositedPageCount`, `Stats.FreePageCount`,
+`Stats.MinRequiredFreePageCount` and `Stats.AllocatedReservedPageCount` before,
+around refill and after the case. Inspect
+`GlobalZone->GlobalZonePromoteSubPageAllocations` before assuming sub-page
+packing. Record before/after matched-PDB
+`sizeof(GPAP_PROTECTED_SHARED_ENTRY)` and
+`sizeof(GPAP_PROTECTED_SHARED_REGISTRATION)`, not guessed type sizes.
+Removing 56 AMD64 pointers saves **448 requested bytes per entry**, or
+**3.5 MiB for 8192 entries**, before allocator rounding and separately allocated
+registration objects; this is **not exact resident-memory savings**.
+Counters describe the global root compartment, not a lease-exclusive balance.
+Free sub-pages, reserves, NUMA placement and concurrent allocations prevent
+exclusive before/after attribution or a guaranteed refill amount.
+
+### Manual matrix: expectations are not results
+
+Retain separate results/evidence for each subcase; do not mark a whole row
+passed when an unsafe/unavailable subcase remains unverified.
+
+| ID | Setup / scenario | Expected outcome and protected invariant | Required evidence | Status |
+| --- | --- | --- | --- | --- |
+| T1 | Review capacity/bounds and source ABI; obtain matched before/after HV PDB type sizes. Only if existing safe native tooling permits, drive eight real retained episodes and a ninth attempt on one lifetime. | Eight history pointers, including Removed; no eviction/recycling. Published maximum 64 and 2584-byte scratch unchanged; report uses actual count/length. Ninth returns `HV_STATUS_INSUFFICIENT_BUFFERS` without losing history or blocking existing seal/remove/report/reclaim. | Bounds/assertion and collector review, actual PDB identities/type sizes, real state/count/registration/lifetime observations and capacity status plus cleanup receipts. No fabricated count; unavailable boundary exercise stays unverified. | **PENDING** |
+| T2 | Fresh matched legacy/combined backing without induced shortage; narrowly scope policy/helper observation to the run. | Successful Initialize makes no deposit-policy call; native receipts and normal startup remain correct. Recovery adds no normal-path preallocation tax. | Actual SVC statuses/prefixes, scoped policy invocation count zero, native startup receipts, IDs and bounded ETW. | **PENDING** |
+| T3 | On the approved isolated target, induce one real pre-mutation root shortage before any page completes, only at a verified safe site. | Valid zero-prefix exact shortage causes one SELF policy invocation after full SVC/SK return; retry submits the original unfinished range. Only actual later SVC completion can yield a checked startup receipt. | Fault site/scope, status and zero prefix, returned-call/context observations, actual policy result, suffix range/lifetimes, native receipt and pool snapshots. | **PENDING** |
+| T4 | Induce shortage on a later page of one real four-page request, before that page gains a lifetime; retain prior real descriptors. | Earlier SPA/lifetime identities survive unchanged, lease initialization/aggregate prefix advance once, and only the unfinished zero-ID suffix is retried. Cleanup owns every initialized page. | Per-attempt ranges/counts, before/after descriptors and ledger, policy attempts, aggregate receipt and authorized teardown/reclaim evidence. | **PENDING** |
+| T5 | Source-review every classification/budget/framing branch. Safely exercise other statuses/operations, persistent root shortage with progress between refills, deposit failure and malformed framing only where an existing safe exercise permits. | No deposit for excluded statuses/operations, uncertainty or exhausted suffix. Maximum three policy invocations per original request; progress never resets budget. Policy failure/exhaustion preserves last actual SVC failure and aggregate prefix; malformed results retain sticky uncertainty/owners, never success or fallback. | Individual statuses/operations, attempts 1-3 and absence of a fourth policy call, policy result, SVC status/prefix, framing/uncertainty and retained-owner observations. Record each unsafe/unavailable subcase unverified. | **PENDING** |
+| T6 | Fresh matched HV/VID and complete verified runtime. Cold combined 32-MiB boot and separate legacy direct-root/GCS boot; normal stop and supported startup cancellation in separately observed runs, without optional masks/pause. | Workload root and GCS work through diode in combined mode; legacy remains direct. Real Bootstrap/Import receipts, required backing admission sealing and native release/scrub are correct, or uncertainty remains explicit with owners retained. No ordinary fallback or reduced geometry. AHV requests/tools stay diode-only. | Section 2's `.\run.ps1 diode start -ProtectedShared -MediateGCS`, separate attach consoles and `diode stop`; separate `diode start -ProtectedShared`/stop and supported cancellation commands actually used. Preserve root/GCS readiness, receipts, run/VM IDs, refill traces/ETL, native cleanup/release and exact deployed hashes. | **PENDING** |
+
+A no-shortage boot does not prove recovery; a deposit does not prove Initialize.
+Preserve failures and remaining coverage gaps for S4 rather than adjusting
+history, geometry, seals, backing mode or ownership checks to obtain success.
 
 ## Command and contract source map
 
