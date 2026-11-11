@@ -292,7 +292,7 @@ func TestBenchmarkCPUValidationUsesPhysicalTopologyNotAdjacentLPs(t *testing.T) 
 		{{8, 24}}, {{8, 24}, {9, 25}}, {{8, 24}, {8, 24}},
 	} {
 		copyBefore := append([]uint32(nil), groups[0]...)
-		if err := validateBenchmarkCPUs(topology, groups, false); err != nil {
+		if err := validateBenchmarkCPUs(topology, groups, false, 2); err != nil {
 			t.Fatalf("valid affinity %v rejected: %v", groups, err)
 		}
 		if !reflect.DeepEqual(copyBefore, groups[0]) {
@@ -302,7 +302,7 @@ func TestBenchmarkCPUValidationUsesPhysicalTopologyNotAdjacentLPs(t *testing.T) 
 	for _, groups := range [][][]uint32{
 		{{8}}, {{8, 9}}, {{8, 8}}, {{8, 100}}, {{8, 24}, {10, 26}},
 	} {
-		if err := validateBenchmarkCPUs(topology, groups, false); err == nil {
+		if err := validateBenchmarkCPUs(topology, groups, false, 2); err == nil {
 			t.Fatalf("accepted invalid physical-core placement %v", groups)
 		}
 
@@ -325,26 +325,26 @@ func TestBenchmarkMinRootRejectsRootAffinity(t *testing.T) {
 					topology.LogicalProcessors[i].CoreId = topology.LogicalProcessors[i].LpIndex
 				}
 			}
-			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}, {8, 24}}, noSMT); err != nil {
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}, {8, 24}}, noSMT, 2); err != nil {
 				t.Fatalf("root-free placement rejected: %v", err)
 			}
-			if err := validateBenchmarkCPUs(topology, [][]uint32{{0, 16}}, noSMT); err == nil ||
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{0, 16}}, noSMT, 2); err == nil ||
 				!strings.Contains(err.Error(), "root-partition LPs") {
 				t.Fatalf("root placement not rejected: %v", err)
 			}
 			topology.LogicalProcessors[3].RootVpIndex = 2
-			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err == nil ||
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT, 2); err == nil ||
 				!strings.Contains(err.Error(), "root-partition LPs") {
 				t.Fatalf("partially root-owned placement not rejected: %v", err)
 			}
 			for i := range topology.LogicalProcessors {
 				topology.LogicalProcessors[i].RootVpIndex = int32(i)
 			}
-			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err != nil {
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT, 2); err != nil {
 				t.Fatalf("unrestricted-root placement rejected: %v", err)
 			}
 			topology.LogicalProcessors[0].RootVpIndex = -2
-			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT); err == nil {
+			if err := validateBenchmarkCPUs(topology, [][]uint32{{8, 24}}, noSMT, 2); err == nil {
 				t.Fatal("invalid root topology accepted")
 			}
 		})
@@ -357,24 +357,52 @@ func TestBenchmarkNoSMTRequiresIdenticalTwoCoreAffinities(t *testing.T) {
 		{LpIndex: 2, CoreId: 2}, {LpIndex: 3, CoreId: 3, NodeNumber: 1},
 	}}
 	groups := [][]uint32{{0, 1}, {1, 0}}
-	if err := validateBenchmarkCPUs(topology, groups, true); err != nil {
+	if err := validateBenchmarkCPUs(topology, groups, true, 2); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBenchmarkCPUs(topology, groups[:1], true); err != nil {
+	if err := validateBenchmarkCPUs(topology, groups[:1], true, 2); err != nil {
 		t.Fatalf("SMT-off baseline rejected: %v", err)
 	}
-	if err := validateBenchmarkCPUs(topology, groups, false); err == nil {
+	if err := validateBenchmarkCPUs(topology, groups, false, 2); err == nil {
 		t.Fatal("default SMT validation accepted two physical cores")
 	}
 	for _, invalid := range [][][]uint32{
 		{{0, 1}, {0, 2}}, {{0, 0}, {0, 0}}, {{0, 99}, {0, 99}}, {{0, 3}, {0, 3}},
 	} {
-		if err := validateBenchmarkCPUs(topology, invalid, true); err == nil {
+		if err := validateBenchmarkCPUs(topology, invalid, true, 2); err == nil {
 			t.Fatalf("accepted invalid SMT-off placement %v", invalid)
 		}
 	}
 	topology.LogicalProcessors[1].CoreId = 0
-	if err := validateBenchmarkCPUs(topology, groups, true); err == nil {
+	if err := validateBenchmarkCPUs(topology, groups, true, 2); err == nil {
 		t.Fatal("SMT-off mode accepted an enabled SMT pair")
+	}
+}
+
+func TestBenchmarkSingleVPRequiresCompleteCore(t *testing.T) {
+	topology := &hcsschema.ProcessorTopology{LogicalProcessors: []hcsschema.LogicalProcessor{
+		{LpIndex: 0, CoreId: 0, RootVpIndex: 0},
+		{LpIndex: 16, CoreId: 0, RootVpIndex: 1},
+		{LpIndex: 8, CoreId: 4, RootVpIndex: -1},
+		{LpIndex: 24, CoreId: 4, RootVpIndex: -1},
+		{LpIndex: 9, CoreId: 5, RootVpIndex: -1},
+		{LpIndex: 25, CoreId: 5, RootVpIndex: -1},
+		{LpIndex: 10, CoreId: 6, NodeNumber: 1, RootVpIndex: -1},
+		{LpIndex: 26, CoreId: 6, NodeNumber: 1, RootVpIndex: -1},
+	}}
+	for _, groups := range [][][]uint32{
+		{{8, 24}}, {{8, 24}, {8, 24}}, {{24, 8}, {24, 8}}, {{8, 24}, {9, 25}},
+	} {
+		if err := validateBenchmarkCPUs(topology, groups, false, 1); err != nil {
+			t.Fatalf("valid one-VP placement %v rejected: %v", groups, err)
+		}
+	}
+	for _, groups := range [][][]uint32{
+		{{8}, {8}}, {{8, 24}, {8, 9}}, {{8, 24}, {10, 26}},
+		{{8, 24}, {8, 99}}, {{0, 16}, {0, 16}}, {{8, 24}, {}},
+	} {
+		if err := validateBenchmarkCPUs(topology, groups, false, 1); err == nil {
+			t.Fatalf("invalid one-VP placement %v accepted", groups)
+		}
 	}
 }

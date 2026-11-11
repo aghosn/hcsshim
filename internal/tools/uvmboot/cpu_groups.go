@@ -230,9 +230,9 @@ func hostProcessorTopology(ctx context.Context) (*hcsschema.ProcessorTopology, e
 	return &topology, nil
 }
 
-func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uint32, noSMT bool) error {
-	if topology == nil || len(groups) < 1 || len(groups) > 2 {
-		return errors.New("benchmark requires host topology and one or two CPU affinity pairs")
+func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uint32, noSMT bool, processors uint64) error {
+	if topology == nil || len(groups) < 1 || len(groups) > 2 || (processors != 1 && processors != 2) {
+		return errors.New("benchmark requires host topology, one or two VM affinities, and one or two VPs per VM")
 	}
 	byLP := map[uint32]hcsschema.LogicalProcessor{}
 	coreLPs := map[string][]uint32{}
@@ -267,9 +267,12 @@ func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uin
 	for i, group := range groups {
 		_, key, err := canonicalLPs(group)
 		if err != nil || len(group) != 2 {
-			return fmt.Errorf("benchmark VM %d requires exactly two distinct logical processors", i)
+			return fmt.Errorf("benchmark VM %d requires exactly two distinct logical processors, including complete SMT pairs when SMT is enabled", i)
 		}
 		first, foundFirst := byLP[group[0]]
+		if !foundFirst {
+			return fmt.Errorf("benchmark affinity %s includes a nonexistent LP", key)
+		}
 		second, foundSecond := byLP[group[1]]
 		if !foundFirst || !foundSecond {
 			return fmt.Errorf("benchmark affinity %s includes a nonexistent LP", key)

@@ -36,8 +36,8 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	if directory == "" {
 		return nil, nil
 	}
-	if c.GlobalUint64(cpusArgName) != 1 {
-		return nil, errors.New("unikraft diode currently requires --cpus=1 for one-to-one workload/diode VP pairing; multicore is not implemented")
+	if c.GlobalUint64(cpusArgName) != 2 {
+		return nil, errors.New("unikraft pair requires --cpus=2 for the Linux workload; the Unikraft diode remains one VP")
 	}
 	if !useGCS || !c.Bool(securityHardwareFlag) || !c.Bool(sharedMemoryTwoUVMArgName) ||
 		c.GlobalInt(countArgName) != 2 || c.GlobalInt(parallelArgName) != 2 ||

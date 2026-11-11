@@ -34,6 +34,7 @@ const (
 	storageBenchmarkLatencyArgName    = "storage-benchmark-latency"
 	storageBenchmarkThroughputArgName = "storage-benchmark-throughput"
 	storageBenchmarkIdleArgName       = "storage-benchmark-idle"
+	storageBenchmarkSingleVPArgName   = "storage-benchmark-single-vp"
 )
 
 type storageBenchmarkContent struct {
@@ -111,7 +112,8 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 			storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
 			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkTestArgName, storageBenchmarkStatsArgName,
-			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName} {
+			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName,
+			storageBenchmarkSingleVPArgName} {
 			if c.IsSet(name) {
 				return errors.New("storage benchmark options require --storage-benchmark-script")
 			}
@@ -120,12 +122,10 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 	}
 	count := c.GlobalInt(countArgName)
 	unikraft := c.String(unikraftPackageArgName) != ""
-	cpus := c.GlobalUint64(cpusArgName)
-	if !useGCS || !c.Bool(securityHardwareFlag) || (cpus != 1 && cpus != 2) ||
-		(count == 2 && ((unikraft && cpus != 1) || (!unikraft && cpus != 2))) ||
+	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != 2 ||
 		count != c.GlobalInt(parallelArgName) || len(groups) != count ||
 		(count != 1 && count != 2) {
-		return errors.New("storage benchmark requires SNP, GCS, explicit CPU affinity, two VPs for Linux pairs or one VP for Unikraft pairs")
+		return errors.New("storage benchmark requires SNP, GCS, explicit CPU affinity and two workload VPs")
 	}
 	if c.String(networkBenchmarkScriptArgName) != "" || c.Bool(siblingInteractiveArgName) ||
 		c.Bool(siblingStorageRootArgName) || c.String(siblingOpenShellBundleArgName) != "" ||
@@ -295,7 +295,7 @@ func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.Utilit
 			return "", noCleanup, fmt.Errorf("share storage benchmark input/results: %w", err)
 		}
 	}
-	command := storageBenchmarkPreflight(c.GlobalUint64(cpusArgName), c.String(storageBenchmarkIdleArgName))
+	command := storageBenchmarkPreflight(benchmarkVMProcessors(c, vm.ID()), c.String(storageBenchmarkIdleArgName))
 	if plan == nil {
 		attachment, err := attachSiblingStorageDisk(ctx, vm, siblingStorageDisk{
 			HostPath: c.String(storageBenchmarkDiskArgName), Access: "read-write",

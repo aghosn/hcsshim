@@ -31,8 +31,9 @@ const (
 	networkBenchmarkSingleVPArgName = "network-benchmark-single-vp"
 )
 
-func networkBenchmarkProcessors(c *cli.Context) uint64 {
-	if c.Bool(networkBenchmarkSingleVPArgName) {
+func benchmarkVMProcessors(c *cli.Context, id string) uint64 {
+	if id == "uvmboot-0" && c.GlobalInt(countArgName) == 2 &&
+		(c.Bool(networkBenchmarkSingleVPArgName) || c.Bool(storageBenchmarkSingleVPArgName)) {
 		return 1
 	}
 	return 2
@@ -108,11 +109,10 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.Duration(networkBenchmarkTimeoutArgName) <= 0 {
 		return errors.New("network benchmark timeout must be positive")
 	}
-	processors := networkBenchmarkProcessors(c)
-	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != processors ||
+	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != 2 ||
 		c.GlobalInt(countArgName) != c.GlobalInt(parallelArgName) ||
 		len(groups) != c.GlobalInt(countArgName) {
-		return fmt.Errorf("network benchmark requires SNP, GCS, --cpus %d and one explicit affinity pair per concurrently launched VM", processors)
+		return errors.New("network benchmark requires SNP, GCS, --cpus 2 for the workload and one explicit affinity pair per concurrently launched VM")
 	}
 	baseline := c.IsSet(baselineNICArgName) && c.GlobalInt(countArgName) == 1
 	sibling := c.IsSet(siblingBusGuestModuleArgName) && c.Bool(sharedMemoryTwoUVMArgName) &&
@@ -207,7 +207,7 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 			`echo 'network_benchmark: transport=host-hvsock-relay interface=tun0 cid=2 mtu=1500'; `
 	}
 	script := "/run/network-benchmark/" + filepath.Base(c.String(networkBenchmarkScriptArgName))
-	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +
+	return networkBenchmarkPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		networkBenchmarkDiagnosticStage(script) +

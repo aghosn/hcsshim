@@ -191,7 +191,7 @@ func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := benchmarkTestContext(t, append(append([]string{}, base...), tc.flags...)...)
-			for key, value := range map[string]string{cpusArgName: "1", countArgName: tc.count, parallelArgName: tc.count} {
+			for key, value := range map[string]string{cpusArgName: "2", countArgName: tc.count, parallelArgName: tc.count} {
 				if err := c.GlobalSet(key, value); err != nil {
 					t.Fatal(err)
 				}
@@ -202,6 +202,25 @@ func TestNetworkBenchmarkSingleVPComparison(t *testing.T) {
 			}
 			if err := validateNetworkBenchmark(c, groups); (err != nil) != tc.wantError {
 				t.Fatalf("validation=%v, wantError=%v", err, tc.wantError)
+			}
+			workloadID := "uvmboot-0"
+			if tc.count == "2" {
+				workloadID = "uvmboot-1"
+				if got := benchmarkVMProcessors(c, "uvmboot-0"); got != 1 {
+					t.Fatalf("SingleVP diode got %d VPs", got)
+				}
+			}
+			if got := benchmarkVMProcessors(c, workloadID); got != 2 {
+				t.Fatalf("workload got %d VPs; must always have two", got)
+			}
+			if command := networkBenchmarkClient(c, "workload"); !strings.Contains(command, "vcpus=2") {
+				t.Fatalf("SingleVP changed workload preflight: %s", command)
+			}
+			if err := c.GlobalSet(cpusArgName, "1"); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateNetworkBenchmark(c, groups); err == nil {
+				t.Fatal("accepted a one-VP workload")
 			}
 		})
 	}

@@ -99,7 +99,7 @@ func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.
 		"--shared-memory-size", "33554432", "--sibling-bus-guest-module", filepath.Join(directory, "sibling_bus.ko"),
 		"--unikraft-diode-package", directory, "--storage-benchmark-script", filepath.Join(directory, "fio.sh"),
 		"--storage-benchmark-idle", "poll")
-	for flag, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for flag, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.Parent().Set(flag, value); err != nil {
 			t.Fatal(err)
 		}
@@ -321,7 +321,7 @@ func TestUnikraftRootOnlyPairUsesStaticManifestAndSharedWorkload(t *testing.T) {
 		"--"+sharedMemoryTwoUVMArgName, "--"+sharedMemorySizeArgName, "33554432",
 		"--"+siblingBusGuestModuleArgName, modulePath, "--"+siblingInteractiveArgName,
 		"--"+siblingStorageRootArgName, "--"+siblingStorageBackendsArgName, filepath.Join(directory, "storage.json"))
-	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for name, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.GlobalSet(name, value); err != nil {
 			t.Fatal(err)
 		}
@@ -422,11 +422,11 @@ func TestUnikraftPairPreflight(t *testing.T) {
 		extra []string
 		error string
 	}{
-		{cpus: "1"},
-		{cpus: "1", extra: []string{"--" + sharedMemoryGuestModuleArgName, "marker.ko"}, error: "does not support"},
-		{cpus: "0", error: "one-to-one workload/diode VP pairing"},
-		{cpus: "2", error: "one-to-one workload/diode VP pairing"},
-		{cpus: "4", error: "one-to-one workload/diode VP pairing"},
+		{cpus: "2"},
+		{cpus: "2", extra: []string{"--" + sharedMemoryGuestModuleArgName, "marker.ko"}, error: "does not support"},
+		{cpus: "0", error: "Linux workload"},
+		{cpus: "1", error: "Linux workload"},
+		{cpus: "4", error: "Linux workload"},
 	} {
 		context := benchmarkTestContext(t, append(append([]string{}, args...), test.extra...)...)
 		if err := context.GlobalSet(cpusArgName, test.cpus); err != nil {
@@ -448,7 +448,7 @@ func TestUnikraftPairPreflight(t *testing.T) {
 		"--network-benchmark-script", filepath.Join(directory, "bench.sh"),
 		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-single-vp")
 	c := benchmarkTestContext(t, benchmarkArgs...)
-	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for name, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.GlobalSet(name, value); err != nil {
 			t.Fatal(err)
 		}
