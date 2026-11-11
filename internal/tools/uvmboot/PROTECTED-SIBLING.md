@@ -697,8 +697,10 @@ exercise an M06/M07 negative, mark that subcase unverified; do not add a proof
 engine, fakes, production seams or a third-VM harness.
 
 Filtering observations are not comprehensive network/DMA isolation or
-attestation evidence. Root-inaccessible pages cannot transparently replace
-host-consumed VMBus/GCS buffers; future GCS-over-this-backing is not implemented.
+attestation evidence. The combined profile relays workload GCS over the protected
+peer backing; diode host-facing GCS, direct-host Plan9 and diode/host disk I/O
+remain unchanged.
+Root-inaccessible pages cannot transparently replace host-consumed VMBus/GCS buffers.
 Save/restore, cloning, PHU/KSR, migration and arbitrary subranges are unsupported.
 
 On failure: preserve exact command/artifacts/IDs/status/prefix evidence, stop
