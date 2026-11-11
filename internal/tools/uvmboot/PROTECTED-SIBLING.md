@@ -23,14 +23,16 @@ changing a launcher check cannot make old guest artifacts compatible.
 
 ## 1. Match the entire stack before launching
 
-Use an elevated Windows SNP lab host and exactly two Linux VMs, each with a
-direct RP-attached dm-verity root. Supply the actual current IGVM-derived
+Use an elevated Windows SNP lab host and exactly two Linux VMs. The legacy
+profile gives each a direct RP-attached dm-verity root and direct host GCS.
+The combined profile below mediates only the workload root and GCS.
+Supply the actual current IGVM-derived
 `kernel.vmgs` and its matching `rootfs.vhd` in the boot directory. Record the
 IGVM/kernel build inputs and hash as well as the VMGS/rootfs hashes: the CLI
 consumes the VMGS, not a separate invented `--igvm` argument. Kernel, modules,
-rootfs, GCS and runtime tools must agree. Neither sibling-root/storage export,
-appliance/Unikraft, OpenShell, benchmarks, mapping-only/inventory, nor the old
-protected diagnostic/two-proof lifecycle is supported here.
+rootfs, GCS and runtime tools must agree. Arbitrary storage exports,
+appliance/Unikraft, owned startup, OpenShell, benchmarks, mapping-only/inventory,
+and the old protected diagnostic/two-proof lifecycle remain unsupported.
 
 Deploy the matched native product set through the established lab process:
 VID DLL **and** driver, worker memory/VMB components, common shared-region
@@ -122,8 +124,10 @@ and copied into `/run/dtb-exec` on both roles. From attach run
 `./collect-page-metadata.sh /run/page-metadata-results` manually.
 Results persist after shutdown; no automatic collection or generic share
 permission is enabled. Requested-share failure fails startup.
-Export with GCS mediation or Unikraft is deferred. ProtectedShared also remains
-unsupported with sibling-root storage mediation and containerd-owned startup.
+Export supports ordinary/protected standalone Linux relayed-GCS pairs too.
+Plan9 still connects directly to the host; this is debug/test-only, not a Plan9
+relay, attestation or host-I/O isolation guarantee. Owned startup, appliances,
+OpenShell and benchmarks remain unsupported.
 
 The matched diagnostic kernel enables page owner with `page_owner=on`.
 The collector preserves raw kpageflags, full available page_owner records/PFNs,
@@ -147,7 +151,57 @@ flags into a protected command. Protected-only masks/pause are rejected without
 the opt-in. The launcher creates a fresh section and real VID controller;
 `--shared-memory-name` is not accepted on this route.
 
-Expected source sequence (collect actual evidence; logs alone are not proof):
+### Combined workload root and GCS mediation
+
+From a freshly rebuilt, complete matched runtime package:
+
+```powershell
+.\run.ps1 diode start -ProtectedShared -MediateGCS
+.\run.ps1 attach diode
+.\run.ps1 attach workload
+.\run.ps1 diode stop
+```
+
+The public launcher selects exactly **32 MiB / 8192 pages**, the existing
+relay-root IGVM in `sibling-root.vmgs`, and an internally generated single
+`workload-root` read-only, non-removable LUN0 plan bound to the selected verified
+root input. Native flags are `--protected-shared-memory --sibling-storage-root
+--sibling-gcs-relay --sibling-storage-backends <plan>` with the normal SNP/GCS
+pair settings. Never enable ordinary proof/marker flags. Missing relay images
+or provider artifacts fail before native invocation; no installed ContainerPlat
+files change. Use only the canonical `dist\runtime` / `dist\runtime.zip` output,
+including matched `diode_storvsp.ko`, rootfs, GCS and relay-root images; consumers
+need no source checkout. Historical baseline packages are insufficient.
+
+The diode retains its direct RP root and host GCS. The workload has no direct
+RP root attachment; its owned bundle root copy is attached read-only to the
+diode and exported over sibling storage. Workload GCS control and stdio use
+CID4 through the diode, without direct fallback. Protection applies to peer
+backing, including storage transfer buffers; diode/host disk I/O and the
+provider's separate bounce buffers are unchanged.
+
+Diode Bootstrap receipt/lease validation precedes workload Import creation.
+Early foreground-owned diode bootstrap/provider/relay setup overlaps workload
+native startup without workload GCS/IP dependencies. ConfigureGCSRelay precedes
+workload Start; handshake plus Import receipt and explicit relay readiness
+precede network setup and required backing admission sealing.
+Shutdown joins workload users and terminates/waits for the workload before
+joining/quiescing the diode service and releasing the root attachment through
+live direct diode GCS. Only then can diode termination and participant-gated
+teardown/reclaim complete. Uncertain drain/release retains owners and the
+workload bundle root copy; it is not successful cleanup.
+
+Legacy public `-ProtectedShared` keeps its 2-MiB default and direct roots/GCS;
+raw legacy geometry bounds are unchanged. Root-only/relay-only protection,
+custom exports, owned/appliance/OpenShell/benchmark modes are unsupported.
+`-NoStorageMediation` is redundant for legacy and rejected with combined mode.
+Initial hardware acceptance uses **no optional partition masks or pause**;
+admission sealing still applies. Attach readiness does not establish completed
+seals. This profile's hardware acceptance remains pending; no optional-category
+effect or production isolation claim follows from source or fixtures.
+
+Expected legacy direct-root source sequence (the combined ordering is above;
+collect actual evidence, as logs alone are not proof):
 
 1. `uvmboot-0`, diode/A (log role `a`), is configured
    `ProtectedShared=true`, `HiddenFromGuest=false`,
@@ -513,7 +567,7 @@ stdin/cancellation Kill workers are joined; protected listeners, connections,
 frame readers, shell handlers and services must finish borrowing VM/process
 owners before release. This is the source contract, not observed shutdown proof.
 
-Cleanup closes/joins shells, sends BeginTeardown for the exact known initialized
+Legacy direct-root cleanup closes/joins shells, sends BeginTeardown for the exact known initialized
 prefix, attempts participant Remove, terminates VMs and observes exit/drain,
 joins services, and explicitly reclaims through native participant gating.
 Framed partial progress is consumed before errors and never replayed;
@@ -521,6 +575,8 @@ only recognized framed zero-progress reclaim contention is retried under the
 cleanup deadline. Whole initialized-backing zero verification happens **only
 after authorized full reclaim**, followed by resource/copy release. A cached
 Remove/Installed/InitializedPages property is not drain or release authority.
+Combined cleanup instead uses the workload-first dependency ordering above;
+it must not tear down backing while the workload/provider still depends on it.
 
 Unknown startup ownership, malformed progress, incomplete teardown/reclaim,
 unjoined borrowers or failed scrub verification must remain errors. No
