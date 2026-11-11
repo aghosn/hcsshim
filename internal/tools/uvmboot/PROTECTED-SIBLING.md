@@ -162,15 +162,17 @@ From a freshly rebuilt, complete matched runtime package:
 .\run.ps1 diode stop
 ```
 
-The public launcher selects exactly **32 MiB / 8192 pages**, the existing
-relay-root IGVM in `sibling-root.vmgs`, and an internally generated single
+The public launcher selects exactly **32 MiB / 8192 pages**, the
+new `hcs-shmem-snp-ahv-gcs-relay-root-idle-{halt,poll}.igvm` workload payload
+in `sibling-root.vmgs`, and an internally generated single
 `workload-root` read-only, non-removable LUN0 plan bound to the selected verified
 root input. Native flags are `--protected-shared-memory --sibling-storage-root
 --sibling-gcs-relay --sibling-storage-backends <plan>` with the normal SNP/GCS
 pair settings. Never enable ordinary proof/marker flags. Missing relay images
 or provider artifacts fail before native invocation; no installed ContainerPlat
 files change. Use only the canonical `dist\runtime` / `dist\runtime.zip` output,
-including matched `diode_storvsp.ko`, rootfs, GCS and relay-root images; consumers
+including matched `diode_storvsp.ko`, rootfs, GCS, AHV tool/hook and new
+attestation relay-root images; consumers
 need no source checkout. Historical baseline packages are insufficient.
 
 The diode retains its direct RP root and host GCS. The workload has no direct
@@ -185,11 +187,55 @@ Early foreground-owned diode bootstrap/provider/relay setup overlaps workload
 native startup without workload GCS/IP dependencies. ConfigureGCSRelay precedes
 workload Start; handshake plus Import receipt and explicit relay readiness
 precede network setup and required backing admission sealing.
+After diode tool staging and BEFORE workload Start, the pair creates a separate
+foreground `/run/dtb-exec/ahv-guest-ctl boot-server` through its owned service
+list, not behind the relay's terminal `exec /bin/gcs`. Process creation is not
+socket readiness: bounded transient CID4 setup retries may overlap workload
+native boot. No peer/GCS readiness wait precedes workload Start.
+
+Only this combined protected workload image carries measured `AHV_BOOT_ATTEST=1`.
+After read-only dm-verity root mount, its conditional `/startup.sh` hook invokes
+the root-embedded `/usr/bin/ahv-guest-ctl boot-client` before the exact original
+`/init`/GCS launch suffix and deny-policy flags. `/init` and runc are preserved.
+There is no new public switch, post-GCS client delivery, new initramfs or kernel
+device gate. Early device discovery is allowed. AF_VSOCK port 40500 connects
+workload CID3 to diode CID4 only, never RP CID2 or IP fallback.
+
+One fresh nonce and one monotonic **300-second** budget, starting before entropy,
+cover collection/transfer/publication. The diode freezes all deduplicated current
+ProtectedShared peers across the complete SELF inventory: any Pending/Installed/
+Removing registration includes a peer; only all-Removed history is excluded.
+Require at least one peer and every report; no first-match, GPA-equality or
+single-backing selection. Missing/bad/late evidence fails boot before original
+init/GCS, without a partial success marker or recovery shell. Exact AHVF bytes
+and UNVERIFIED metadata publish atomically/freshly at `/ahv-attestation/current`
+on workload-private 0700, 72-MiB nodev/nosuid/noexec tmpfs, surviving later
+`/init` and its `/run`/`/tmp` mounts. Stale current evidence is never overwritten.
+Structure/nonce/subject consistency is not signature, attachment-hash, trusted
+identity or policy verification; no SNP evidence operation is added. Sequential
+reports are not an atomic snapshot or final seal/device-state assertion.
+
+The selected workload uses a validated seven-minute per-call native/GCS timeout,
+sharing the ordinary `UtilityVM.Start` core. Combined setup gets ten minutes.
+Diode/other Start callers retain the existing default (normally two minutes),
+legacy pair setup five minutes, and seal/cleanup budgets remain independent.
+No process-global timeout is changed. Premature server exit cancels startup,
+including during workload GCS wait; ordinary successful collection does not
+terminate the daemon. Cancellation joins server creation/Wait borrowers.
 Shutdown joins workload users and terminates/waits for the workload before
 joining/quiescing the diode service and releasing the root attachment through
 live direct diode GCS. Only then can diode termination and participant-gated
 teardown/reclaim complete. Uncertain drain/release retains owners and the
 workload bundle root copy; it is not successful cleanup.
+
+Rebuild a fresh complete canonical package with version-3 root metadata binding
+tool/startup/root/image hashes; the root/hook/tool/images change measurements.
+Do not mix old payloads or treat historical package hashes as current evidence.
+External acceptance on matched SNP hardware must record pre-GCS publication,
+later artifact reads, root/GCS continuity, absent/failing server, incomplete
+batch, cancellation and full-budget behavior, plus confirmed borrower/provider/
+native drainage before backing release. Source and callback/stream fixtures
+cannot establish this. Other profiles still use manual AHV diagnostics.
 
 Legacy public `-ProtectedShared` keeps its 2-MiB default and direct roots/GCS;
 raw legacy geometry bounds are unchanged. Root-only/relay-only protection,
@@ -328,8 +374,9 @@ Protected staging checks copies into executable tmpfs: `dtb` is
 and `tcpdump`, `tc`, `ipt`, `covert`, `demo.sh` are staged aliases. The iptables
 multi-call syntax is `./ipt iptables ...`, not `./ipt ...`.
 `ahv-guest-ctl` is shared read-only and copied/chmodded into this tmpfs **only
-for the diode**; shares remain VM-owned through cleanup. Staging never invokes
-`prepare` or collection. Workload tools and readiness remain unchanged.
+for the diode**; shares remain VM-owned through cleanup. Staging itself never
+invokes `prepare` or collection. Combined mode then starts the owned boot-server;
+its workload boot-client is already in the verified root, not staged via GCS.
 
 In the **diode** shell, inspect the pre-NAT workload interface and rules:
 
@@ -528,8 +575,9 @@ Use the complete canonical companion runtime (`artifacts\runtime-inputs` ->
 `dist\runtime` / `dist\runtime.zip`) and matched HV/SK/VID/Linux artifacts.
 The existing source staging, static CLI builder and manifest packaging carry
 the tool; do not make a separate package or copy mismatched binaries into one.
-All compilation/tests for this AHV change are deferred to plan 000025 S6;
-all `C:\os\src` builds remain manual operator work.
+Manual diagnostic validation remains in plan 000025 S6; compilation/tests for
+the early protected boot integration are deferred to plan 000029 S5.
+All `C:\os\src` builds remain manual operator work.
 
 From the diode's `/run/dtb-exec`, invoke `./ahv-guest-ctl` with these forms
 (angle brackets are operator inputs, brackets denote optional arguments):
@@ -582,11 +630,12 @@ isolated verdict, whole-region coverage/exclusivity policy, forwarding gate or
 key release follows. Raw root-VTL0 WBCL is separate, unsigned and not an AHVF
 attachment; saving it does not authenticate it against TPM evidence.
 
-Only the diode issues AHV requests and owns their input/response memory and
-completion, including when the report describes the workload. Do not run AHV
-or a bootstrap report in the workload. Device presence in either guest and
-staging are not attestation success and allocate no AHV response slot. Explicit
-AHV failure is not an ordinary startup/networking gate.
+Only the diode issues AHV ioctl requests and owns their input/response memory and
+completion, including when the report describes the workload. The combined
+workload client only receives reports, never opens the AHV device. Device presence
+and staging are not attestation success and allocate no AHV response slot.
+Outside combined protected boot, manual AHV failure is not an ordinary
+startup/networking gate.
 
 Normal allocation stays lazy. Where approved diode seals prevent later response
 allocation/sharing/growth, use only the optional manual `prepare` in section 4's
@@ -604,10 +653,10 @@ Record actual observations separately from source expectations:
 
 | AHV ID (plan 000025) | Manual check and required evidence |
 | --- | --- |
-| M1 | Matched protected pair, cold workload SNP cache and no preceding workload AHV request: complete self/offline dump/explicit target flow. Record cold-cache evidence and root preparation of the selected workload, not just CLI success. Trace only diode-owned request/response buffers, access and completion; workload supplies none. Self discovery must not need acquisition of peer identity. |
+| M1 | Matched legacy direct-root protected pair, cold workload SNP cache and no preceding workload AHV request: complete self/offline dump/explicit target flow. Record cold-cache evidence and root preparation of the selected workload, not just CLI success. Trace only diode-owned request/response buffers, access and completion; workload supplies none. Self discovery must not need acquisition of peer identity. |
 | M2 | Safely exercise actual nonexistent/deleted targets, supported ways to reach unsupported subjects, large inventories/logs (including beyond the old slot), and allocation/preparation/native failures. Record errno, HV/outer/inner statuses, requester completion/resume and cleanup. Expect complete responses with bounded resize or explicit terminal limit/failure, no usable partial report or alternate-subject/legacy fallback. Do not add fault-injection seams; unsafe/unexercisable failures remain unverified. |
 | M3 | Verify diode-only delivery and no workload AHV allocation; record actual approved masks, ready identity, successful `0x200000` preparation before guarded resume, persistence after CLI exit and post-seal self/target reuse without sharing growth. Preserve failures rather than relaxing the policy. |
-| M4 | Matched current-ABI self works; ordinary and protected startup/networking require no AHV request or preparation. Where available, explicitly request AHV on an unsupported host and verify failure without fallback while ordinary networking remains operational. |
+| M4 | Matched current-ABI self works; ordinary and legacy direct-root protected startup/networking require no AHV request or preparation. Combined protected boot uses the mandatory early exchange above. Where available, explicitly request AHV on an unsupported host and verify failure without fallback while ordinary networking remains operational. |
 
 These are pending hardware checks, not claims that U1-U3 fixtures or source
 review establish firmware, cold-cache or sealing success. Preserve source/build/
@@ -884,7 +933,7 @@ passed when an unsafe/unavailable subcase remains unverified.
 | T3 | On the approved isolated target, induce one real pre-mutation root shortage before any page completes, only at a verified safe site. | Valid zero-prefix exact shortage causes one SELF policy invocation after full SVC/SK return; retry submits the original unfinished range. Only actual later SVC completion can yield a checked startup receipt. | Fault site/scope, status and zero prefix, returned-call/context observations, actual policy result, suffix range/lifetimes, native receipt and pool snapshots. | **PENDING** |
 | T4 | Induce shortage on a later page of one real four-page request, before that page gains a lifetime; retain prior real descriptors. | Earlier SPA/lifetime identities survive unchanged, lease initialization/aggregate prefix advance once, and only the unfinished zero-ID suffix is retried. Cleanup owns every initialized page. | Per-attempt ranges/counts, before/after descriptors and ledger, policy attempts, aggregate receipt and authorized teardown/reclaim evidence. | **PENDING** |
 | T5 | Source-review every classification/budget/framing branch. Safely exercise other statuses/operations, persistent root shortage with progress between refills, deposit failure and malformed framing only where an existing safe exercise permits. | No deposit for excluded statuses/operations, uncertainty or exhausted suffix. Maximum three policy invocations per original request; progress never resets budget. Policy failure/exhaustion preserves last actual SVC failure and aggregate prefix; malformed results retain sticky uncertainty/owners, never success or fallback. | Individual statuses/operations, attempts 1-3 and absence of a fourth policy call, policy result, SVC status/prefix, framing/uncertainty and retained-owner observations. Record each unsafe/unavailable subcase unverified. | **PENDING** |
-| T6 | Fresh matched HV/VID and complete verified runtime. Cold combined 32-MiB boot and separate legacy direct-root/GCS boot; normal stop and supported startup cancellation in separately observed runs, without optional masks/pause. | Workload root and GCS work through diode in combined mode; legacy remains direct. Real Bootstrap/Import receipts, required backing admission sealing and native release/scrub are correct, or uncertainty remains explicit with owners retained. No ordinary fallback or reduced geometry. AHV requests/tools stay diode-only. | Section 2's `.\run.ps1 diode start -ProtectedShared -MediateGCS`, separate attach consoles and `diode stop`; separate `diode start -ProtectedShared`/stop and supported cancellation commands actually used. Preserve root/GCS readiness, receipts, run/VM IDs, refill traces/ETL, native cleanup/release and exact deployed hashes. | **PENDING** |
+| T6 | Fresh matched HV/VID and complete verified runtime. Cold combined 32-MiB boot and separate legacy direct-root/GCS boot; normal stop and supported startup cancellation in separately observed runs, without optional masks/pause. | Workload root and GCS work through diode in combined mode; legacy remains direct. Real Bootstrap/Import receipts, required backing admission sealing and native release/scrub are correct, or uncertainty remains explicit with owners retained. No ordinary fallback or reduced geometry. AHV ioctl collection stays diode-only; the root-embedded workload client receives its early batch before GCS. | Section 2's `.\run.ps1 diode start -ProtectedShared -MediateGCS`, separate attach consoles and `diode stop`; separate `diode start -ProtectedShared`/stop and supported cancellation commands actually used. Preserve early batch/output, root/GCS readiness, receipts, run/VM IDs, refill traces/ETL, native cleanup/release and exact deployed hashes. | **PENDING** |
 
 A no-shortage boot does not prove recovery; a deposit does not prove Initialize.
 Preserve failures and remaining coverage gaps for S4 rather than adjusting
