@@ -562,13 +562,18 @@ full-width decimal or `0x` hex; do not truncate them. A peer-table index, vSock
 CID or VM GUID is not a numeric partition ID. TARGET rejects SELF/NONE sentinels.
 The selector supports live root-direct VM subjects, not root-as-third-party or
 nested targeting; sharing is not an authorization condition on this prototype.
-The dump shows protected-peer candidates, not an automatic selection. Correlate
-the known link's subject-local GPA with backing `LifetimeId`, lifecycle and
-per-registration state/permissions; retain aliases and removed/historical
-registrations, including historical-only subject participation. `LifetimeId`
-names a backing-page lifetime, not a whole group/section. Peer-local GPAs belong
-to that peer and need not equal diode GPAs. A valid empty candidate set is not
-a malformed dump and must not trigger a fallback.
+The dump shows each protected peer once under `not yet attached`, `attached`,
+or `removed`, not an automatic selection. Any Installed/Removing registration
+places it in `attached`; otherwise Pending takes precedence over Removed
+history. Subject and communication-only IDs are excluded. Empty groups show
+`(none)` and must not trigger a fallback.
+
+The groups summarize retained peer registration states, not verified current
+whole-link coverage or identity. The report still retains all per-page
+lifetimes, aliases and removed/historical registrations, including historical-only
+subject participation; those details are not printed by `dump-peers`.
+`LifetimeId` names a backing-page lifetime, not a whole group/section.
+Registration-local peer GPAs need not equal diode GPAs.
 
 All claims, nonce equality and target-ID equality are **UNVERIFIED structural
 diagnostics**, not signature/attachment-hash/expected-identity verification.
