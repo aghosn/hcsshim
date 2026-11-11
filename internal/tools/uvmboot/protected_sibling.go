@@ -26,9 +26,11 @@ import (
 )
 
 const (
-	protectedSetupBudget   = 5 * time.Minute
-	protectedCleanupBudget = 2 * time.Minute
-	protectedCombinedBytes = 32 * 1024 * 1024
+	protectedSetupBudget         = 5 * time.Minute
+	protectedCombinedSetupBudget = 10 * time.Minute
+	protectedWorkloadGCSBudget    = 7 * time.Minute
+	protectedCleanupBudget       = 2 * time.Minute
+	protectedCombinedBytes       = 32 * 1024 * 1024
 )
 
 type protectedSiblingProfile uint8
@@ -54,12 +56,13 @@ type protectedSiblingVM struct {
 	bundleOwned bool
 }
 
-// protectedSiblingService retains the process owner even if bounded cleanup
-// cannot observe its exit. done has one buffered result, published after Wait
-// releases its GCS process/streams. Only the pair consumes that result.
+// protectedSiblingService retains even a failed creation attempt. done closes
+// only after creation and any successful-start Wait have joined all borrowers.
+// A failed creation or unobserved exit never authorizes backing/root release.
 type protectedSiblingService struct {
 	process *cmd.Cmd
-	done    chan error
+	done    chan struct{}
+	err     error
 }
 
 // protectedSiblingPair is the sole serial owner of the two attempts, backing,
@@ -86,6 +89,24 @@ type protectedSiblingPair struct {
 	seals       [2]protectedPartitionSeal
 	// stop cancels forward work only; mediated dependencies drain separately.
 	mediated *protectedSiblingDependencies
+}
+
+// setupBudget selects runProtectedSibling's outer startup allowance; legacy
+// profiles and the independent partition-seal budget keep their old default.
+func (p *protectedSiblingPair) setupBudget() time.Duration {
+	if p.profile == protectedSiblingMediatedRoot {
+		return protectedCombinedSetupBudget
+	}
+	return protectedSetupBudget
+}
+
+// gcsTimeout selects runProtectedSibling's early-attesting workload override.
+// Zero means use UtilityVM.Start unchanged, including its process default.
+func (p *protectedSiblingPair) gcsTimeout(role string) time.Duration {
+	if p.profile == protectedSiblingMediatedRoot && role == workloadRole {
+		return protectedWorkloadGCSBudget
+	}
+	return 0
 }
 
 // protectedPartitionSeal is serial-owner evidence, not native partition state.
@@ -346,7 +367,10 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 // workload's relay, and exports its owned bundle root from the diode. Early
 // diode services overlap workload native Start/GCS handshake; both the actual
 // Import receipt and explicit relay readiness precede networking and seals.
-// Tools/shares are staged once per role, with AHV tooling only on the diode.
+// Tools/shares are staged once per role; only the diode receives the host-staged
+// AHV collector. Its pair-owned boot-server starts before workload Start and
+// waits for CID4 independently. The verified workload root already contains the
+// early client, which must publish its complete batch before original init/GCS.
 // Forward cancellation preserves dependencies through workload termination,
 // relay/provider drainage and root unplug; the workload bundle survives until
 // that attachment is released. Only then may native backing reclaim and owner
@@ -523,7 +547,7 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		endpoint.SharedMemorySectionName = p.memory.hcsName
 		v.options.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{endpoint}
 	}
-	setupCtx, stopSetup := context.WithTimeout(ctx, protectedSetupBudget)
+	setupCtx, stopSetup := context.WithTimeout(ctx, p.setupBudget())
 	defer stopSetup()
 	if profile == protectedSiblingMediatedRoot {
 		if err := p.bootstrapMediated(setupCtx, c, rootPlan); err != nil {
@@ -680,13 +704,19 @@ func (p *protectedSiblingPair) startCreated(ctx context.Context, v *protectedSib
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := v.vm.Start(ctx); err != nil {
+	var startErr error
+	if connectionTimeout := p.gcsTimeout(v.role); connectionTimeout != 0 {
+		startErr = v.vm.StartWithGCSConnectionTimeout(ctx, connectionTimeout)
+	} else {
+		startErr = v.vm.Start(ctx)
+	}
+	if startErr != nil {
 		p.memory.unknown = true
 		// Native failure cleanup may already have destroyed the observable
 		// owner. Preserve any structurally valid initialization history for
 		// teardown, but never clear uncertainty or authorize reclaim from it.
 		p.observeFailedStartup(v)
-		return fmt.Errorf("protected %s start (native progress uncertain): %w", v.options.ID, err)
+		return fmt.Errorf("protected %s start (native progress uncertain): %w", v.options.ID, startErr)
 	}
 	v.started = true
 	p.watch(v)
@@ -730,6 +760,11 @@ func (p *protectedSiblingPair) bootstrapMediated(ctx context.Context, c *cli.Con
 		attach: func(ctx context.Context) error { return p.prepareMediatedRoot(ctx, c, plan) },
 		// stageDiode runs once, before the early service can use its tools.
 		stageDiode: func(ctx context.Context) error { return stageProtectedSiblingTools(ctx, c, diode) },
+		// startServer creates a separate foreground owner, never a peer/socket
+		// readiness wait or a command hidden behind the relay's terminal exec.
+		startServer: func(context.Context) error {
+			return p.startService(diode, "exec /run/dtb-exec/ahv-guest-ctl boot-server")
+		},
 		// startDependencies creates the owned foreground service without peer waits.
 		startDependencies: func(ctx context.Context) error { return p.mediated.start(ctx) },
 		// startWorkload allows native offers while the diode service awaits its peer.
@@ -859,7 +894,8 @@ func protectedSiblingGuest(ctx context.Context, v *protectedSiblingVM, command s
 // stageProtectedSiblingTools borrows existing merged artifacts through file
 // shares and checks copying/chmod into executable tmpfs. Missing demo/filter
 // tools fail instead of silently degrading the interactive experiment. The AHV
-// CLI is delivered only to the diode; staging never prepares or collects evidence.
+// collector is delivered only to the diode; staging itself never collects.
+// The workload boot client is already in its verified root, not delivered here.
 // Shares stay VM-owned; no independent boot stack or guest harness is created.
 func stageProtectedSiblingTools(ctx context.Context, c *cli.Context, v *protectedSiblingVM) error {
 	module := c.String(siblingBusGuestModuleArgName)
@@ -889,7 +925,7 @@ type protectedSiblingTool struct {
 }
 
 // protectedSiblingToolArtifacts is the shared staging contract for both
-// profiles. Only the diode receives the explicit-use AHV CLI.
+// profiles. Only the diode receives the host-staged AHV collector/server CLI.
 func protectedSiblingToolArtifacts(role string) []protectedSiblingTool {
 	artifacts := []protectedSiblingTool{
 		{"diode_tcpbulk", "/run/diode-tcpbulk", "dtb"},
@@ -1004,27 +1040,60 @@ func (p *protectedSiblingPair) checkSockets(ctx context.Context) error {
 // startService gives a long-lived guest server the pair's lifetime context,
 // separate from bounded setup. cleanup observes Wait within its own deadline,
 // retaining the process/owner if unavailable; any premature exit cancels the
-// experiment. Readiness is independently checked in the guest, never inferred
-// from successful GCS process creation. service.done is published only after
-// command-owned cancellation/stdio callbacks and Process.Close have completed;
+// experiment. Creation is not socket readiness: the boot-server may still await
+// the peer while workload native boot proceeds; root/relay readiness is separate.
+// service.done is published only after creation and, on success, command-owned
+// cancellation/stdio callbacks and Process.Close have completed;
 // an in-flight native/GCS call can delay it beyond the cleanup budget.
 func (p *protectedSiblingPair) startService(v *protectedSiblingVM, command string) error {
 	process := cmd.CommandContext(p.ctx, v.vm, "sh", "-c", command)
 	process.JoinBackgroundOperations = true
 	process.CopyAfterExitTimeout = 5 * time.Second
-	if err := process.Start(); err != nil {
-		return err
+	process.Stdout, process.Stderr = os.Stdout, os.Stderr
+	service := &protectedSiblingService{process: process, done: make(chan struct{})}
+	return p.startOwnedService(service, v.options.ID, command, protectedSiblingDependencyOps{
+		// start creates only the process; the foreground server owns CID waits.
+		start: func(context.Context) error { return process.Start() },
+		// wait joins streams/cancellation and separately reports observed exit.
+		wait: func() (bool, error) {
+			err := process.Wait()
+			return process.ExitState.ExitCode() != -1, err
+		},
+	})
+}
+
+// startOwnedService registers the borrower before synchronous creation for
+// startService. The per-instance start/wait callbacks share the dependency
+// fixture's ownership contract; neither creation nor joined Wait proves exit.
+// No fallible registration follows successful creation. Failure retains the
+// attempt and cancels forward startup, including a pending workload GCS wait.
+func (p *protectedSiblingPair) startOwnedService(service *protectedSiblingService, vmID, command string,
+	ops protectedSiblingDependencyOps) error {
+	if err := p.ctx.Err(); err != nil {
+		return context.Cause(p.ctx)
 	}
-	service := &protectedSiblingService{process: process, done: make(chan error, 1)}
 	p.services = append(p.services, service)
+	if err := ops.start(p.ctx); err != nil {
+		service.err = fmt.Errorf("protected service on %s creation outcome uncertain: %w", vmID, err)
+		close(service.done)
+		p.stop(service.err)
+		return service.err
+	}
+	// The owner is already registered if cancellation/exit races this launch.
 	go func() {
-		err := process.Wait()
-		if p.ctx.Err() == nil {
-			p.stop(errors.Join(fmt.Errorf("protected service on %s exited: %s", v.options.ID, command), err))
+		exited, err := ops.wait()
+		if !exited {
+			err = errors.Join(err, errors.New("protected service exit unobserved"))
 		}
-		service.done <- err
+		if p.ctx.Err() == nil {
+			p.stop(errors.Join(fmt.Errorf("protected service on %s exited: %s", vmID, command), err))
+		} else if exited {
+			err = protectedSiblingStopError(err)
+		}
+		service.err = err
+		close(service.done)
 	}()
-	return nil
+	return context.Cause(p.ctx)
 }
 
 // interactive serves the existing attach/stop protocol through a pair-owned
@@ -1259,7 +1328,9 @@ func (p *protectedSiblingPair) joinServices(ctx context.Context) error {
 	for _, service := range p.services {
 		select {
 		case <-service.done:
-			// Forward cancellation intentionally stops these servers.
+			// Expected nonzero stop is normalized only after confirmed exit.
+			// Creation uncertainty and joined transport/stream errors remain.
+			result = errors.Join(result, service.err)
 		case <-ctx.Done():
 			result = errors.Join(result, errors.New("protected guest service exit unobserved"), ctx.Err())
 		}

@@ -146,8 +146,9 @@ func newProtectedDependencyFixture(t *testing.T) *protectedDependencyFixture {
 		f.ready.release()
 		f.waitReturn.release()
 		f.exit.release()
-		_ = f.owner.drain(context.Background(), true)
 		cancel(nil)
+		_ = f.pair.joinServices(context.Background())
+		_ = f.owner.drain(context.Background(), true)
 	})
 	return f
 }
@@ -651,6 +652,7 @@ func protectedBootstrapTestOps(call func(context.Context, string) error) protect
 	return protectedSiblingBootstrapOps{
 		bootstrap: step("bootstrap"), create: step("create"), configure: step("configure"),
 		attach: step("attach"), stageDiode: step("stage-diode"),
+		startServer: step("start-server"),
 		startDependencies: step("start-dependencies"), startWorkload: step("start-workload"),
 		ready: step("relay-ready"), stageWorkload: step("stage-workload"),
 	}
@@ -693,7 +695,7 @@ func TestProtectedCombinedBootstrapOverlap(t *testing.T) {
 	go func() { result <- protectedSiblingBootstrap(ctx, ops) }()
 	protectedDependencyAwait(t, entered)
 	f.ready.release()
-	want := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+	want := []string{"bootstrap", "create", "configure", "attach", "stage-diode", "start-server",
 		"start-dependencies", "start", "wait", "start-workload"}
 	if !reflect.DeepEqual(f.recorded(), want) {
 		t.Fatalf("incorrect native/configure/dependency order: %v", f.recorded())
@@ -717,7 +719,7 @@ func TestProtectedCombinedBootstrapOverlap(t *testing.T) {
 // readiness failures at every production callback boundary. No later tool/
 // readiness step may run after an error, including a failed workload Start.
 func TestProtectedCombinedBootstrapFailures(t *testing.T) {
-	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode", "start-server",
 		"start-dependencies", "start-workload", "relay-ready", "stage-workload"}
 	for i, failed := range steps {
 		// Each independent failure must leave exactly its attempted prefix.
@@ -746,7 +748,7 @@ func TestProtectedCombinedBootstrapFailures(t *testing.T) {
 // by an otherwise successful callback prevents every later boundary, including
 // tool/readiness steps, and final callback cancellation cannot report success.
 func TestProtectedCombinedBootstrapCancellation(t *testing.T) {
-	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+	steps := []string{"bootstrap", "create", "configure", "attach", "stage-diode", "start-server",
 		"start-dependencies", "start-workload", "relay-ready", "stage-workload"}
 	for i := -1; i < len(steps); i++ {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1036,6 +1038,277 @@ func TestProtectedRootAttachFailureRetention(t *testing.T) {
 			}
 		} else if err == nil || f.owner.root == nil || f.owner.rootReleased {
 			t.Fatal("unobservable attachment outcome allowed ownership release")
+		}
+	}
+}
+
+// startServer reuses this fixture's per-instance process callbacks at the real
+// pair service boundary. It models no VM/native receipt or socket readiness.
+func (f *protectedDependencyFixture) startServer() error {
+	return f.pair.startOwnedService(&protectedSiblingService{done: make(chan struct{})},
+		"diode fixture", "ahv-guest-ctl boot-server", f.owner.ops)
+}
+
+// TestProtectedBootServerOrdering checks T4's early boot barrier: a persistent
+// foreground server is owned before workload Start and remains live while GCS
+// is blocked. No socket/peer readiness is needed to permit native workload boot.
+func TestProtectedBootServerOrdering(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	workload := newProtectedDependencyBarrier()
+	t.Cleanup(workload.release)
+	entered := make(chan struct{})
+	// Observe the production ordering callbacks with the real service owner.
+	ops := protectedBootstrapTestOps(func(ctx context.Context, name string) error {
+		f.record(name)
+		switch name {
+		case "start-server":
+			if err := f.startServer(); err != nil {
+				return err
+			}
+			<-f.waitEntered
+		case "start-workload":
+			close(entered)
+			select {
+			case <-workload.ch:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+	result := make(chan error, 1)
+	// The production helper must progress despite the server's pending Wait.
+	go func() { result <- protectedSiblingBootstrap(f.pair.ctx, ops) }()
+	protectedDependencyAwait(t, entered)
+	want := []string{"bootstrap", "create", "configure", "attach", "stage-diode",
+		"start-server", "start", "wait", "start-dependencies", "start-workload"}
+	if !reflect.DeepEqual(f.recorded(), want) || len(f.pair.services) != 1 {
+		t.Fatalf("server not owned before workload boot: %v", f.recorded())
+	}
+	select {
+	case <-f.pair.services[0].done:
+		t.Fatal("server ended before the workload handshake")
+	default:
+	}
+	workload.release()
+	if err := protectedDependencyResult(t, result); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-f.pair.services[0].done:
+		t.Fatal("successful boot ended persistent server")
+	default:
+	}
+}
+
+// TestProtectedBootServerCreationFailure checks T4's pre-Start failure path.
+// Even partial process creation stays registered, prevents workload Start and
+// forbids root/backing release rather than mistaking a returned error for exit.
+func TestProtectedBootServerCreationFailure(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	failure := errors.New("partial server creation")
+	f.startErr = failure
+	// Drive the actual ordered server boundary, not a second bootstrap flow.
+	ops := protectedBootstrapTestOps(func(_ context.Context, name string) error {
+		if name == "start-server" {
+			return f.startServer()
+		}
+		if name == "start-workload" {
+			t.Error("workload started after server creation failure")
+		}
+		return nil
+	})
+	if err := protectedSiblingBootstrap(f.pair.ctx, ops); !errors.Is(err, failure) {
+		t.Fatalf("lost server creation failure: %v", err)
+	}
+	if len(f.pair.services) != 1 || !errors.Is(f.pair.joinServices(context.Background()), failure) {
+		t.Fatal("failed creation lost its registered owner or uncertainty")
+	}
+	safe, err := protectedSiblingDrain(context.Background(),
+		protectedDrainTestOps(f, f.pair.joinServices(context.Background()), false, true))
+	if safe || err == nil || f.owner.root == nil || f.owner.rootReleased {
+		t.Fatal("partial server creation authorized dependency/backing release")
+	}
+}
+
+// TestProtectedBootServerPrematureExit checks T4's pre-workload exit race:
+// even a clean server exit is a startup failure, not a readiness signal that
+// permits workload native boot or later staging.
+func TestProtectedBootServerPrematureExit(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	// Complete the real service watcher before the next ordering boundary.
+	ops := protectedBootstrapTestOps(func(_ context.Context, name string) error {
+		if name == "start-server" {
+			if err := f.startServer(); err != nil {
+				return err
+			}
+			f.exit.release()
+			<-f.pair.services[0].done
+		}
+		if name == "start-workload" || name == "start-dependencies" {
+			t.Error("startup continued after server exit")
+		}
+		return nil
+	})
+	if err := protectedSiblingBootstrap(f.pair.ctx, ops); err == nil ||
+		context.Cause(f.pair.ctx) == nil {
+		t.Fatal("premature server exit was mistaken for successful readiness")
+	}
+}
+
+// TestProtectedBootServerLossDuringGCS checks T4's pending-handshake paths:
+// premature exit and parent cancellation stop forward boot, skip later staging,
+// and leave root dependencies owned until workload drainage is confirmed.
+func TestProtectedBootServerLossDuringGCS(t *testing.T) {
+	for _, scenario := range []string{"exit", "cancel"} {
+		// Each case blocks only the workload GCS callback, not native authority.
+		t.Run(scenario, func(t *testing.T) {
+			f := newProtectedDependencyFixture(t)
+			failure := errors.New("server failed during collection")
+			f.exitErr = failure
+			entered := make(chan struct{})
+			// Bind real service ownership into the production bootstrap order.
+			ops := protectedBootstrapTestOps(func(ctx context.Context, name string) error {
+				switch name {
+				case "start-server":
+					return f.startServer()
+				case "start-workload":
+					close(entered)
+					<-ctx.Done()
+					return ctx.Err()
+				case "relay-ready", "stage-workload":
+					t.Error("server failure/cancellation permitted later startup")
+				}
+				return nil
+			})
+			result := make(chan error, 1)
+			// Keep the helper and all service callbacks joined by this fixture.
+			go func() { result <- protectedSiblingBootstrap(f.pair.ctx, ops) }()
+			protectedDependencyAwait(t, entered)
+			if scenario == "exit" {
+				f.exit.release()
+			} else {
+				f.pair.stop(context.Canceled)
+			}
+			if err := protectedDependencyResult(t, result); err == nil {
+				t.Fatal("pending GCS wait survived service loss/cancellation")
+			}
+			protectedDependencyAwait(t, f.pair.services[0].done)
+			if scenario == "exit" && !errors.Is(context.Cause(f.pair.ctx), failure) {
+				t.Fatal("premature server exit lost its failure cause")
+			}
+			if err := f.owner.drain(context.Background(), false); err == nil ||
+				f.owner.root == nil || f.owner.providerDrained {
+				t.Fatal("server loss released still-needed root dependencies")
+			}
+		})
+	}
+}
+
+// TestProtectedBootServerPartialCreationCancellation checks T4's registration
+// race: cancellation cannot forget a synchronous creation borrower, even before
+// its outcome is known. A cleanup join timeout must retain root/backing owners.
+func TestProtectedBootServerPartialCreationCancellation(t *testing.T) {
+	f := newProtectedDependencyFixture(t)
+	f.creation = newProtectedDependencyBarrier()
+	result := make(chan error, 1)
+	// The production service registers itself before entering this barrier.
+	go func() { result <- f.startServer() }()
+	protectedDependencyAwait(t, f.startEntered)
+	if len(f.pair.services) != 1 {
+		t.Fatal("creation began without a registered owner")
+	}
+	f.pair.stop(context.Canceled)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	joinErr := f.pair.joinServices(ctx)
+	if !errors.Is(joinErr, context.Canceled) {
+		t.Fatalf("blocked creation was not retained: %v", joinErr)
+	}
+	safe, err := protectedSiblingDrain(ctx, protectedDrainTestOps(f, joinErr, false, true))
+	if safe || err == nil || f.owner.root == nil || f.owner.providerDrained {
+		t.Fatal("unjoined creation authorized root/backing release")
+	}
+	f.creation.release()
+	if err := protectedDependencyResult(t, result); !errors.Is(err, context.Canceled) {
+		t.Fatalf("creation returned success after cancellation: %v", err)
+	}
+	if err := f.pair.joinServices(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProtectedBootServerJoinRetention checks T4's Wait/exit distinction:
+// a blocked join, unobserved exit or stream failure prevents safe dependency/
+// backing release. Expected cancellation alone is not evidence of drainage.
+func TestProtectedBootServerJoinRetention(t *testing.T) {
+	for _, scenario := range []string{"blocked-wait", "unknown-exit", "stream-failure"} {
+		// All cases use the service owner and existing barrier process fixture.
+		t.Run(scenario, func(t *testing.T) {
+			f := newProtectedDependencyFixture(t)
+			failure := errors.New("joined stream/exit failure")
+			switch scenario {
+			case "blocked-wait":
+				f.waitReturn = newProtectedDependencyBarrier()
+			case "unknown-exit":
+				f.exited = false
+			case "stream-failure":
+				f.exitErr = failure
+			}
+			if err := f.startServer(); err != nil {
+				t.Fatal(err)
+			}
+			protectedDependencyAwait(t, f.waitEntered)
+			f.pair.stop(context.Canceled)
+			ctx := context.Background()
+			if scenario == "blocked-wait" {
+				bounded, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = bounded
+			} else {
+				protectedDependencyAwait(t, f.pair.services[0].done)
+			}
+			joinErr := f.pair.joinServices(ctx)
+			if joinErr == nil {
+				t.Fatal("incomplete service drainage reported success")
+			}
+			drainOps := protectedDrainTestOps(f, joinErr, false, true)
+			// Even confirmed native workload drainage cannot supersede a
+			// service borrower. No relay was started in this service fixture.
+			drainOps.terminateWorkload = func(context.Context) (bool, error) {
+				f.record("terminate-workload")
+				return true, nil
+			}
+			safe, err := protectedSiblingDrain(ctx, drainOps)
+			if safe || err == nil || f.owner.root == nil || f.owner.providerDrained {
+				t.Fatal("incomplete service join authorized root/backing release")
+			}
+			f.waitReturn.release()
+			protectedDependencyAwait(t, f.pair.services[0].done)
+		})
+	}
+}
+
+// TestProtectedBootstrapBudgets checks T4's profile selection without waiting:
+// only the combined setup gets ten minutes and only its workload gets seven;
+// legacy and diode starts continue through the public default Start path.
+func TestProtectedBootstrapBudgets(t *testing.T) {
+	for _, profile := range []protectedSiblingProfile{protectedSiblingDirectRoot, protectedSiblingMediatedRoot} {
+		p := &protectedSiblingPair{profile: profile}
+		wantSetup := 5 * time.Minute
+		wantWorkload := time.Duration(0)
+		if profile == protectedSiblingMediatedRoot {
+			wantSetup, wantWorkload = 10*time.Minute, 7*time.Minute
+		}
+		before := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), p.setupBudget())
+		after := time.Now()
+		deadline, ok := ctx.Deadline()
+		cancel()
+		if !ok || deadline.Before(before.Add(wantSetup)) || deadline.After(after.Add(wantSetup)) ||
+			p.gcsTimeout(workloadRole) != wantWorkload || p.gcsTimeout(diodeRole) != 0 {
+			t.Fatalf("wrong profile startup budgets: profile=%d setup=%s workload=%s diode=%s",
+				profile, p.setupBudget(), p.gcsTimeout(workloadRole), p.gcsTimeout(diodeRole))
 		}
 	}
 }

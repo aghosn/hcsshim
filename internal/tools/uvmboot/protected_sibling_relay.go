@@ -217,19 +217,21 @@ func protectedSiblingQuiesceProvider(ctx context.Context, diode *protectedSiblin
 // tests exercise orchestration, never fabricate native authority.
 type protectedSiblingBootstrapOps struct {
 	bootstrap, create, configure, attach func(context.Context) error
-	stageDiode, startDependencies        func(context.Context) error
+	stageDiode, startServer              func(context.Context) error
+	startDependencies                   func(context.Context) error
 	startWorkload, ready, stageWorkload  func(context.Context) error
 }
 
 // protectedSiblingBootstrap enforces runProtectedSibling's combined cold-start
-// order. Creation/configuration precede workload Start; dependencies can await
+// order. Diode staging and server creation precede workload Start, without
+// equating creation with socket readiness. Root/relay dependencies can await
 // peer native-running while that Start completes GCS. Every callback is joined
 // before returning, except the explicitly owned asynchronous dependency starter.
 // Failure/cancellation prevents every later step and the caller's ready/seal phase.
 func protectedSiblingBootstrap(ctx context.Context, ops protectedSiblingBootstrapOps) error {
 	for _, step := range []func(context.Context) error{
 		ops.bootstrap, ops.create, ops.configure, ops.attach, ops.stageDiode,
-		ops.startDependencies, ops.startWorkload, ops.ready, ops.stageWorkload,
+		ops.startServer, ops.startDependencies, ops.startWorkload, ops.ready, ops.stageWorkload,
 	} {
 		if err := ctx.Err(); err != nil {
 			return context.Cause(ctx)

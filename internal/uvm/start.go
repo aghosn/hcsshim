@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
@@ -60,11 +61,33 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
+	return uvm.start(ctx, timeout.GCSConnectionTimeout)
+}
+
+// StartWithGCSConnectionTimeout starts through the same core as Start with a
+// positive per-call connection budget. It never changes the process default;
+// an earlier parent deadline or cancellation still wins.
+func (uvm *UtilityVM) StartWithGCSConnectionTimeout(ctx context.Context, connectionTimeout time.Duration) error {
+	if connectionTimeout <= 0 {
+		return fmt.Errorf("GCS connection timeout must be positive: %s", connectionTimeout)
+	}
+	return uvm.start(ctx, connectionTimeout)
+}
+
+// gcsBootstrapContext bounds Start's native/GCS bootstrap without detaching it
+// from its parent. Termination continues to use the original parent context.
+func gcsBootstrapContext(parent context.Context, connectionTimeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, connectionTimeout)
+}
+
+// start is the shared production core for Start and its per-call timeout entry.
+// Both paths retain identical entropy, output, termination and borrower joins.
+func (uvm *UtilityVM) start(ctx context.Context, connectionTimeout time.Duration) (err error) {
 	uvm.startInvoked.Store(true)
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
-	ctx, cancel := context.WithTimeout(pCtx, timeout.GCSConnectionTimeout)
-	log.G(ctx).Debugf("using gcs connection timeout: %s\n", timeout.GCSConnectionTimeout)
+	ctx, cancel := gcsBootstrapContext(pCtx, connectionTimeout)
+	log.G(ctx).Debugf("using gcs connection timeout: %s\n", connectionTimeout)
 
 	g, gctx := errgroup.WithContext(ctx)
 	defer func() {
@@ -162,8 +185,8 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			// use parent context, to prevent 2 minute timout (set above) from overridding terminate operation's
-			// timeout and erroring out prematurely
+			// Use the parent so the connection budget cannot shorten the
+			// termination operation's own timeout.
 			_ = uvm.hcsSystem.Terminate(pCtx)
 			_ = uvm.hcsSystem.WaitCtx(pCtx)
 		}
