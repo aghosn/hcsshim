@@ -260,7 +260,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 	}()
 
 	p.host = parent
-	if parent != nil && pair == nil {
+	if parent != nil && (pair == nil || pair.Diode == nil) {
 		cid := req.ID
 		if id, ok := s.Annotations[annotations.NcproxyContainerID]; ok {
 			cid = id

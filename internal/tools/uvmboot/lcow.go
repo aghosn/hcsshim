@@ -504,12 +504,14 @@ var lcowCommand = cli.Command{
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
 		}
-		if c.Bool(siblingGCSRelayArgName) && (!useGCS || !siblingInteractive ||
+		if c.Bool(siblingGCSRelayArgName) && (!useGCS ||
+			(!siblingInteractive && !(unikraft != nil && c.String(networkBenchmarkScriptArgName) != "")) ||
 			!c.Bool(sharedMemoryTwoUVMArgName) || !c.Bool(siblingStorageRootArgName) ||
 			c.String(siblingBusGuestModuleArgName) == "" ||
-			c.String(siblingOpenShellBundleArgName) != "" || c.String(networkBenchmarkScriptArgName) != "" ||
+			c.String(siblingOpenShellBundleArgName) != "" ||
+			(c.String(networkBenchmarkScriptArgName) != "" && unikraft == nil) ||
 			c.String(storageBenchmarkScriptArgName) != "") {
-			return fmt.Errorf("--%s requires an interactive sibling-root pair without other experiments", siblingGCSRelayArgName)
+			return fmt.Errorf("--%s requires an interactive sibling-root pair or a Unikraft network benchmark", siblingGCSRelayArgName)
 		}
 		for _, flag := range []struct {
 			name  string

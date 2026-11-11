@@ -33,7 +33,7 @@ type shellGuest struct {
 
 func pairShellGuests(pair *Pair) []shellGuest {
 	guests := []shellGuest{{"workload", pair.Workload}}
-	if !pair.unikraft {
+	if pair.Diode != nil && !pair.unikraft {
 		guests = append(guests, shellGuest{"diode", pair.Diode})
 	}
 	return guests

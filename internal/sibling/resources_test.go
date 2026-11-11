@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -190,6 +191,7 @@ func TestPairCPUGroupFailureRollsBackWithoutChangingOptions(t *testing.T) {
 			cancel()
 			return nil, failure
 		}
+
 		return query(ctx, id)
 	}
 	workload, diode := testOptions(), testOptions()
@@ -202,5 +204,88 @@ func TestPairCPUGroupFailureRollsBackWithoutChangingOptions(t *testing.T) {
 		events[3] != strings.Replace(events[0], "create:", "delete:", 1) ||
 		workload.CPUGroupID != "workload-base" || diode.CPUGroupID != "diode-base" {
 		t.Fatalf("partial groups or options escaped failed allocation: %v", events)
+	}
+}
+
+func TestResourceCPUGroupPriorities(t *testing.T) {
+	for _, standalone := range []bool{false, true} {
+		t.Run(fmt.Sprint(standalone), func(t *testing.T) {
+			config := testConfig()
+			config.VMResources = testResources()
+			if standalone {
+				config = testStandaloneConfig()
+			}
+			var events []string
+			ops, created := fakeResourceCPUGroupOperations(&events)
+			priorities := map[string]uint32{}
+			ops.SetPriority = func(_ context.Context, id string, priority uint32) error {
+				priorities[id] = priority
+				return nil
+			}
+			query := ops.Query
+			ops.Query = func(ctx context.Context, id string) (*hcsschema.CpuGroupConfig, error) {
+				result, err := query(ctx, id)
+				result.GroupProperties = []hcsschema.CpuGroupProperty{{
+					PropertyCode: hcsschema.CPUSchedulingPriorityProperty, PropertyValue: priorities[id],
+				}}
+				return result, err
+			}
+			var options []*uvm.OptionsLCOW
+			for i := range config.VMResources {
+				priority := uint32(0)
+				config.VMResources[i].CPUGroupLPs = []uint32{8, 24, 9, 25, 10, 26}
+				config.VMResources[i].CPUGroupPriority = &priority
+				options = append(options, testOptions())
+			}
+			groups, err := prepareResourceCPUGroups(context.Background(), config, options, ops)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer groups.Close(context.Background())
+			if len(created) != len(options) || len(groups.Reports) != len(options) ||
+				len(priorities) != len(options) {
+				t.Fatalf("explicit equal priorities did not create and verify independent groups: %+v", groups)
+			}
+			for i, option := range options {
+				if option.CPUGroupID != groups.IDs[i] || groups.Reports[i].SchedulingPriority != 0 {
+					t.Fatal("priority/group assignment mismatch")
+				}
+			}
+			if len(options) == 2 && options[0].CPUGroupID == options[1].CPUGroupID {
+				t.Fatal("explicit shared-pool priorities reused a single group")
+			}
+		})
+	}
+}
+
+func TestResourceCPUGroupPriorityValidation(t *testing.T) {
+	zero, max, invalid := uint32(0), cpugroup.MaxSchedulingPriority, cpugroup.MaxSchedulingPriority+1
+	for _, resources := range [][]VMResources{
+		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupPriority: &zero}},
+		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupLPs: []uint32{8, 24}, CPUGroupPriority: &invalid}},
+		{{ProcessorCount: 1, MemoryMB: 2048, CPUGroupLPs: []uint32{8, 24}, CPUGroupPriority: &max},
+			{ProcessorCount: 16, MemoryMB: 131072, CPUGroupLPs: []uint32{8, 24}}},
+	} {
+		if err := ValidateVMResources(resources); err == nil {
+			t.Fatalf("invalid priority configuration accepted: %+v", resources)
+		}
+	}
+}
+
+func TestResourceCPUGroupPriorityFailureRollsBack(t *testing.T) {
+	config := testStandaloneConfig()
+	priority := uint32(0)
+	config.VMResources[0].CPUGroupPriority = &priority
+	config.VMResources[0].CPUGroupLPs = []uint32{8, 24}
+	var events []string
+	ops, created := fakeResourceCPUGroupOperations(&events)
+	failure := errors.New("injected priority failure")
+	ops.SetPriority = func(context.Context, string, uint32) error { return failure }
+	options := testOptions()
+	options.CPUGroupID = "inherited"
+	groups, err := prepareResourceCPUGroups(context.Background(), config, []*uvm.OptionsLCOW{options}, ops)
+	if !errors.Is(err, failure) || groups != nil || len(created) != 0 ||
+		options.CPUGroupID != "inherited" || len(events) != 2 {
+		t.Fatalf("priority failure did not roll back: %+v %v %v", groups, err, events)
 	}
 }

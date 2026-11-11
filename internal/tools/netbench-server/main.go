@@ -32,9 +32,10 @@ import (
 var validID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,95}$`)
 
 const (
-	protocolVersion  = 3
-	maxTrialDuration = 10 * time.Minute
-	accessViolation  = "iperf-access-violation"
+	protocolVersion      = 4
+	defaultTrialDuration = 10 * time.Minute
+	maxTrialDuration     = 4 * time.Hour
+	accessViolation      = "iperf-access-violation"
 )
 
 type capturedOutput struct {
@@ -70,19 +71,19 @@ type listener struct {
 	err  error
 }
 
-func listenerArgs(bind string, port int, latency bool) []string {
+func listenerArgs(bind string, port int, latency bool, duration time.Duration) []string {
 	args := []string{"-s", "-B", bind, "-p", strconv.Itoa(port), "-e", "-f", "m", "--utc"}
 	if latency || runtime.GOOS == "windows" {
 		// On Windows, -i 1 also makes a 500 ms receive timeout fatal.
 		// Bound Windows bulk and RTT listeners by the trial deadline instead.
-		return append(args, "-t", strconv.Itoa(int(maxTrialDuration/time.Second)))
+		return append(args, "-t", strconv.Itoa(int(duration/time.Second)))
 	}
 	return append(args, "-i", "1")
 }
 
-func startListener(binary, bind string, port int, latency bool) (*listener, error) {
+func startListener(binary, bind string, port int, latency bool, duration time.Duration) (*listener, error) {
 	out := &capturedOutput{ready: make(chan struct{})}
-	cmd := exec.Command(binary, listenerArgs(bind, port, latency)...)
+	cmd := exec.Command(binary, listenerArgs(bind, port, latency, duration)...)
 	for _, env := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(env), "IPERF_") {
 			cmd.Env = append(cmd.Env, env)
@@ -145,6 +146,7 @@ type trialResult struct {
 	Failure             string    `json:"failure,omitempty"`
 	FailureKind         string    `json:"failure_kind,omitempty"`
 	Attempt             int       `json:"attempt,omitempty"`
+	TimeoutSeconds      int       `json:"timeout_seconds"`
 }
 
 type controller struct {
@@ -163,12 +165,14 @@ type controller struct {
 	primaryLatency bool
 	attempt        int
 	lastResult     *trialResult
+	duration       time.Duration
 }
 
 func (c *controller) finish(failure string) trialResult {
 	result := trialResult{ID: c.active, StartedUTC: c.started,
 		OS: runtime.GOOS, CPUs: runtime.NumCPU(), Failure: failure,
-		PrimaryLatency: c.primaryLatency, Attempt: c.attempt}
+		PrimaryLatency: c.primaryLatency, Attempt: c.attempt,
+		TimeoutSeconds: int(c.duration / time.Second)}
 	retryable := failure == ""
 	if runtime.GOOS != "windows" {
 		result.BulkIntervalSeconds = 1
@@ -269,6 +273,7 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ID             string `json:"id"`
 		PrimaryLatency bool   `json:"primary_latency"`
 		Retry          bool   `json:"retry"`
+		TimeoutSeconds int    `json:"timeout_seconds"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
 	decoder.DisallowUnknownFields()
@@ -281,6 +286,14 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unexpected request data", http.StatusBadRequest)
 		return
 	}
+	duration := defaultTrialDuration
+	if request.TimeoutSeconds < 0 || request.TimeoutSeconds > int(maxTrialDuration/time.Second) {
+		http.Error(w, "trial timeout must be at most the four-hour campaign limit", http.StatusBadRequest)
+		return
+	}
+	if request.TimeoutSeconds != 0 {
+		duration = time.Duration(request.TimeoutSeconds) * time.Second
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if r.URL.Path == "/begin" {
@@ -292,7 +305,8 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if request.Retry {
 			if c.lastResult == nil || c.lastResult.ID != request.ID ||
 				c.lastResult.FailureKind != accessViolation || c.lastResult.Attempt != 0 ||
-				c.lastResult.PrimaryLatency != request.PrimaryLatency {
+				c.lastResult.PrimaryLatency != request.PrimaryLatency ||
+				c.lastResult.TimeoutSeconds != int(duration/time.Second) {
 				http.Error(w, "trial is not eligible for a server-crash retry", http.StatusConflict)
 				return
 			}
@@ -304,9 +318,10 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		c.active, c.started = request.ID, time.Now().UTC()
 		c.primaryLatency = request.PrimaryLatency
+		c.duration = duration
 		c.seen[request.ID] = true
 		for i, port := range []int{c.port, c.port + 1} {
-			server, err := startListener(c.binary, c.bind, port, i == 0 && c.primaryLatency)
+			server, err := startListener(c.binary, c.bind, port, i == 0 && c.primaryLatency, duration)
 			if err != nil {
 				result := c.finish(err.Error())
 				w.WriteHeader(http.StatusInternalServerError)
@@ -317,11 +332,11 @@ func (c *controller) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		id := c.active
 		attempt := c.attempt
-		c.timer = time.AfterFunc(maxTrialDuration, func() {
+		c.timer = time.AfterFunc(duration, func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			if c.active == id && c.attempt == attempt {
-				result := c.finish("trial exceeded the 10-minute server deadline")
+				result := c.finish(fmt.Sprintf("trial exceeded the %s server deadline", duration))
 				log.Printf("trial %s failed: %s", id, result.Failure)
 			}
 		})

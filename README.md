@@ -117,6 +117,48 @@ possibly live export. LUN 0 cannot be dynamically added or removed.
 
 Without this annotation, the ordinary LCOW and demo paths are unchanged.
 
+The same annotation can explicitly select one containerd-owned VM with direct
+SCSI storage and direct GCS, without a diode, shared section, sibling modules,
+relay or sibling networking:
+
+```json
+{
+  "version": 1,
+  "standalone": true,
+  "vm_resources": [
+    {
+      "processor_count": 8,
+      "memory_mb": 65536,
+      "cpu_group_lps": [8, 24, 9, 25],
+      "cpu_group_priority": 0
+    }
+  ]
+}
+```
+
+Standalone requires exactly one workload resource entry. Its normal SNP
+dm-verity boot configuration and security policy are preserved. Optionally set
+`workload_guest_state_file` to a direct-root VMGS filename in the existing boot
+directory; otherwise the sandbox's configured VMGS is used. This VMGS must boot
+from ordinary RP SCSI, not wait for a sibling root provider. The matching
+verified root VHD remains supplied by the normal boot configuration and is
+copied into the bundle and attached directly at root LUN 0. No guests are built
+or boot settings rewritten by this option. Pair-only fields (`module_directory`,
+`shared_memory_bytes`, `mediate_gcs`, `unikraft_package`) must be omitted.
+`interactive: true` exposes only the existing workload shell pipe.
+
+For pairs, optional `vm_resources` still has exactly two entries in
+`[diode, workload]` order. Each entry supplies `processor_count` (1..256),
+`memory_mb` (HCS MiB), and optional `cpu_group_lps` of arbitrary nonzero length.
+Affinity pools must be identical or disjoint, not partially overlapping; VP
+counts need not equal pool sizes. Optional `cpu_group_priority` (0..7) must be
+specified with affinity for every VM if used at all. Explicit priorities create
+independently owned CPU groups even for identical pools, and verify both
+affinity and priority before VM creation. Omitted priorities preserve the
+existing identical-pool/shared-group behavior. CPU groups are deleted only
+after their VMs close. Resource sizes, pool selection and priority policy
+belong to callers, not the native runtime.
+
 ### Optional Unikraft diode in the existing uvmboot pair
 
 The same `uvmboot-shmem.exe` retains its ordinary Linux runtime commands,

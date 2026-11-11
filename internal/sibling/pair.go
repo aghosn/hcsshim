@@ -27,13 +27,14 @@ import (
 
 // Config is an explicit host-side opt-in; it never names existing HCS systems.
 // The workload inherits the sandbox's security/integrity options without alteration.
-// VMResources optionally replaces CPU/memory in [diode, workload] order; memory
-// is the HCS allocation in MiB, not embedded guest image memory.
+// VMResources optionally replaces CPU/memory in [diode, workload] order (or
+// [workload] in standalone mode); memory is the HCS allocation in MiB.
 type Config struct {
 	Version                int           `json:"version"`
-	ModuleDirectory        string        `json:"module_directory"`
-	SharedMemoryBytes      uint64        `json:"shared_memory_bytes"`
-	WorkloadGuestStateFile string        `json:"workload_guest_state_file"`
+	Standalone             bool          `json:"standalone,omitempty"`
+	ModuleDirectory        string        `json:"module_directory,omitempty"`
+	SharedMemoryBytes      uint64        `json:"shared_memory_bytes,omitempty"`
+	WorkloadGuestStateFile string        `json:"workload_guest_state_file,omitempty"`
 	Interactive            bool          `json:"interactive,omitempty"`
 	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
 	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
@@ -67,13 +68,22 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	if limited.N == 0 {
 		return nil, errors.New("sibling pair config exceeds 64 KiB")
 	}
-	if config.Version != 1 || !filepath.IsAbs(config.ModuleDirectory) ||
+	if config.Version != 1 {
+		return nil, errors.New("sibling config requires version 1")
+	}
+	if config.Standalone {
+		if config.ModuleDirectory != "" || config.SharedMemoryBytes != 0 ||
+			config.MediateGCS || config.UnikraftPackage != "" {
+			return nil, errors.New("standalone cannot configure a diode, shared memory, modules or GCS mediation")
+		}
+	} else if !filepath.IsAbs(config.ModuleDirectory) ||
 		config.SharedMemoryBytes < 1<<20 || config.SharedMemoryBytes > 0x7ffff000 ||
 		config.SharedMemoryBytes%4096 != 0 {
 		return nil, errors.New("sibling pair requires version 1, an absolute module directory and page-aligned shared memory in 1 MiB..2 GiB")
 	}
-	if config.WorkloadGuestStateFile == "" || filepath.Base(config.WorkloadGuestStateFile) != config.WorkloadGuestStateFile ||
-		strings.ContainsAny(config.WorkloadGuestStateFile, "\\/:\x00") || !strings.EqualFold(filepath.Ext(config.WorkloadGuestStateFile), ".vmgs") {
+	if (!config.Standalone || config.WorkloadGuestStateFile != "") &&
+		(config.WorkloadGuestStateFile == "" || filepath.Base(config.WorkloadGuestStateFile) != config.WorkloadGuestStateFile ||
+			strings.ContainsAny(config.WorkloadGuestStateFile, "\\/:\x00") || !strings.EqualFold(filepath.Ext(config.WorkloadGuestStateFile), ".vmgs")) {
 		return nil, errors.New("sibling workload guest state must be a VMGS filename under the existing boot files directory")
 	}
 	if config.UnikraftPackage != "" && (!filepath.IsAbs(config.UnikraftPackage) ||
@@ -86,8 +96,8 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	return &config, nil
 }
 
-// Pair is the sole lifetime owner of two newly created UVMs and their shared
-// section. Workload tasks borrow Workload; only the sandbox closes the Pair.
+// Pair owns a newly created workload and, unless standalone, its diode and
+// shared section. Workload tasks borrow Workload; only the sandbox closes it.
 type Pair struct {
 	Workload        *uvm.UtilityVM
 	Diode           *uvm.UtilityVM
@@ -108,6 +118,9 @@ type Pair struct {
 }
 
 func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	if config.Standalone {
+		return nil, nil, errors.New("standalone does not have pair options")
+	}
 	if err := config.validateResources(); err != nil {
 		return nil, nil, err
 	}
@@ -182,6 +195,9 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	config, err = decodeConfig(strings.NewReader(string(encoded)))
 	if err != nil {
 		return nil, err
+	}
+	if config.Standalone {
+		return startStandalone(ctx, base, config)
 	}
 	native, err := loadOwnedUnikraft(config)
 	if err != nil {
