@@ -370,7 +370,8 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 // Tools/shares are staged once per role; only the diode receives the host-staged
 // AHV collector. Its pair-owned boot-server starts before workload Start and
 // waits for CID4 independently. The verified workload root already contains the
-// early client, which must publish its complete batch before original init/GCS.
+// client. The marked image requires its complete batch before original init/GCS;
+// the unmarked image permits an explicit one-shot fetch after boot for debugging.
 // Forward cancellation preserves dependencies through workload termination,
 // relay/provider drainage and root unplug; the workload bundle survives until
 // that attachment is released. Only then may native backing reclaim and owner
