@@ -6,11 +6,61 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestBootstrapCommandPreservesStatusOutputAndFailureDiagnostics(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell unavailable")
+	}
+	for _, test := range []struct {
+		name, script string
+		status       int
+	}{
+		{"success", "printf 'bootstrap stdout\\n'", 0},
+		{"explicit-exit", "printf 'relay failure on stdout\\n'; exit 7", 7},
+		{"silent-guard", "[ 3 = 4 ]; printf 'must not continue\\n'", 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec",
+				`dmesg() { printf 'fixture kernel state\n'; }; `+bootstrapCommand("fixture stage", test.script))
+			var stdout, stderr strings.Builder
+			command.Stdout, command.Stderr = &stdout, &stderr
+			err := command.Run()
+			if command.ProcessState == nil || command.ProcessState.ExitCode() != test.status {
+				t.Fatalf("exit status changed: %v; stderr=%s", err, stderr.String())
+			}
+			if test.status == 0 {
+				if stdout.String() != "bootstrap stdout\n" || strings.Contains(stderr.String(), "bootstrap failed:") {
+					t.Fatalf("success output changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+				}
+			} else if !strings.Contains(stderr.String(), "sibling bootstrap failed: fixture stage") ||
+				!strings.Contains(stderr.String(), "fixture kernel state") ||
+				strings.Contains(stdout.String(), "must not continue") {
+				t.Fatalf("failed bootstrap lost its diagnostics or continued: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+			if test.name == "explicit-exit" && stdout.String() != "relay failure on stdout\n" {
+				t.Fatalf("failure stdout was lost: %q", stdout.String())
+			}
+		})
+	}
+}
+
+func TestGuestOutputTailRetainsFailureAfterLongTrace(t *testing.T) {
+	output := strings.Repeat("startup trace\n", 2000) + "actual failure\n"
+	tail := guestOutputTail(output)
+	if !strings.HasPrefix(tail, "[earlier output truncated]\n") ||
+		!strings.HasSuffix(tail, "actual failure\n") || len(tail) > 16450 {
+		t.Fatalf("long bootstrap trace hid its failure or exceeded the error budget: %q", tail)
+	}
+}
 
 func TestExportControlAddReconcilesAmbiguousReplies(t *testing.T) {
 	for _, test := range []struct {

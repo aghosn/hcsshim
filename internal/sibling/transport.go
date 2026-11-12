@@ -72,6 +72,18 @@ func BusLoadCommand(modulePath string) string {
 		Quote(modulePath) + " || exit 1; fi; "
 }
 
+func guestInstanceCommand(localCID, peerCID int) string {
+	return `sb_wait=0; until set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; ` +
+		`[ "$#" -eq 1 ] && [ -r "$1" ] && sb_instance=$(cat "$1") && ` +
+		`case "$sb_instance" in *" ready=1") true;; *) false;; esac; do ` +
+		`sb_wait=$((sb_wait+1)); if [ "$sb_wait" -ge 300 ]; then ` +
+		`echo 'Timed out waiting for ready sibling bus' >&2; exit 1; fi; sleep 0.1; done; ` +
+		`set -- $sb_instance; ` +
+		fmt.Sprintf(`[ "$#" -eq 5 ] && [ "${2#*=}" = %d ] && [ "${3#*=}" = %d ] && [ "${4#*=}" = %d ] || `+
+			`{ echo "Invalid sibling bus identity: $sb_instance" >&2; exit 1; }; `, localCID, peerCID, TransportVersion) +
+		`sb_bus=${1#*=}; `
+}
+
 // RPDeviceCommand selects a block device by the RP controller identity, not sdX
 // enumeration order. The caller must bound the lifetime of the guest process.
 func RPDeviceCommand(controller uint, lun uint) (string, error) {

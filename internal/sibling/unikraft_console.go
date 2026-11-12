@@ -25,12 +25,19 @@ func CaptureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- tim
 	scanner.Buffer(make([]byte, 4096), 65536)
 	snp, offers, provider, reported := false, false, false, false
 	idleVerified := false
+	relayDetail := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		if _, err := fmt.Fprintln(output, line); err != nil {
 			return err
 		}
+		if strings.Contains(line, "diode-gcs: IO port ") {
+			relayDetail = line
+		}
 		if strings.Contains(line, "diode-gcs: session failed:") {
+			if relayDetail != "" {
+				return fmt.Errorf("Unikraft workload management relay failed: %s; %s", relayDetail, line)
+			}
 			return fmt.Errorf("Unikraft workload management relay failed: %s", line)
 		}
 		snp = snp || strings.Contains(line, "hyperv: isolation type 2 (SNP), paravisor absent")

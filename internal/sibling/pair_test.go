@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -125,6 +127,22 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 	if _, err := LoadConfig("relative"); err == nil {
 		t.Fatal("accepted relative config-file path")
 	}
+	directory := t.TempDir()
+	path := filepath.Join(directory, "sibling-pair.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.directory != directory {
+		t.Fatalf("console directory does not follow the retained config: %q", config.directory)
+	}
+	config.directory = ""
+	if !reflect.DeepEqual(config, testConfig()) {
+		t.Fatalf("loading the config changed its VM settings: %+v", config)
+	}
 }
 
 func TestPairBootstrapOverlapsWorkloadRootAndDiodeStartup(t *testing.T) {
@@ -193,11 +211,16 @@ func TestPairGCSRelayReadiness(t *testing.T) {
 		t.Run(fmt.Sprint(ready), func(t *testing.T) {
 			mock := `echo 'synthetic relay startup failure'; return 7`
 			if ready {
-				mock = `touch "$fixture/gcs-relay.ready"`
+				mock = `touch "$fixture/gcs-relay.ready"; exec /bin/sleep 1`
 			}
-			script := `fixture=$(mktemp -d); trap 'rm -f "$fixture/gcs-relay.ready" "$fixture/gcs-relay.pid" "$fixture/gcs-relay.log"; rmdir "$fixture"' EXIT; ` +
+			command := strings.ReplaceAll(GCSRelayCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture/sibling_instance"`)
+			script := `fixture=$(mktemp -d); relay_pid=; trap 'rc=$?; trap - EXIT; ` +
+				`if [ -n "$relay_pid" ]; then kill "$relay_pid" 2>/dev/null || :; wait "$relay_pid" 2>/dev/null || :; fi; ` +
+				`rm -f "$fixture/sibling_instance" "$fixture/gcs-relay.ready" "$fixture/gcs-relay.pid" "$fixture/gcs-relay.log"; rmdir "$fixture"; exit "$rc"' EXIT; ` +
+				`printf '%s\n' 'bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1' >"$fixture/sibling_instance"; ` +
 				`mock_gcs() { ` + mock + `; }; ` +
-				strings.ReplaceAll(strings.ReplaceAll(GCSRelayCommand(), "/bin/gcs", "mock_gcs"), "/run/gcs-relay", "$fixture/gcs-relay")
+				strings.ReplaceAll(strings.ReplaceAll(command, "/bin/gcs", "mock_gcs"), "/run/gcs-relay", "$fixture/gcs-relay")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec", script).CombinedOutput()
@@ -233,6 +256,54 @@ func TestPairCloseIsOrderedAndIdempotentAfterFailures(t *testing.T) {
 	}
 	if !reflect.DeepEqual(calls, []string{"interactive", "workload", "diode", "uplink", "section"}) {
 		t.Fatalf("invalid provider/consumer lifetime: %v", calls)
+	}
+}
+
+func TestGCSRelayWaitsForSiblingInstanceBeforeBinding(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell unavailable")
+	}
+	for _, test := range []struct {
+		name, mode, instance, wantError string
+	}{
+		{"delayed-offer-and-enumeration", "delayed", "bus_id=1 local_cid=4 peer_cid=3 version=4", ""},
+		{"missing-bus", "missing", "", "Timed out waiting for ready sibling bus"},
+		{"wrong-role", "ready", "bus_id=1 local_cid=3 peer_cid=4 version=4", "Invalid sibling bus identity"},
+		{"old-protocol", "ready", "bus_id=1 local_cid=4 peer_cid=3 version=3", "Invalid sibling bus identity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			script := strings.ReplaceAll(GCSRelayCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture"/*/sibling_instance`)
+			script = strings.ReplaceAll(script, "/run/gcs-relay", "$fixture/relay")
+			script = strings.ReplaceAll(script, "/bin/gcs", "fixture_gcs")
+			fixture := `fixture=$(mktemp -d); relay_pid=; sleeps=0; ` +
+				`trap 'rc=$?; trap - EXIT; if [ -n "$relay_pid" ]; then kill "$relay_pid" 2>/dev/null || :; wait "$relay_pid" 2>/dev/null || :; fi; ` +
+				`if [ -f "$fixture/launched" ]; then echo RELAY_INVOKED; fi; ` +
+				`rm -f "$fixture/bus-1/sibling_instance" "$fixture/relay.ready" "$fixture/relay.log" "$fixture/relay.pid" "$fixture/launched"; ` +
+				`rmdir "$fixture/bus-1" 2>/dev/null || :; rmdir "$fixture"; exit "$rc"' EXIT; ` +
+				`mode=` + Quote(test.mode) + `; instance=` + Quote(test.instance) + `; ` +
+				`publish() { mkdir -p "$fixture/bus-1"; printf '%s ready=%s\n' "$instance" "$1" >"$fixture/bus-1/sibling_instance"; }; ` +
+				`if [ "$mode" = ready ]; then publish 1; fi; ` +
+				`sleep() { sleeps=$((sleeps+1)); if [ "$mode" = delayed ]; then ` +
+				`if [ "$sleeps" -eq 1 ]; then publish 0; elif [ "$sleeps" -eq 2 ]; then publish 1; fi; ` +
+				`if [ "$sleeps" -ge 2 ]; then /bin/sleep 0.01; fi; fi; }; ` +
+				`fixture_gcs() { grep -q 'ready=1' "$fixture/bus-1/sibling_instance" || return 99; ` +
+				`echo launched >"$fixture/launched"; touch "$fixture/relay.ready"; exec /bin/sleep 1; }; `
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec",
+				fixture+script+`; [ "$sleeps" -ge 2 ]`).CombinedOutput()
+			if test.wantError == "" {
+				if err != nil || !strings.Contains(string(output), "GCS_RELAY_READY:") ||
+					!strings.Contains(string(output), "RELAY_INVOKED") {
+					t.Fatalf("relay did not wait for delayed readiness: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), test.wantError) ||
+				strings.Contains(string(output), "RELAY_INVOKED") {
+				t.Fatalf("unready or invalid bus reached relay bind: %v\n%s", err, output)
+			}
+		})
 	}
 }
 
@@ -281,9 +352,11 @@ func TestPairBootstrapShellSyntax(t *testing.T) {
 			t.Run(test.name, func(t *testing.T) {
 				script := strings.Replace(workloadNICCommand(),
 					BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko"), "", 1)
+				script = strings.ReplaceAll(script, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$sb_fixture"`)
 				script = strings.ReplaceAll(script, "/sys/class/net/*", test.nics)
 				script = strings.ReplaceAll(script, `[ -e "$p/device" ]`, "true")
-				fixture := `grep() { return 0; }; cat() { printf '%s\n' ` + Quote(test.instance) + `; }; ` +
+				fixture := `sb_fixture=$(mktemp); trap 'rm -f "$sb_fixture"' EXIT; ` +
+					`printf '%s\n' ` + Quote(test.instance) + ` >"$sb_fixture"; ` +
 					`readlink() { case "$*" in *driver) printf '%s\n' /drivers/` + test.driver + `;; ` +
 					`*) printf '%s\n' /devices/` + test.device + `;; esac; }; `
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

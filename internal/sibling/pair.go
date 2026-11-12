@@ -39,6 +39,7 @@ type Config struct {
 	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
 	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
 	VMResources            []VMResources `json:"vm_resources,omitempty"`
+	directory              string
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -50,7 +51,12 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return decodeConfig(file)
+	config, err := decodeConfig(file)
+	if err != nil {
+		return nil, err
+	}
+	config.directory = filepath.Dir(path)
+	return config, nil
 }
 
 func decodeConfig(reader io.Reader) (*Config, error) {
@@ -184,6 +190,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
 	}
+	consoleDirectory := config.directory
 	if err := config.validateResources(); err != nil {
 		return nil, err
 	}
@@ -258,7 +265,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, fmt.Errorf("create sibling workload: %w", err)
 	}
 	if native != nil {
-		if err := pair.prepareOwnedUnikraft(diodeOptions, native); err != nil {
+		if err := pair.prepareOwnedUnikraft(diodeOptions, native, consoleDirectory); err != nil {
 			return nil, err
 		}
 		cancelOnProviderLoss(ctx, pair.unikraftConsole, cancelStartup)
@@ -313,7 +320,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		if err != nil {
 			return err
 		}
-		if _, err := runGuest(bootCtx, pair.Diode, BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko")+
+		if _, err := runBootstrapGuest(bootCtx, pair.Diode, "diode root provider", BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko")+
 			resolve+`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true`); err != nil {
 			return fmt.Errorf("bootstrap permanent sibling root provider: %w", err)
 		}
@@ -322,7 +329,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return err
 		}
 		pair.uplinkCleanup = cleanup
-		_, err = runGuest(bootCtx, pair.Diode, diodeBootstrapCommand(uplink, config.MediateGCS))
+		_, err = runBootstrapGuest(bootCtx, pair.Diode, "diode network and GCS relay", diodeBootstrapCommand(uplink, config.MediateGCS))
 		return err
 	})
 	if err != nil {
@@ -352,7 +359,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		nicCommand = workloadNICCommandForMAC(native.Network.PeerMAC.String())
 		ip, gateway = native.Network.Peer.String(), native.Network.Provider.String()
 	}
-	device, err := runGuest(nicCtx, pair.Workload, demoToolsStage+nicCommand)
+	device, err := runBootstrapGuest(nicCtx, pair.Workload, "workload peer NIC", demoToolsStage+nicCommand)
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +434,7 @@ const demoToolsStage = `mkdir -p /run/sibling-exec && mount -t tmpfs -o exec,siz
 
 // GCSRelayCommand starts the same guest relay for standalone and shim-owned pairs.
 func GCSRelayCommand() string {
-	return `rm -f /run/gcs-relay.ready; ` +
+	return guestInstanceCommand(4, 3) + `rm -f /run/gcs-relay.ready; ` +
 		`/bin/gcs -sibling-relay -relay-ready /run/gcs-relay.ready </dev/null >/run/gcs-relay.log 2>&1 & relay_pid=$!; ` +
 		`echo "$relay_pid" >/run/gcs-relay.pid; ` +
 		`relay_wait=0; until [ -f /run/gcs-relay.ready ]; do ` +
@@ -470,9 +477,7 @@ func workloadNICCommandForMAC(mac string) string {
 		checkMAC = `[ "$(cat "$p/address")" = ` + Quote(mac) + ` ] || { echo 'workload peer MAC differs from Unikraft manifest' >&2; exit 1; }; `
 	}
 	return BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
-		`set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; [ "$#" -eq 1 ]; ` +
-		`until grep -q 'ready=1' "$1"; do sleep 0.1; done; ` +
-		`set -- $(cat "$1"); [ "$#" -eq 5 ]; sb_bus=${1#*=}; [ "${2#*=}" = 3 ]; [ "${3#*=}" = 4 ]; [ "${4#*=}" = 4 ]; [ "${5#*=}" = 1 ]; ` +
+		guestInstanceCommand(3, 4) +
 		`until count=0; dev=; for p in /sys/class/net/*; do [ -e "$p/device" ] || continue; ` +
 		`d=$(readlink -f "$p/device"); case ${d##*/} in bus${sb_bus}-relid*) ` +
 		`[ "$(basename "$(readlink "$p/device/driver")")" = hv_netvsc ] || exit 1; ` + checkMAC + `dev=${d##*/}; count=$((count+1));; ` +

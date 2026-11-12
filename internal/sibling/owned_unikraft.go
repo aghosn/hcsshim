@@ -92,7 +92,7 @@ func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cf
 	return uvm.VerifyOptions(context.Background(), diode)
 }
 
-func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig) error {
+func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig, consoleDirectory string) error {
 	root := opts.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"].Path
 	if err := security.GrantVmGroupAccessWithMask(root, security.AccessMaskAll); err != nil {
 		return fmt.Errorf("grant access to permanent Unikraft boot root: %w", err)
@@ -105,7 +105,11 @@ func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig) 
 	opts.Appliance.NetworkAdapters = map[string]hcsschema.NetworkAdapter{
 		"00000000-0000-0000-0000-000000000001": {EndpointId: endpoint.Id, MacAddress: endpoint.MacAddress},
 	}
-	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, opts.BundleDirectory, cfg.Idle)
+	if consoleDirectory == "" {
+		consoleDirectory = opts.BundleDirectory
+	}
+	// Config-file callers retain the console outside the disposable task bundle.
+	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, consoleDirectory, cfg.Idle)
 	return err
 }
 

@@ -238,6 +238,12 @@ func TestOwnedUnikraftMediatedFirmwareSelection(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "management relay failed") {
 		t.Fatalf("native relay failure did not reach provider supervision: %v", err)
 	}
+	detail := "diode-gcs: IO port 1610612738 root->workload failed: -107; buffered=0 eof=1 fin=0"
+	err = CaptureUnikraftConsole(strings.NewReader(detail+"\ndiode-gcs: session failed: -107; no fallback\n"),
+		&output, ready, "halt")
+	if err == nil || !strings.Contains(err.Error(), detail) {
+		t.Fatalf("native stream failure details were lost: %v", err)
+	}
 }
 
 func TestOwnedProviderCleanupRetainsCause(t *testing.T) {
