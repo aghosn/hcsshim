@@ -41,6 +41,7 @@ type dependencies struct {
 	dial         func(context.Context, uint32, uint32) (net.Conn, error)
 	workloadPeer func(net.Conn) bool
 	acceptTTL    time.Duration
+	metrics      *relayMetrics
 }
 
 func nativeDependencies() dependencies {
@@ -80,6 +81,12 @@ func run(ctx context.Context, readyPath string, d dependencies) error {
 	defer root.Close()
 	stopRoot := context.AfterFunc(ctx, func() { root.Close() })
 	defer stopRoot()
+	metrics, stopMetrics, err := startRelayMetrics(ctx, readyPath+".metrics.json")
+	if err != nil {
+		return err
+	}
+	defer stopMetrics()
+	d.metrics = metrics
 	// Exclusive creation avoids following or overwriting an existing readiness
 	// file. A stale marker is an explicit startup failure.
 	file, err := os.OpenFile(readyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
@@ -230,6 +237,7 @@ func (s *session) forward(src io.Reader, dst io.Writer, requests bool) error {
 			if err := writeAll(dst, body); err != nil {
 				return err
 			}
+			s.d.metrics.frame(kind, size)
 			if !requests {
 				if err := s.execResponse(id, body); err != nil {
 					return err
@@ -242,6 +250,7 @@ func (s *session) forward(src io.Reader, dst io.Writer, requests bool) error {
 			if _, err := io.CopyN(dst, src, bodySize); err != nil {
 				return err
 			}
+			s.d.metrics.frame(kind, size)
 		}
 	}
 }
@@ -447,15 +456,27 @@ func (s *session) serveIO(id uint64, p *ioPort) error {
 	if err != nil {
 		return fmt.Errorf("IO listener close %#x: %w", p.port, err)
 	}
-	return copyDuplex(s.ctx, p.root, conn)
+	return copyDuplexMeasured(s.ctx, p.root, conn, s.d.metrics)
 }
 
 func copyDuplex(ctx context.Context, a, b net.Conn) error {
+	return copyDuplexMeasured(ctx, a, b, nil)
+}
+
+func copyDuplexMeasured(ctx context.Context, a, b net.Conn, metrics *relayMetrics) error {
 	stop := context.AfterFunc(ctx, func() { a.Close(); b.Close() })
 	defer stop()
 	results := make(chan error, 2)
-	copyOne := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
+	copyOne := func(dst, src net.Conn, toRoot bool) {
+		var writer io.Writer = dst
+		if metrics != nil && metrics.enabled.Load() {
+			counter := &metrics.rootIO
+			if toRoot {
+				counter = &metrics.guestIO
+			}
+			writer = countedStreamWriter{dst, counter}
+		}
+		_, err := io.Copy(writer, src)
 		if err == nil {
 			if half, ok := dst.(interface{ CloseWrite() error }); ok {
 				err = half.CloseWrite()
@@ -465,8 +486,8 @@ func copyDuplex(ctx context.Context, a, b net.Conn) error {
 		}
 		results <- err
 	}
-	go copyOne(a, b)
-	go copyOne(b, a)
+	go copyOne(a, b, true)
+	go copyOne(b, a, false)
 	first := <-results
 	if first != nil {
 		a.Close()
