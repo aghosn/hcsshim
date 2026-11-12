@@ -485,10 +485,10 @@ func (p *protectedPair) observeFailedStartup(v *protectedVMAttempt) {
 // evidence. close stops and joins these watchers before closing VM handles.
 func (p *protectedPair) watch(v *protectedVMAttempt) {
 	p.watchers.Add(1)
-	// WaitCtx borrows the retained VM until observation or explicit watcher stop.
+	// Native exit, not log delivery, triggers loss notification.
 	go func() {
 		defer p.watchers.Done()
-		err := v.vm.WaitCtx(p.watchCtx)
+		err := v.vm.WaitNativeExit(p.watchCtx)
 		if p.watchCtx.Err() == nil {
 			cause := errors.Join(fmt.Errorf("protected VM %s exited", v.options.ID), err, v.vm.ExitError())
 			_, logErr := fmt.Fprintf(p.log, "VM ended run=%s vm=%s error=%v\n", p.config.RunID, v.options.ID, cause)
@@ -847,12 +847,12 @@ func (p *protectedPair) close() error {
 			return err
 		}
 	}
-	// CloseCtx is deliberately last, never the protected stop operation.
-	// Its boot-copy deletion only logs errors, so verify our workload VMGS
+	// Final resource close does not join logs and follows backing release.
+	// Boot-copy deletion only logs errors, so verify our workload VMGS
 	// separately without deleting the caller-owned sandbox directory.
 	for _, v := range []*protectedVMAttempt{&p.workload, &p.diode} {
 		if v.vm != nil {
-			result = errors.Join(result, v.vm.CloseCtx(ctx))
+			result = errors.Join(result, v.vm.CloseAfterNativeExit(ctx))
 		}
 	}
 	if p.workload.vm != nil {
@@ -899,8 +899,8 @@ func (p *protectedPair) close() error {
 	return nil
 }
 
-// terminateProtectedVM requires observable native termination and output join,
-// not CloseCtx, a cached receipt, or a successful terminate submission alone.
+// terminateProtectedVM requires observed native exit, not output completion,
+// handle closure, a cached receipt, or terminate submission alone.
 func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
 	if v.vm == nil {
 		if v.createAttempt {
@@ -912,7 +912,7 @@ func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
 	if hcsv2.IsAlreadyStopped(err) {
 		err = nil
 	}
-	return errors.Join(err, v.vm.WaitCtx(ctx))
+	return errors.Join(err, v.vm.WaitNativeExit(ctx))
 }
 
 // stopDependencyServices requests a trapped TERM, never cancellation's SIGKILL.
