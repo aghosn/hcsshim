@@ -94,6 +94,58 @@ func TestNetworkBenchmarkCPUSamplingPolicy(t *testing.T) {
 	}
 }
 
+func TestNetworkBenchmarkIndependentIdlePolicies(t *testing.T) {
+	for _, test := range []struct {
+		workload string
+		diode    string
+	}{
+		{"poll", ""},
+		{"halt", ""},
+		{"poll", "halt"},
+		{"halt", "poll"},
+		{"poll", "poll"},
+	} {
+		t.Run(test.workload+"/"+test.diode, func(t *testing.T) {
+			args := []string{"--network-benchmark-script", `C:\scripts\experiment.sh`,
+				"--network-benchmark-server", "192.0.2.10", "--network-benchmark-idle", test.workload}
+			expectedDiode := test.workload
+			if test.diode != "" {
+				args = append(args, "--network-benchmark-diode-idle", test.diode)
+				expectedDiode = test.diode
+			}
+			c := benchmarkTestContext(t, args...)
+			workload := networkBenchmarkSiblingCommand(c, "/bus.ko", "", workloadRole,
+				siblingNetConfig{ifName: "dvsc0", address: "10.200.0.2/30", gateway: "10.200.0.1"}, nil)
+			diode := networkBenchmarkSiblingCommand(c, "/bus.ko", "/netvsp.ko", diodeRole,
+				siblingNetConfig{ifName: "dvsp0", address: "10.200.0.1/30"},
+				&diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
+			if !strings.Contains(workload, `role=workload idle=`+test.workload) ||
+				!strings.Contains(diode, `role=diode idle=`+expectedDiode) {
+				t.Fatal("per-VM preflight did not enforce the requested idle policies")
+			}
+			if got := networkBenchmarkGuestStateFile(c, "uvmboot-0"); got != "kernel.vmgs" {
+				t.Fatalf("diode firmware changed: %s", got)
+			}
+			want := "kernel.vmgs"
+			if expectedDiode != test.workload {
+				want = networkBenchmarkWorkloadVMGS
+			}
+			if got := networkBenchmarkGuestStateFile(c, "uvmboot-1"); got != want {
+				t.Fatalf("workload firmware %s, want %s", got, want)
+			}
+		})
+	}
+	for _, args := range [][]string{
+		{"--network-benchmark-diode-idle", "halt"},
+		{"--network-benchmark-script", "fixture", "--network-benchmark-diode-idle", "invalid"},
+		{"--network-benchmark-script", "fixture", "--network-benchmark-diode-idle", "halt"},
+	} {
+		if err := validateNetworkBenchmark(benchmarkTestContext(t, args...), nil); err == nil {
+			t.Fatalf("unsupported independent idle options accepted: %v", args)
+		}
+	}
+}
+
 func TestNetworkBenchmarkValidationFailsClosed(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "bench.sh")
 	if err := os.WriteFile(script, []byte("exit 0\n"), 0600); err != nil {

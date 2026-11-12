@@ -19,16 +19,34 @@ import (
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
 
 const (
-	networkBenchmarkScriptArgName  = "network-benchmark-script"
-	networkBenchmarkServerArgName  = "network-benchmark-server"
-	networkBenchmarkPortArgName    = "network-benchmark-port"
-	networkBenchmarkTimeoutArgName = "network-benchmark-timeout"
-	networkBenchmarkNoSMTArgName   = "network-benchmark-no-smt"
-	networkBenchmarkIdleArgName    = "network-benchmark-idle"
+	networkBenchmarkScriptArgName    = "network-benchmark-script"
+	networkBenchmarkServerArgName    = "network-benchmark-server"
+	networkBenchmarkPortArgName      = "network-benchmark-port"
+	networkBenchmarkTimeoutArgName   = "network-benchmark-timeout"
+	networkBenchmarkNoSMTArgName     = "network-benchmark-no-smt"
+	networkBenchmarkIdleArgName      = "network-benchmark-idle"
+	networkBenchmarkDiodeIdleArgName = "network-benchmark-diode-idle"
+	networkBenchmarkWorkloadVMGS     = "network-workload.vmgs"
 )
+
+func networkBenchmarkDiodeIdlePolicy(c *cli.Context) string {
+	if idle := c.String(networkBenchmarkDiodeIdleArgName); idle != "" {
+		return idle
+	}
+	return c.String(networkBenchmarkIdleArgName)
+}
+
+func networkBenchmarkGuestStateFile(c *cli.Context, id string) string {
+	if c.String(networkBenchmarkScriptArgName) != "" && c.String(unikraftPackageArgName) == "" && id == "uvmboot-1" &&
+		networkBenchmarkDiodeIdlePolicy(c) != c.String(networkBenchmarkIdleArgName) {
+		return networkBenchmarkWorkloadVMGS
+	}
+	return vmutils.DefaultGuestStateFile
+}
 
 func networkBenchmarkCPUEnabled(c *cli.Context) (bool, error) {
 	script, err := os.ReadFile(c.String(networkBenchmarkScriptArgName))
@@ -75,13 +93,21 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
 			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
-			c.IsSet(networkBenchmarkIdleArgName) {
+			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkDiodeIdleArgName) {
 			return errors.New("network benchmark server, port and timeout require --network-benchmark-script")
 		}
 		return nil
 	}
 	if idle := c.String(networkBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
 		return errors.New("network benchmark idle policy must be poll or halt")
+	}
+	if c.IsSet(networkBenchmarkDiodeIdleArgName) {
+		if idle := c.String(networkBenchmarkDiodeIdleArgName); idle != "poll" && idle != "halt" {
+			return errors.New("network benchmark diode idle policy must be poll or halt")
+		}
+		if c.GlobalInt(countArgName) != 2 || c.String(baselineVsockArgName) != "" {
+			return errors.New("independent network benchmark idle policies require a sibling pair without a vSock relay")
+		}
 	}
 	addresses, err := net.InterfaceAddrs()
 	if err != nil {
@@ -223,7 +249,7 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 	return command + siblingDiodeUplinkCommand(uplink, guestWaitFor) +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`"$ipt" iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE; ` +
-		networkBenchmarkVPPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), requestedVMProcessors(c, "uvmboot-0")) +
+		networkBenchmarkVPPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), networkBenchmarkDiodeIdlePolicy(c), requestedVMProcessors(c, "uvmboot-0")) +
 		`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 		`{ echo 'network_benchmark: FAIL diode uplink is not synthetic hv_netvsc' >&2; exit 1; }; ` +
 		`diag=/run/dtb-exec/receive-diagnostics.log; ` +

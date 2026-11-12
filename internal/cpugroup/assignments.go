@@ -57,6 +57,7 @@ func CanonicalLPs(lps []uint32) ([]uint32, string, error) {
 
 // Prepare validates all affinities before creating groups. Identical affinities
 // share a group unless independent scheduling priorities were requested.
+// Independent groups may overlap; otherwise affinities must be identical or disjoint.
 // A nil affinity leaves that VM's inherited group unchanged.
 func Prepare(ctx context.Context, groups [][]uint32, vmCount int, ops Operations, priorities ...uint32) (_ *Assignments, resultErr error) {
 	assignments := &Assignments{ops: ops}
@@ -92,7 +93,7 @@ func Prepare(ctx context.Context, groups [][]uint32, vmCount int, ops Operations
 			return nil, err
 		}
 		for _, lp := range ordered[i] {
-			if owner, ok := lpOwners[lp]; ok && owner != keys[i] {
+			if owner, ok := lpOwners[lp]; ok && owner != keys[i] && len(priorities) == 0 {
 				return nil, fmt.Errorf("partially overlapping CPU affinities: %s and %s", owner, keys[i])
 			}
 			lpOwners[lp] = keys[i]

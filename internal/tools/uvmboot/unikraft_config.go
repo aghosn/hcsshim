@@ -86,11 +86,11 @@ func loadUnikraftConfig(c *cli.Context, plan *siblingStoragePlan) (*unikraftConf
 	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Network == nil {
 		return nil, errors.New("Unikraft network benchmark requires networking")
 	}
-	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Idle != c.String(networkBenchmarkIdleArgName) {
-		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark idle=%s", cfg.Idle, c.String(networkBenchmarkIdleArgName))
+	if c.String(networkBenchmarkScriptArgName) != "" && cfg.Idle != networkBenchmarkDiodeIdlePolicy(c) {
+		return nil, fmt.Errorf("Unikraft firmware idle=%s does not match benchmark diode idle=%s", cfg.Idle, networkBenchmarkDiodeIdlePolicy(c))
 	}
 	if c.String(storageBenchmarkScriptArgName) != "" &&
-		(cfg.Network != nil || cfg.Idle != c.String(storageBenchmarkIdleArgName)) {
+		(cfg.Network != nil || cfg.Idle != storageBenchmarkDiodeIdlePolicy(c)) {
 		return nil, errors.New("Unikraft storage firmware must be network-free and match the requested idle policy")
 	}
 	if _, _, err := cfg.storageDevices(plan); err != nil {

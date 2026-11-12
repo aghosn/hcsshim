@@ -121,6 +121,29 @@ func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.
 			t.Fatalf("accepted incompatible storage firmware: %s", invalid)
 		}
 	}
+	writeManifest(strings.Replace(command, "idle=poll", "idle=halt", 1))
+	if err := c.Set(storageBenchmarkDiodeIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadUnikraftConfig(c, plan)
+	if err != nil || cfg.Idle != "halt" || c.String(storageBenchmarkIdleArgName) != "poll" {
+		t.Fatalf("independent Unikraft halt/workload poll rejected: cfg=%+v err=%v", cfg, err)
+	}
+	if err := c.Set(storageBenchmarkDiodeIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, plan); err == nil {
+		t.Fatal("accepted Unikraft halt firmware with a poll diode expectation")
+	}
+	for _, args := range [][]string{
+		{"--storage-benchmark-diode-idle", "halt"},
+		{"--storage-benchmark-script", "fixture", "--storage-benchmark-diode-idle", "invalid"},
+		{"--storage-benchmark-script", "fixture", "--storage-benchmark-diode-idle", "halt"},
+	} {
+		if err := validateStorageBenchmark(benchmarkTestContext(t, args...), nil, nil); err == nil {
+			t.Fatalf("unsupported storage diode override accepted: %v", args)
+		}
+	}
 }
 
 func TestUnikraftIdleManifest(t *testing.T) {
@@ -464,5 +487,31 @@ func TestUnikraftPairPreflight(t *testing.T) {
 	}
 	if _, err := loadUnikraftConfig(c, nil); err == nil || !strings.Contains(err.Error(), "does not match benchmark") {
 		t.Fatalf("mismatched benchmark firmware was accepted: %v", err)
+	}
+	if err := c.Set(networkBenchmarkIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(networkBenchmarkDiodeIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "launch-manifest.json"),
+		[]byte(unikraftTestManifest(strings.Join(network, " ")+" libukbus_vmbus.idle=halt")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadUnikraftConfig(c, nil)
+	if err != nil || cfg.Idle != "halt" {
+		t.Fatalf("mixed Unikraft network idle rejected: cfg=%+v err=%v", cfg, err)
+	}
+	if err := validateNetworkBenchmark(c, [][]uint32{{8, 24}, {8, 24}}); err != nil {
+		t.Fatal(err)
+	}
+	if networkBenchmarkGuestStateFile(c, "uvmboot-1") != "kernel.vmgs" {
+		t.Fatal("Unikraft pair selected the Linux-only network firmware path instead of retaining root mediation")
+	}
+	if err := c.Set(networkBenchmarkDiodeIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, nil); err == nil {
+		t.Fatal("accepted network Unikraft firmware inconsistent with diode idle expectation")
 	}
 }

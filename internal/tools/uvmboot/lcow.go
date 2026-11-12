@@ -319,6 +319,10 @@ var lcowCommand = cli.Command{
 			Value: "poll",
 			Usage: "Required guest boot idle policy for network benchmarks: poll or halt.",
 		},
+		cli.StringFlag{
+			Name:  networkBenchmarkDiodeIdleArgName,
+			Usage: "Diode idle policy override: poll or halt. Mixed Linux pairs require network-workload.vmgs; Unikraft pairs retain sibling-root.vmgs.",
+		},
 		cli.StringFlag{Name: storageBenchmarkScriptArgName, Usage: "Run the disposable ext4 fio experiment."},
 		cli.StringFlag{Name: storageBenchmarkDiskArgName, Usage: "New disposable benchmark VHDX copy."},
 		cli.StringFlag{Name: storageBenchmarkOutputArgName, Usage: "Empty result directory shared with the guests."},
@@ -332,6 +336,7 @@ var lcowCommand = cli.Command{
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
 		cli.StringFlag{Name: storageBenchmarkIdleArgName, Value: "halt", Usage: "Storage workload idle policy: poll or halt."},
+		cli.StringFlag{Name: storageBenchmarkDiodeIdleArgName, Usage: "Storage diode idle policy override: poll or halt."},
 	},
 	Action: func(c *cli.Context) (resultErr error) {
 		if err := prepareVMResources(c); err != nil {
@@ -1033,7 +1038,7 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		options.SecurityPolicyEnforcer = c.String(securityPolicyEnforcerArgName)
 	}
 	if c.IsSet(securityHardwareFlag) {
-		options.GuestStateFilePath = vmutils.DefaultGuestStateFile
+		options.GuestStateFilePath = networkBenchmarkGuestStateFile(c, id)
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
 		options.SecurityPolicyEnabled = true

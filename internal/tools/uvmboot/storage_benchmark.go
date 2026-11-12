@@ -36,7 +36,15 @@ const (
 	storageBenchmarkLatencyArgName    = "storage-benchmark-latency"
 	storageBenchmarkThroughputArgName = "storage-benchmark-throughput"
 	storageBenchmarkIdleArgName       = "storage-benchmark-idle"
+	storageBenchmarkDiodeIdleArgName  = "storage-benchmark-diode-idle"
 )
+
+func storageBenchmarkDiodeIdlePolicy(c *cli.Context) string {
+	if idle := c.String(storageBenchmarkDiodeIdleArgName); idle != "" {
+		return idle
+	}
+	return c.String(storageBenchmarkIdleArgName)
+}
 
 type storageBenchmarkContent struct {
 	FileMiB      int    `json:"file_mib"`
@@ -113,7 +121,7 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 			storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
 			storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkTestArgName, storageBenchmarkStatsArgName,
-			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName} {
+			storageBenchmarkLatencyArgName, storageBenchmarkThroughputArgName, storageBenchmarkIdleArgName, storageBenchmarkDiodeIdleArgName} {
 			if c.IsSet(name) {
 				return errors.New("storage benchmark options require --storage-benchmark-script")
 			}
@@ -121,6 +129,11 @@ func validateStorageBenchmark(c *cli.Context, groups [][]uint32, plan *siblingSt
 		return nil
 	}
 	count := c.GlobalInt(countArgName)
+	if c.IsSet(storageBenchmarkDiodeIdleArgName) {
+		if idle := c.String(storageBenchmarkDiodeIdleArgName); count != 2 || (idle != "poll" && idle != "halt") {
+			return errors.New("storage benchmark diode idle override requires a paired benchmark and poll or halt")
+		}
+	}
 	unikraft := c.String(unikraftPackageArgName) != ""
 	if err := validateBenchmarkVMResources(c); err != nil {
 		return err

@@ -59,7 +59,7 @@ func ValidateVMResources(resources []VMResources) error {
 			return fmt.Errorf("vm_resources[%d]: %w", i, err)
 		}
 		for _, lp := range lps {
-			if owner, ok := owners[lp]; ok && owner != key {
+			if owner, ok := owners[lp]; ok && owner != key && !prioritized {
 				return fmt.Errorf("vm_resources CPU affinities must be identical or disjoint")
 			}
 			owners[lp] = key

@@ -263,12 +263,73 @@ func TestResourceCPUGroupPriorityValidation(t *testing.T) {
 	for _, resources := range [][]VMResources{
 		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupPriority: &zero}},
 		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupLPs: []uint32{8, 24}, CPUGroupPriority: &invalid}},
+		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupLPs: []uint32{}, CPUGroupPriority: &zero}},
+		{{ProcessorCount: 8, MemoryMB: 65536, CPUGroupLPs: []uint32{8, 8}, CPUGroupPriority: &zero}},
 		{{ProcessorCount: 1, MemoryMB: 2048, CPUGroupLPs: []uint32{8, 24}, CPUGroupPriority: &max},
 			{ProcessorCount: 16, MemoryMB: 131072, CPUGroupLPs: []uint32{8, 24}}},
 	} {
 		if err := ValidateVMResources(resources); err == nil {
 			t.Fatalf("invalid priority configuration accepted: %+v", resources)
 		}
+	}
+}
+
+func TestPairOverlappingPrioritizedAffinities(t *testing.T) {
+	pool := []uint32{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25}
+	for _, test := range []struct {
+		name       string
+		affinities [][]uint32
+	}{
+		{"diode-subset", [][]uint32{{10, 11}, pool}},
+		{"workload-subset", [][]uint32{pool, {10, 11}}},
+		{"partial-overlap", [][]uint32{{10, 11}, {11, 12}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			priority := uint32(1)
+			config := testConfig()
+			config.VMResources = []VMResources{
+				{ProcessorCount: 2, MemoryMB: 2048, CPUGroupLPs: test.affinities[0], CPUGroupPriority: &priority},
+				{ProcessorCount: 16, MemoryMB: 131072, CPUGroupLPs: test.affinities[1], CPUGroupPriority: &priority},
+			}
+			workload, diode, err := pairOptions(testOptions(), config, "group", &Section{HCSName: "owned", Size: 16 << 20})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var events []string
+			ops, created := fakeResourceCPUGroupOperations(&events)
+			priorities := map[string]uint32{}
+			ops.SetPriority = func(_ context.Context, id string, value uint32) error {
+				priorities[id] = value
+				return nil
+			}
+			query := ops.Query
+			ops.Query = func(ctx context.Context, id string) (*hcsschema.CpuGroupConfig, error) {
+				result, err := query(ctx, id)
+				result.GroupProperties = []hcsschema.CpuGroupProperty{{
+					PropertyCode: hcsschema.CPUSchedulingPriorityProperty, PropertyValue: priorities[id],
+				}}
+				return result, err
+			}
+			groups, err := preparePairCPUGroups(context.Background(), config, workload, diode, ops)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer groups.Close(context.Background())
+			if len(created) != 2 || len(groups.Reports) != 2 || diode.CPUGroupID == workload.CPUGroupID {
+				t.Fatalf("overlapping affinities did not create independent groups: %+v", groups)
+			}
+			for i, options := range []*uvm.OptionsLCOW{diode, workload} {
+				expected, _, _ := cpugroup.CanonicalLPs(test.affinities[i])
+				resource := config.VMResources[i]
+				if options.CPUGroupID != groups.IDs[i] ||
+					!reflect.DeepEqual(created[options.CPUGroupID], expected) ||
+					!reflect.DeepEqual(groups.Reports[i].LogicalProcessors, expected) ||
+					groups.Reports[i].SchedulingPriority != priority ||
+					options.ProcessorCount != resource.ProcessorCount || options.MemorySizeInMB != resource.MemoryMB {
+					t.Fatalf("role %d affinity, priority or allocation changed: %+v", i, options)
+				}
+			}
+		})
 	}
 }
 
