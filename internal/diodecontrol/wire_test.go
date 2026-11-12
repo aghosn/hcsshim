@@ -129,7 +129,7 @@ func TestRejectedStorageRecords(t *testing.T) {
 		value  byte
 	}{
 		{"zero-capacity-limit", 1, 2, 0},
-		{"oversize-capacity-limit", 1, 2, 17},
+		{"oversize-capacity-limit", 1, 2, MaxExports + 1},
 		{"capabilities-reserved", 1, 16, 1},
 		{"query-reserved", 3, 4, 1},
 		{"duplicate-lun", 3, QuerySize + ExportSize + 24, 0},

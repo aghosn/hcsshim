@@ -17,7 +17,9 @@ import (
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 )
 
 const (
@@ -262,11 +264,129 @@ func storageBenchmarkPreflight(cpus uint64, idle string) string {
 		`grep -qw ` + shellSingleQuote("idle="+idle) + ` /proc/cmdline; `
 }
 
+func runProductionStorageBenchmark(ctx context.Context, c *cli.Context, groups [][]uint32, priorities []uint32) (resultErr error) {
+	resources, err := resolvedVMResources(c)
+	if err != nil {
+		return err
+	}
+	resources = append([]sibling.VMResources(nil), resources...)
+	if len(groups) != len(resources) || (len(priorities) != 0 && len(priorities) != len(resources)) {
+		return errors.New("storage runtime requires affinity and, when selected, priority for every VM")
+	}
+	for i := range resources {
+		resources[i].CPUGroupLPs = groups[i]
+		if len(priorities) != 0 {
+			resources[i].CPUGroupPriority = &priorities[i]
+		}
+	}
+	if err := sibling.ValidateVMResources(resources); err != nil {
+		return err
+	}
+	config := &sibling.Config{Version: 1, Standalone: len(resources) == 1, VMResources: resources}
+	if !config.Standalone {
+		config.ModuleDirectory = filepath.Dir(c.String(siblingBusGuestModuleArgName))
+		config.SharedMemoryBytes = 32 << 20
+		config.WorkloadGuestStateFile = siblingStorageRootVMGS
+		config.MediateGCS = true
+		config.UnikraftPackage = c.String(unikraftPackageArgName)
+	}
+	id := fmt.Sprintf("uvmboot-%d", len(resources)-1)
+	options, err := createLCOWOptions(ctx, c, id)
+	if err != nil {
+		return err
+	}
+	pair, err := sibling.Start(ctx, options, config)
+	if err != nil {
+		return fmt.Errorf("start production storage runtime; boot state retained at %s: %w", options.BundleDirectory, err)
+	}
+	var releases []func(context.Context) error
+	defer func() {
+		closeErr := closeStorageBenchmark(ctx, func(context.Context) error { return pair.Close() }, releases)
+		resultErr = errors.Join(resultErr, closeErr)
+		if closeErr == nil {
+			resultErr = errors.Join(resultErr, os.RemoveAll(options.BundleDirectory))
+		}
+	}()
+	vm := pair.Workload
+	if uint64(vm.ProcessorCount()) != requestedVMProcessors(c, id) {
+		return fmt.Errorf("storage workload requested %d VPs, HCS assigned %d", requestedVMProcessors(c, id), vm.ProcessorCount())
+	}
+	content, err := prepareStorageBenchmarkContent(c.String(storageBenchmarkOutputArgName),
+		c.Int(storageBenchmarkSizeArgName), c.Int(storageBenchmarkSyncIOArgName))
+	if err != nil {
+		return err
+	}
+	if err := shareStorageBenchmark(ctx, c, vm); err != nil {
+		return err
+	}
+	const device = "/run/diode-storage/fio-data"
+	disk, err := vm.SCSIManager.AddVirtualDisk(ctx, c.String(storageBenchmarkDiskArgName),
+		false, vm.ID(), device, &scsi.MountConfig{BlockDev: true})
+	if err != nil {
+		return fmt.Errorf("attach benchmark disk through production storage manager: %w", err)
+	}
+	releases = append(releases, disk.Release)
+	fmt.Printf("storage_benchmark_attachment: production vm=%s controller=%d lun=%d path=%q\n",
+		vm.ID(), disk.Controller(), disk.LUN(), c.String(storageBenchmarkDiskArgName))
+	metadata, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("storage_benchmark_runtime: %s\n", metadata)
+	if !config.Standalone {
+		policy := "backend_path=production-unikraft-raw-scsi\n"
+		if config.UnikraftPackage == "" {
+			if err := pair.Diode.Share(ctx, c.String(storageBenchmarkOutputArgName), "/run/storage-benchmark-results", false); err != nil {
+				return err
+			}
+			check := `set -eu; [ "$(cat /sys/module/diode_storvsp/parameters/direct_io)" = N ]; `
+			if c.Bool(storageBenchmarkStatsArgName) {
+				check += `echo Y >/sys/module/diode_storvsp/parameters/stats_enabled; ` +
+					storageBenchmarkProviderSnapshot("before")
+			}
+			if err := execViaGCS(ctx, pair.Diode, c, check); err != nil {
+				return fmt.Errorf("verify production Linux backend policy: %w", err)
+			}
+			policy = "backend_path=production-linux-buffered-scsi\n"
+		}
+		if err := os.WriteFile(filepath.Join(c.String(storageBenchmarkOutputArgName), "backend-policy.txt"), []byte(policy), 0600); err != nil {
+			return err
+		}
+	}
+	command := storageBenchmarkPreflight(requestedVMProcessors(c, id), c.String(storageBenchmarkIdleArgName)) +
+		storageBenchmarkClient(c, shellSingleQuote(device), content)
+	resultErr = execViaGCS(ctx, vm, c, command)
+	if c.Bool(storageBenchmarkStatsArgName) {
+		resultErr = errors.Join(resultErr, execViaGCS(ctx, pair.Diode, c, storageBenchmarkProviderSnapshot("after")))
+	}
+	return resultErr
+}
+
+func storageBenchmarkProviderSnapshot(phase string) string {
+	return `set -eu; cat /sys/module/diode_storvsp/parameters/stats >/run/storage-benchmark-results/provider-` + phase + `.txt; ` +
+		`cat /sys/module/diode_storvsp/parameters/pipeline_stats >/run/storage-benchmark-results/pipeline-` + phase + `.txt; `
+}
+
+func shareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityVM) error {
+	for _, share := range []struct {
+		host, guest string
+		readOnly    bool
+	}{
+		{c.String(storageBenchmarkScriptArgName), "/run/storage-benchmark-script", true},
+		{filepath.Join(filepath.Dir(c.String(storageBenchmarkScriptArgName)), "diode_fio"), "/run/storage-benchmark-tool", true},
+		{c.String(storageBenchmarkOutputArgName), "/run/storage-benchmark-results", false},
+	} {
+		if err := vm.Share(ctx, share.host, share.guest, share.readOnly); err != nil {
+			return fmt.Errorf("share storage benchmark input/results: %w", err)
+		}
+	}
+	return nil
+}
+
 func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityVM,
 	plan *siblingStoragePlan, reports []siblingStorageBackendReport,
 	regions int, eventArgs string) (string, func(context.Context) error, error) {
 	noCleanup := func(context.Context) error { return nil }
-	script := c.String(storageBenchmarkScriptArgName)
 	role := ""
 	if plan != nil {
 		var err error
@@ -284,17 +404,8 @@ func prepareStorageBenchmark(ctx context.Context, c *cli.Context, vm *uvm.Utilit
 			return "", noCleanup, err
 		}
 	}
-	for _, share := range []struct {
-		host, guest string
-		readOnly    bool
-	}{
-		{script, "/run/storage-benchmark-script", true},
-		{filepath.Join(filepath.Dir(script), "diode_fio"), "/run/storage-benchmark-tool", true},
-		{c.String(storageBenchmarkOutputArgName), "/run/storage-benchmark-results", false},
-	} {
-		if err := vm.Share(ctx, share.host, share.guest, share.readOnly); err != nil {
-			return "", noCleanup, fmt.Errorf("share storage benchmark input/results: %w", err)
-		}
+	if err := shareStorageBenchmark(ctx, c, vm); err != nil {
+		return "", noCleanup, err
 	}
 	command := storageBenchmarkPreflight(requestedVMProcessors(c, vm.ID()), c.String(storageBenchmarkIdleArgName))
 	if plan == nil {

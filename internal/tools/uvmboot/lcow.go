@@ -353,9 +353,12 @@ var lcowCommand = cli.Command{
 			_, err = fmt.Printf("storage_backend_plan: %s\n", data)
 			return err
 		}
-		unikraft, err := loadUnikraftConfig(c, storagePlan)
-		if err != nil {
-			return err
+		var unikraft *unikraftConfig
+		if c.String(storageBenchmarkScriptArgName) == "" {
+			unikraft, err = loadUnikraftConfig(c, storagePlan)
+			if err != nil {
+				return err
+			}
 		}
 		benchSeconds = c.Int(benchSecondsArgName)
 		if benchSeconds < 1 {
@@ -410,6 +413,9 @@ var lcowCommand = cli.Command{
 			benchmarkCtx, cancel = context.WithTimeout(benchmarkCtx, timeout)
 			cancelBenchmark = cancel
 			defer cancel()
+		}
+		if c.String(storageBenchmarkScriptArgName) != "" {
+			return runProductionStorageBenchmark(benchmarkCtx, c, cpuGroupLPs, cpuGroupPriorities)
 		}
 		cpuGroups, err := prepareCPUGroups(context.Background(), cpuGroupLPs,
 			c.GlobalInt(countArgName), hostCPUGroupOperations, cpuGroupPriorities...)

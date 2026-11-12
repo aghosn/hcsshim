@@ -15,7 +15,7 @@ const (
 	Magic            uint32 = 0x314d4344
 	Version          uint16 = 1
 	HeaderSize              = 40
-	MaxExports              = 16
+	MaxExports              = 64
 	ExportSize              = 32
 	CapabilitiesSize        = 24
 	MutationSize            = 16
