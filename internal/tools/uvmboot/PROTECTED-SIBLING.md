@@ -1,9 +1,10 @@
 # Protected sibling pair: operator runbook
 
-This is the private, default-off, standalone SNP Linux experiment, not a
+This is the default-off SNP Linux experiment, not a
 production isolation guarantee. Source acceptance is **not** build, deployment,
 or hardware acceptance. The hardware commands below remain manual acceptance
-steps; source and fixture checks do not replace them.
+steps; source and fixture checks do not replace them. The standalone workflow
+is preserved; the reduced containerd-owned profile is described separately below.
 
 The 2026-11-10 upstream integration supersedes the earlier transport-v3 pin.
 Use hcsshim branch
@@ -31,8 +32,9 @@ Supply the actual current IGVM-derived
 IGVM/kernel build inputs and hash as well as the VMGS/rootfs hashes: the CLI
 consumes the VMGS, not a separate invented `--igvm` argument. Kernel, modules,
 rootfs, GCS and runtime tools must agree. Arbitrary storage exports,
-appliance/Unikraft, owned startup, OpenShell, benchmarks, mapping-only/inventory,
+appliance/Unikraft, OpenShell, benchmarks, mapping-only/inventory,
 and the old protected diagnostic/two-proof lifecycle remain unsupported.
+Owned startup requires the reduced profile below, not these standalone CLI flags.
 
 Deploy the matched native product set through the established lab process:
 VID DLL **and** driver, worker memory/VMB components, common shared-region
@@ -250,7 +252,7 @@ cannot establish this. Other profiles still use manual AHV diagnostics.
 
 Legacy public `-ProtectedShared` keeps its 2-MiB default and direct roots/GCS;
 raw legacy geometry bounds are unchanged. Root-only/relay-only protection,
-custom exports, owned/appliance/OpenShell/benchmark modes are unsupported.
+custom exports and appliance/OpenShell/benchmark modes are unsupported.
 `-NoStorageMediation` is redundant for legacy and rejected with combined mode.
 Initial hardware acceptance uses **no optional partition masks or pause**;
 admission sealing still applies. Attach readiness does not establish completed
@@ -367,6 +369,74 @@ backing admission sealing, root/GCS routing and diode-only AHV tooling above;
 do not enable ordinary backing or relax receipt checks to obtain a boot.
 Native build, matched deployment and hardware recovery remain pending; use
 section 9's T1-T6 handoff rather than treating source acceptance as execution.
+
+### Reduced containerd-owned Linux profile
+
+Use the newly built matched shim and launcher from this worktree pair, not
+only the historical integration pins above. From the complete companion runtime,
+after stopping any existing pair, use a fresh state directory:
+
+```powershell
+.\run.ps1 diode start -ProtectedShared -MediateGCS -WorkloadPartitionSealMask 0x1 -LateAhvAttestation -StateDirectory .\runtime-owned\
+.\run.ps1 container hello-world -StateDirectory .\runtime-owned\
+.\run.ps1 container hello-world -StateDirectory .\runtime-owned\
+.\run.ps1 attach workload
+# Workload shell: /usr/bin/ahv-guest-ctl boot-client (once).
+.\run.ps1 diode status -StateDirectory .\runtime-owned\
+.\run.ps1 diode stop -StateDirectory .\runtime-owned\
+```
+
+`StateDirectory` or `CrictlPath` explicitly selects containerd ownership.
+Only Linux with both root/GCS mediation, 32 MiB backing and unchanged SNP/
+dm-verity/prototype policy is admitted. No owned seal pause, Unikraft,
+OpenShell, tuning/CPU groups, static custom exports, direct workload root/GCS
+or page-metadata host export. Preparation requires only sibling bus, storage
+and network providers, iptables and the AHV tool, not benchmark/covert tools.
+Standalone tool staging, masks and optional pause remain unchanged.
+
+The same concrete `internal/sibling/protected_memory.go` backing/controller
+is used by standalone and owned startup. Owned Bootstrap-before-Import,
+root/GCS service overlap, readiness and required backing admission sealing
+precede selected diode then workload partition seals. Backing admission sealing
+is distinct from a partition mask. Omission makes no call; zero and all uint64
+bits remain exact optional decimal strings. Seals finish before sandbox
+infrastructure or application containers are created. Post-seal containers
+and late AHV with `0x1` remain **pending hardware acceptance**: report native/
+guest errors, never weaken masks or move sealing.
+
+Early mode uses the measured AHV relay-root image. `LateAhvAttestation` selects
+the unmarked relay-root image during preparation only; it is not a shim flag.
+The owned diode collector is `/run/sibling-exec/ahv-guest-ctl`, while the
+workload client is `/usr/bin/ahv-guest-ctl` from its verified root. Invoke late
+client once; no repeated-fetch/reset or new evidence-verification policy exists.
+AHV output remains unverified evidence. `protected-pair.log`, beside the
+receipt, correlates guest/service diagnostics with run/VM IDs; ordinary CRI
+logs and binary-logger support are unchanged. External logger completion is
+not a native reclaim prerequisite.
+
+Existing `owner.json` records protected selection, the fresh session's run ID,
+expected receipt path, dispatch and sandbox reconciliation. Protected CRI
+timeouts are `runp` 30 minutes and `stopp`/`rmp` 3 minutes; ordinary values
+remain unchanged. The shim publishes only one terminal file, atomically and
+without overwrite, after actual successful pair cleanup:
+
+```json
+{"version":1,"run_id":"<session>","workload_vm_id":"<sandbox>@vm","diode_vm_id":"<sandbox>@vm-diode","result":"released"}
+```
+
+It lives at `<fresh-session>\protected-cleanup-result.json`, with no mirrored
+phase/counter/history protocol. It communicates completion, not attestation
+or independent native authority. After dispatch, the runner requires sandbox
+reconciliation **and** this exact matching result before terminating its
+verified private daemon. Lost `runp` replies may use the existing owner label;
+unknown sandbox, empty list, lost reply, daemon exit or `rmp` success alone
+cannot authorize stop. Missing/malformed/mismatched completion retains daemon,
+boot copies and diagnostics with `cleanup-incomplete` and an explicit manual
+intervention error. Receipt publication failure never replays native controls;
+reconciled removal is persisted so a later stop only checks completion.
+Before dispatch, its own daemon may be closed normally. No forced shim kill,
+service change, crash recovery or uncertain-work replay is provided.
+Builds, regressions and H1-H3 hardware acceptance remain pending.
 
 ## 3. Attach, capture and filter actual workload traffic
 
@@ -965,5 +1035,6 @@ are the lookup anchors.
 | Demo/tcpdump/iptables syntax, traffic units, descriptor v2/54/event-range limits, transport v4/sysfs/CIDs and socket CLI | matched companion `203341899db940bc4165507f0371a1eed10d5949`: `diagnostics/sibling-bus/{demo.sh,diode_tcpbulk.c,diode_vsock_test.c,sibling_bus.c}`; `mshv/include/hyperv/{sibling_link.h,sibling_wire.h}` (`sibling_link_validate`, `SIBLING_BUS_VERSION`, `sibling_instance_show`); hcsshim `lcow.go`: `siblingTransportVersion`, `siblingInstanceDiscoveryCommand` (shared ordinary/protected guard) | M01/M03/M04 |
 | Exact masks and truthful submission evidence | hcsshim `protected_sibling.go`: `sealPartitions`, `reportSeal`; `internal/uvm/partition.go`, `internal/hcs/v2/system.go`, `internal/computecore/computecore.go` | M05/M06 |
 | Exclusive marker sharing/content/cleanup and interactive lifetime | hcsshim `protected_sibling_pause.go`; `interactive.go`: protected server and `siblingShellSession`; `internal/cmd/cmd.go` opt-in joining | M05/M07 |
-| Prefix accounting/authorized reclaim/no ordinary close | hcsshim `protected_sibling.go`: `cleanup`; `protected_sibling_memory.go`: `controlBatch`, `advance`, `release` | M07 |
+| Prefix accounting/authorized reclaim/no ordinary close | Standalone `internal/tools/uvmboot/protected_sibling.go`: `cleanup`; shared `internal/sibling/protected_memory.go`: `ProtectedBacking`, `controlBatch`, `advance`, `Release` (the former standalone memory file was removed) | M07 |
+| Owned configuration, Bootstrap-before-Import, joined cleanup and one final receipt | hcsshim `internal/sibling/pair.go`: `Config`, `decodeConfig`; `protected_pair.go`: `start`, `close`, `publishReceipt`; companion `runtime/start-uvms.ps1`, `run-workload-container.ps1` | H1-H3 pending |
 | Generation/build and explicit builder checkout | plan S8; hcsshim `go.mod`, computecore generator directive; matched companion `203341899db940bc4165507f0371a1eed10d5949`: `scripts/{build-hcs-launcher.ps1,resolve-build-root.py}` | M08 |
