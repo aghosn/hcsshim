@@ -194,6 +194,17 @@ socket readiness: bounded transient CID4 setup retries may overlap workload
 native boot. No peer/GCS readiness wait precedes workload Start.
 
 Only this combined protected workload image carries measured `AHV_BOOT_ATTEST=1`.
+The public debug-only `-LateAhvAttestation` switch instead selects the existing
+unmarked relay-root image; backing/VMBus/root/GCS and the owned diode server
+still start normally. After attaching the workload, manually run
+`/usr/bin/ahv-guest-ctl boot-client` once. The same protocol, 300-second budget
+and fresh private output rules apply. Workload progress goes to its shell;
+diode phase/ioctl diagnostics stream to the launcher. Failure is a command
+error, not a boot gate in this mode. No repeated-fetch/reset support is added.
+Reports now describe post-boot/seal state; selected diode policies may require
+the existing pre-seal `prepare` procedure, never weakening seals. Default
+early behavior remains unchanged.
+
 After read-only dm-verity root mount, its conditional `/startup.sh` hook invokes
 the root-embedded `/usr/bin/ahv-guest-ctl boot-client` before the exact original
 `/init`/GCS launch suffix and deny-policy flags. `/init` and runc are preserved.
