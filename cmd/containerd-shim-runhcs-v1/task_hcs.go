@@ -34,6 +34,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/internal/resources"
 	"github.com/Microsoft/hcsshim/internal/shimdiag"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/Microsoft/hcsshim/pkg/annotations"
@@ -205,6 +206,13 @@ func newHcsTask(
 	req *task.CreateTaskRequest,
 	s *specs.Spec,
 	hostOwner ...interface{ Close() error }) (_ shimTask, err error) {
+	var protection *sibling.Pair
+	if len(hostOwner) != 0 {
+		protection, _ = hostOwner[0].(*sibling.Pair)
+		if protection != nil && !protection.IsProtected() {
+			protection = nil
+		}
+	}
 	ctx, entry := log.SetEntry(ctx, logrus.Fields{logfields.TaskID: req.ID})
 	entry.WithFields(logrus.Fields{
 		"hasHost":      parent != nil,
@@ -261,6 +269,7 @@ func newHcsTask(
 		closed:         make(chan struct{}),
 		taskSpec:       s,
 		ioRetryTimeout: ioRetryTimeout,
+		protection:     protection,
 	}
 	if len(hostOwner) != 0 {
 		ht.hostOwner = hostOwner[0]
@@ -354,8 +363,9 @@ type hcsTask struct {
 	// `nil`.
 	host *uvm.UtilityVM
 	// hostOwner closes companion resources together with the hosting VM.
-	// It is set before lifecycle goroutines start, and only the sandbox owns it.
-	hostOwner interface{ Close() error }
+	// It is set before lifecycle goroutines start; only the sandbox invokes Close.
+	hostOwner  interface{ Close() error }
+	protection *sibling.Pair // Sandbox stop reaches native shutdown before guest cleanup.
 
 	// ecl is the exec create lock for all non-init execs and MUST be held
 	// during create to prevent ID duplication.
@@ -463,6 +473,12 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 	if all && eid != "" {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "cannot signal all for non-empty exec: '%s'", eid)
 	}
+	if ht.protection != nil && eid == "" && (signal == 9 || signal == 15) {
+		ht.protection.Stop()
+		// Observed native exit fulfills this terminal signal without a guest
+		// RPC. The pair owner independently validates reclaim and release.
+		return ht.host.WaitNativeExit(ctx)
+	}
 	if all {
 		// We are in a kill all on the init task. Signal everything.
 		ht.execs.Range(func(key, value interface{}) bool {
@@ -510,6 +526,14 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 	if err != nil {
 		return 0, 0, time.Time{}, err
 	}
+	if eid == "" && ht.protection != nil {
+		if state := e.State(); state == shimExecStateRunning {
+			return 0, 0, time.Time{}, newExecInvalidStateError(ht.id, eid, state, "delete")
+		}
+		if err := ht.protection.Close(); err != nil {
+			return 0, 0, time.Time{}, err
+		}
+	}
 	if eid == "" {
 		// We are deleting the init exec. Forcibly exit any additional exec's.
 		ht.execs.Range(func(key, value interface{}) bool {
@@ -542,8 +566,8 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 		// The task process may have already exited, and the status set to
 		// shimExecStateExited, but resources may still be in the process
 		// of being cleaned up. Wait for ht.closed to be closed. This signals
-		// that [hcsTask.waitInitExit]/[hcsTask.waitForHostExit] has finished destroying
-		// container resources and that layers were umounted.
+		// that [hcsTask.waitInitExit]/[hcsTask.waitForHostExit] has finished attempting
+		// container resource cleanup and layer unmounts.
 		// If the shim exits before resources are cleaned up, those resources
 		// will remain locked and untracked, which leads to lingering sandboxes
 		// and container resources like base vhdx.
@@ -679,7 +703,13 @@ func (ht *hcsTask) waitForHostExit() {
 		attribute.Bool("host", ht.host != nil),
 		attribute.Bool("ownsHost", ht.ownsHost))
 
-	err := ht.host.WaitCtx(ctx)
+	var err error
+	if ht.protection != nil {
+		err = ht.host.WaitNativeExit(ctx)
+		ht.protection.Stop()
+	} else {
+		err = ht.host.WaitCtx(ctx)
+	}
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to wait for host virtual machine exit")
 	} else {
@@ -707,6 +737,9 @@ func (ht *hcsTask) close(ctx context.Context) {
 	ht.closeOnce.Do(func() {
 		entry := log.G(ctx)
 		entry.Debug("hcsTask::closeOnce")
+		if ht.protection != nil {
+			ht.protection.Stop()
+		}
 
 		// ht.c should never be nil for a real task but in testing we stub
 		// this to avoid a nil dereference. We really should introduce a
@@ -771,12 +804,12 @@ func (ht *hcsTask) close(ctx context.Context) {
 			entry.Trace("starting task resource cleanup")
 
 			if err := resources.ReleaseResources(ctx, ht.cr, ht.host, true); err != nil {
-				entry.WithError(err).Error("failed to release container resources")
+				entry.WithError(err).Warn("failed to release container resources")
 			}
 
 			// Close the container handle invalidating all future access.
 			if err := ht.c.Close(); err != nil {
-				entry.WithError(err).Error("failed to close container")
+				entry.WithError(err).Warn("failed to close container")
 			}
 
 			entry.Trace("task resource cleanup completed")

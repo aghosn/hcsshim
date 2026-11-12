@@ -376,6 +376,24 @@ func (uvm *UtilityVM) Close() error { return uvm.CloseCtx(context.Background()) 
 // The context is used for all operations, including waits, so timeouts/cancellations may prevent
 // proper uVM cleanup.
 func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
+	return uvm.closeCtx(ctx, true)
+}
+
+// CloseAfterNativeExit verifies native exit before releasing VM resources,
+// without joining output forwarding. Callers must first settle Start's ordinary
+// resource publication as well as native Create/Start/control work and release
+// any protected backing. Waiting for publication is a VM-handle lifetime rule,
+// not a protected backing release prerequisite.
+func (uvm *UtilityVM) CloseAfterNativeExit(ctx context.Context) error {
+	if err := uvm.WaitNativeExit(ctx); err != nil {
+		return err
+	}
+	return uvm.closeCtx(ctx, false)
+}
+
+// closeCtx shares resource cleanup; only ordinary CloseCtx joins output.
+// With joinOutput false, CloseAfterNativeExit must already have verified exit.
+func (uvm *UtilityVM) closeCtx(ctx context.Context, joinOutput bool) (err error) {
 	ctx, span := ot.StartSpan(ctx, "uvm::Close")
 	defer span.End()
 	defer func() { ot.SetSpanStatus(span, err) }()
@@ -415,7 +433,7 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 		uvm.outputListener = nil
 	}
 
-	if uvm.hcsSystem != nil {
+	if uvm.hcsSystem != nil && joinOutput {
 		// wait for IO to finish
 		// [WaitCtx] calls [uvm.hcsSystem.WaitCtx] again, but since we waited on it above already
 		// it should nop and return without issue.

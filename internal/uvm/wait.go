@@ -24,6 +24,12 @@ func (uvm *UtilityVM) WaitCtx(ctx context.Context) (err error) {
 	return errors.Join(err, uvm.waitForOutput(ctx))
 }
 
+// WaitNativeExit waits only for native HCS termination, not output forwarding.
+// It retains handles and boot files; cancellation or failure is not exit proof.
+func (uvm *UtilityVM) WaitNativeExit(ctx context.Context) error {
+	return uvm.hcsSystem.WaitCtx(ctx)
+}
+
 // waitForOutput joins only processing owned by an entered Start. Create may
 // allocate the completion channel without starting a processor; leave that
 // channel and all owners intact. Once Start is entered, timeout remains an

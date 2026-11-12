@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 	"github.com/urfave/cli"
 )
@@ -172,8 +173,8 @@ func TestProtectedSiblingProfileSelections(t *testing.T) {
 		{"relay-only", false, []string{"--" + siblingGCSRelayArgName}, true},
 		{"root-false", true, []string{"--" + siblingStorageRootArgName + "=false"}, true},
 		{"relay-false", true, []string{"--" + siblingGCSRelayArgName + "=false"}, true},
-		{"legacy-min", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(protectedTransportMinBytes)}, false},
-		{"legacy-max", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(protectedTransportMaxBytes)}, false},
+		{"legacy-min", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(sibling.ProtectedBackingMinBytes)}, false},
+		{"legacy-max", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(sibling.ProtectedBackingMaxBytes)}, false},
 		{"legacy-unaligned", false, []string{"--" + sharedMemorySizeArgName, "2097153"}, true},
 		{"legacy-small", false, []string{"--" + sharedMemorySizeArgName, "4096"}, true},
 		{"legacy-large", false, []string{"--" + sharedMemorySizeArgName, "33558528"}, true},
