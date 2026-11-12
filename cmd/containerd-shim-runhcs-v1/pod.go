@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -252,7 +253,10 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		// clean up the uvm if we fail any further operations
 		if err != nil {
 			if pair != nil {
-				pair.Close()
+				cleanupErr := pair.Close()
+				if pair.IsProtected() {
+					err = stderrors.Join(err, cleanupErr)
+				}
 			} else if parent != nil {
 				parent.Close()
 			}
@@ -260,6 +264,14 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 	}()
 
 	p.host = parent
+	p.pair = pair
+	if pair != nil && pair.IsProtected() {
+		p.creates.Add(1)
+		defer p.creates.Done()
+		// Stop notification uses the normal task cleanup, not a second pipe.
+		// Start this before sandbox creation: a failed publication still drains.
+		go p.waitProtectedStop()
+	}
 	if parent != nil && pair == nil {
 		cid := req.ID
 		if id, ok := s.Annotations[annotations.NcproxyContainerID]; ok {
@@ -341,7 +353,9 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		if err != nil {
 			return nil, err
 		}
+		p.createMu.Lock()
 		p.sandboxTask = lt
+		p.createMu.Unlock()
 	}
 	return &p, nil
 }
@@ -370,6 +384,10 @@ type pod struct {
 	spec *specs.Spec
 
 	workloadTasks sync.Map
+	pair          *sibling.Pair
+	createMu      sync.Mutex
+	closing       bool
+	creates       sync.WaitGroup
 }
 
 func (p *pod) ID() string {
@@ -377,6 +395,16 @@ func (p *pod) ID() string {
 }
 
 func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *specs.Spec) (_ shimTask, err error) {
+	if p.pair != nil && p.pair.IsProtected() {
+		p.createMu.Lock()
+		if p.closing {
+			p.createMu.Unlock()
+			return nil, errors.New("protected pod creation admission is closed")
+		}
+		p.creates.Add(1)
+		p.createMu.Unlock()
+		defer p.creates.Done()
+	}
 	if config := s.Annotations[annotations.LCOWSiblingPair]; config != "" &&
 		config != p.spec.Annotations[annotations.LCOWSiblingPair] {
 		return nil, errors.New("a workload cannot create or change its sandbox's sibling pair ownership")
@@ -420,7 +448,12 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 			sid)
 	}
 
-	st, err := newHcsTask(ctx, p.events, p.host, false, req, s)
+	var st shimTask
+	if p.pair != nil && p.pair.IsProtected() {
+		st, err = newHcsTask(ctx, p.events, p.host, false, req, s, p.pair)
+	} else {
+		st, err = newHcsTask(ctx, p.events, p.host, false, req, s)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +502,10 @@ func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all 
 	}
 	eg := errgroup.Group{}
 	if all && tid == p.id {
+		if p.pair != nil && p.pair.IsProtected() {
+			p.pair.Stop()
+			p.joinProtectedCreates()
+		}
 		// We are in a kill all on the sandbox task. Signal everything.
 		p.workloadTasks.Range(func(key, value interface{}) bool {
 			wt := value.(shimTask)
@@ -481,10 +518,40 @@ func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all 
 			return true
 		})
 	}
+
 	eg.Go(func() error {
 		return t.KillExec(ctx, eid, signal, all)
 	})
 	return eg.Wait()
+}
+
+// joinProtectedCreates closes pod admission before enumeration. A create that
+// raced stop must publish or finish cleanup before the snapshot is taken.
+func (p *pod) joinProtectedCreates() {
+	p.createMu.Lock()
+	p.closing = true
+	p.createMu.Unlock()
+	p.creates.Wait()
+}
+
+// waitProtectedStop routes provider/host loss and sandbox exit through the same
+// task cleanup as CRI stop. In-flight creates cannot escape the joined snapshot.
+func (p *pod) waitProtectedStop() {
+	<-p.pair.Done()
+	p.joinProtectedCreates()
+	ctx := context.Background()
+	// ForceExit still requires real command Wait and resource cleanup.
+	p.workloadTasks.Range(func(_, value interface{}) bool {
+		ht := value.(*hcsTask)
+		ht.init.ForceExit(ctx, 1)
+		return true
+	})
+	p.createMu.Lock()
+	sandbox := p.sandboxTask
+	p.createMu.Unlock()
+	if sandbox != nil {
+		sandbox.(*hcsTask).init.ForceExit(ctx, 1)
+	}
 }
 
 func (p *pod) DeleteTask(ctx context.Context, tid string) error {
@@ -505,6 +572,18 @@ func (p *pod) DeleteTask(ctx context.Context, tid string) error {
 	}
 	if e.State() == shimExecStateRunning {
 		return errors.Wrap(errdefs.ErrFailedPrecondition, "cannot delete task with running exec")
+	}
+	if p.pair != nil && p.pair.IsProtected() {
+		// Metadata removal follows the actual cleanup result, not init status.
+		ht := t.(*hcsTask)
+		select {
+		case <-ht.closed:
+			if ht.cleanupErr != nil {
+				return ht.cleanupErr
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	if p.id != tid {

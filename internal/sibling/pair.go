@@ -235,6 +235,8 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 
 // Start creates and bootstraps a pair in-process. Workload boot and diode root
 // provider bootstrap must overlap: the workload cannot reach GCS without root0.
+// Protected errors run the single cleanup decision; incomplete owners stay
+// retained in-process even when no sandbox task was published.
 func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair, resultErr error) {
 	ctx, cancelStartup := context.WithCancel(ctx)
 	defer cancelStartup()
@@ -251,7 +253,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, err
 	}
 	if config.ProtectedShared {
-		return nil, errors.New("protected owned startup is gated until protected Close and admission integration is available")
+		pair, err := startProtectedPair(ctx, base, config)
+		if err != nil && pair != nil {
+			err = errors.Join(err, pair.Close())
+		}
+		return pair, err
 	}
 	native, err := loadOwnedUnikraft(config)
 	if err != nil {
@@ -530,6 +536,9 @@ func workloadNICCommandForMAC(mac string) string {
 		`[ "$count" -eq 1 ]; do sleep 0.1; done; printf '%s\n' "$dev"`
 }
 
+// Close makes one cleanup decision. Protected callers first settle the sandbox's
+// own task obligation; other admitted tasks are joined before any VM is retired.
+// An error is sticky and must not be interpreted as backing release or retried.
 func (p *Pair) Close() error {
 	return p.close(nil)
 }
@@ -538,11 +547,13 @@ func (p *Pair) close(cause error) error {
 	if p == nil {
 		return nil
 	}
-	// S2 must never run ordinary CloseCtx (which deletes VMGS) on a protected owner.
-	// S3 replaces this gate with joined task drainage and the single native cleanup.
 	if p.protected != nil {
 		p.protected.stop(cause)
-		return errors.New("protected cleanup is not integrated; pair and dependencies retained")
+		// All callers share the one decision, including publication failures.
+		p.closeOnce.Do(func() {
+			p.closeErr = p.protected.close()
+		})
+		return p.closeErr
 	}
 	p.closeOnce.Do(func() {
 		p.closeErr = cause

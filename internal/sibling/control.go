@@ -67,10 +67,17 @@ func runGuest(ctx context.Context, vm *uvm.UtilityVM, script string) (string, er
 // joinedGuestCommand binds creation and all command-owned callbacks to ctx.
 // The caller retains vm and output until Run/Wait returns, even past deadlines.
 func joinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) *cmd.Cmd {
-	command := cmd.CommandContext(ctx, contextHost{vm, ctx}, "/bin/sh", "-ec", script)
+	command := NewJoinedGuestCommand(ctx, vm, "/bin/sh", "-ec", script)
+	command.Stdout, command.Stderr = output, output
+	return command
+}
+
+// NewJoinedGuestCommand reuses Cmd's joined lifetime for protected direct guest
+// borrowers. The caller retains vm and joins any external input producer.
+func NewJoinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, name string, args ...string) *cmd.Cmd {
+	command := cmd.CommandContext(ctx, contextHost{vm, ctx}, name, args...)
 	command.JoinBackgroundOperations = true
 	command.CopyAfterExitTimeout = 5 * time.Second
-	command.Stdout, command.Stderr = output, output
 	return command
 }
 

@@ -18,6 +18,7 @@ import (
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
+	"github.com/Microsoft/hcsshim/internal/signals"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
@@ -29,6 +30,7 @@ const (
 	protectedPairGCSBudget   = 7 * time.Minute
 	protectedPartitionBudget = 5 * time.Minute
 	protectedPairLogName     = "protected-pair.log"
+	protectedCleanupBudget   = 2 * time.Minute
 )
 
 // protectedVMAttempt is retained before CreateLCOW, even when it returns no VM.
@@ -54,37 +56,47 @@ type protectedService struct {
 	exited     bool
 	dependency bool
 	attempted  bool
+	unexpected error
+	mu         sync.Mutex
+	retiring   bool
+	signals    sync.WaitGroup
+	signalErr  error
 }
 
 // protectedPair is a serial lifecycle owner, not a second VM/task implementation.
-// S3 must join startupDone, task/attach borrowers, watchers and service.done before
-// closing any owner. Dependencies intentionally survive stop: workload shutdown
+// Close joins startup, tasks, attach, watchers and services before retiring
+// their owners. Dependencies intentionally survive stop: workload shutdown
 // still needs the diode's root/provider/relay. No implicit backing Close exists.
 type protectedPair struct {
-	pair             *Pair
-	config           *Config
-	backing          *ProtectedBacking
-	diode            protectedVMAttempt
-	workload         protectedVMAttempt
-	rootAttempt      bool
-	root             *scsi.Mount
-	uplinkAttempt    bool
-	services         []*protectedService
-	control          *ExportControl
-	backend          scsi.HostBackend
-	log              *os.File
-	startupDone      chan struct{}
-	startupErr       error
-	startupParent    context.Context // Checked at seal commitment, never used as a service lifetime.
-	ctx              context.Context
-	cancel           context.CancelCauseFunc
-	dependencyCtx    context.Context
-	stopDependencies context.CancelFunc
-	watchCtx         context.Context
-	stopWatch        context.CancelFunc
-	watchers         sync.WaitGroup
-	forwardMu        sync.Mutex
-	// Attempts are immutable evidence for S3, not permission to replay controls.
+	pair                *Pair
+	config              *Config
+	backing             *ProtectedBacking
+	diode               protectedVMAttempt
+	workload            protectedVMAttempt
+	rootAttempt         bool
+	root                *scsi.Mount
+	uplinkAttempt       bool
+	services            []*protectedService
+	control             *ExportControl
+	backend             scsi.HostBackend
+	log                 *os.File
+	startupDone         chan struct{}
+	startupErr          error
+	startupParent       context.Context // Checked at seal commitment, never used as a service lifetime.
+	ctx                 context.Context
+	cancel              context.CancelCauseFunc
+	dependencyCtx       context.Context
+	stopDependencies    context.CancelFunc
+	watchCtx            context.Context
+	stopWatch           context.CancelFunc
+	watchers            sync.WaitGroup
+	forwardMu           sync.Mutex
+	closing             bool
+	tasks               int
+	tasksDone           chan struct{}
+	taskErr             error
+	dependenciesClosing bool // Guarded by forwardMu; expected relay EOF, not cancellation.
+	// Attempts are retained evidence, not permission to replay controls.
 	admissionAttempt bool
 	sealAttempt      [2]bool
 }
@@ -94,8 +106,7 @@ type protectedPair struct {
 // creation, creates independent foreground AHV and root/GCS services before
 // workload Start, then checks mediation and seals before sandbox creation.
 //
-// This private S2 entry is deliberately NOT dispatched by Start. S3 must wire
-// admission, safe Close and failed-start retention first. After owner allocation,
+// After owner allocation,
 // even an error returns the Pair: the caller must retain it, never ordinary-close
 // its VMs or delete its prepared bundle. Native calls are synchronous and joined;
 // deadlines cannot abandon executing calls, buffers or controller capabilities.
@@ -135,9 +146,16 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 		pair: pair, config: config, ctx: ctx, cancel: cancel,
 		dependencyCtx: dependencies, stopDependencies: stopDependencies,
 		watchCtx: watch, stopWatch: stopWatch, startupDone: make(chan struct{}), startupParent: parent,
-		diode: protectedVMAttempt{options: diode}, workload: protectedVMAttempt{options: workload},
+		tasksDone: make(chan struct{}),
+		diode:     protectedVMAttempt{options: diode}, workload: protectedVMAttempt{options: workload},
 	}
 	pair.protected = p
+	if err := registerProtectedPair(p); err != nil {
+		cancel(err)
+		stopDependencies()
+		stopWatch()
+		return nil, err
+	}
 	// The create RPC owns cancellation only until this bridge is detached and
 	// joined. Owner/service contexts do not inherit its eventual completion.
 	detach, bridged := make(chan struct{}), make(chan struct{})
@@ -215,6 +233,9 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 		}
 	}
 	logPath := filepath.Join(filepath.Dir(config.CleanupReceiptPath), protectedPairLogName)
+	if filepath.Base(config.CleanupReceiptPath) != "protected-cleanup-result.json" {
+		return errors.New("protected receipt must be named protected-cleanup-result.json in the fresh session")
+	}
 	if strings.EqualFold(filepath.Clean(config.CleanupReceiptPath), logPath) {
 		return errors.New("protected cleanup receipt must be separate from the run log")
 	}
@@ -243,12 +264,19 @@ func protectedPairInputs() []string {
 // It never cancels dependencies needed by workload drainage.
 func (p *protectedPair) stop(cause error) {
 	p.forwardMu.Lock()
+	if !p.closing {
+		p.closing = true
+		close(p.pair.done)
+		if p.tasks == 0 {
+			close(p.tasksDone)
+		}
+	}
 	p.cancel(cause)
 	p.forwardMu.Unlock()
 }
 
 // bootstrap owns all effects for startProtectedPair. Attempts and partial results
-// stay attached to p on failure; S3 alone will decide drainage and reclaim.
+// stay attached to p on failure; close alone decides drainage and reclaim.
 func (p *protectedPair) bootstrap(group string) error {
 	setup, stopSetup := context.WithTimeout(p.ctx, protectedPairSetupBudget)
 	defer stopSetup()
@@ -453,7 +481,7 @@ func (p *protectedPair) observeFailedStartup(v *protectedVMAttempt) {
 }
 
 // watch cancels forward work on unexpected VM exit without mutating lifecycle
-// evidence. S3 must stop/join these watchers before closing VM handles.
+// evidence. close stops and joins these watchers before closing VM handles.
 func (p *protectedPair) watch(v *protectedVMAttempt) {
 	p.watchers.Add(1)
 	// WaitCtx borrows the retained VM until observation or explicit watcher stop.
@@ -461,7 +489,9 @@ func (p *protectedPair) watch(v *protectedVMAttempt) {
 		defer p.watchers.Done()
 		err := v.vm.WaitCtx(p.watchCtx)
 		if p.watchCtx.Err() == nil {
-			p.stop(errors.Join(fmt.Errorf("protected VM %s exited", v.options.ID), err, v.vm.ExitError()))
+			cause := errors.Join(fmt.Errorf("protected VM %s exited", v.options.ID), err, v.vm.ExitError())
+			_, logErr := fmt.Fprintf(p.log, "VM ended run=%s vm=%s error=%v\n", p.config.RunID, v.options.ID, cause)
+			p.stop(errors.Join(cause, logErr))
 		}
 	}()
 }
@@ -503,8 +533,8 @@ func (p *protectedPair) stage(ctx context.Context, v *protectedVMAttempt) error 
 }
 
 // startService retains the concrete process before creation, then owns its sole
-// joined Wait. ctx bounds creation, not the process lifetime. Dependency
-// cancellation is reserved for S3 after workload exit.
+// joined Wait. ctx bounds creation, not the process lifetime. Dependencies use
+// trapped TERM only after workload exit, with signal borrowers joined before Wait.
 // A premature exit cancels forward work, not the still-needed root/relay.
 func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt, script string, dependency bool) error {
 	lifetime := p.ctx
@@ -518,6 +548,11 @@ func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt,
 		return context.Cause(p.ctx)
 	}
 	command := joinedGuestCommand(lifetime, v.vm, script, p.log)
+	if dependency {
+		// TERM lets a foreground insmod finish/reap before the shell exits.
+		// Cmd's context cancellation would SIGKILL the shell and orphan it.
+		command.Context = nil
+	}
 	command.Host = contextHost{v.vm, ctx}
 	command.Log = command.Log.WithField("protected_run", p.config.RunID).WithField("vm", v.options.ID)
 	service := &protectedService{command: command, done: make(chan struct{}), dependency: dependency}
@@ -538,8 +573,19 @@ func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt,
 	// This waiter owns all command callbacks/IO until done, not just guest exit.
 	go func() {
 		waitErr := command.Process.Wait()
-		p.stop(errors.Join(fmt.Errorf("protected service on %s exited", v.options.ID), waitErr))
-		service.err = errors.Join(waitErr, command.Wait())
+		p.forwardMu.Lock()
+		expected := lifetime.Err() != nil || (dependency && p.dependenciesClosing)
+		p.forwardMu.Unlock()
+		if !expected {
+			service.unexpected = errors.Join(fmt.Errorf("protected service on %s exited unexpectedly", v.options.ID), waitErr)
+			p.stop(service.unexpected)
+		}
+		// Retire signal admission before Cmd.Wait can close Process.
+		service.mu.Lock()
+		service.retiring = true
+		service.mu.Unlock()
+		service.signals.Wait()
+		service.err = errors.Join(service.unexpected, waitErr, service.signalErr, command.Wait())
 		service.exited = command.ExitState.ExitCode() != -1
 		_, logErr := fmt.Fprintf(p.log, "service ended run=%s vm=%s exited=%t error=%v\n",
 			p.config.RunID, v.options.ID, service.exited, service.err)
@@ -647,7 +693,308 @@ func (p *protectedPair) configure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return p.workload.vm.ConfigureSiblingStorage(p.backend)
+	if err := p.workload.vm.ConfigureSiblingStorage(p.backend); err != nil {
+		return err
+	}
+	return p.workload.vm.SCSIManager.EnableProtectedSibling()
+}
+
+// IsProtected identifies the opt-in task cleanup contract.
+func (p *Pair) IsProtected() bool { return p != nil && p.protected != nil }
+
+// Done notifies the pod to close creation admission and drain normal tasks.
+func (p *Pair) Done() <-chan struct{} { return p.done }
+
+// Stop closes protected task admission before notifying pod cleanup.
+func (p *Pair) Stop() {
+	if p.IsProtected() {
+		p.protected.stop(nil)
+	}
+}
+
+// BeginTask counts creation before its first side effect. A successful create
+// transfers this obligation to normal task cleanup, before any watcher starts.
+func (p *Pair) BeginTask() error {
+	s := p.protected
+	s.forwardMu.Lock()
+	defer s.forwardMu.Unlock()
+	if s.closing {
+		return errors.New("protected pair task admission is closed")
+	}
+	s.tasks++
+	return nil
+}
+
+// EndTask settles exactly one admitted task only after real resource cleanup.
+// Errors are sticky: process exit or metadata removal cannot authorize release.
+func (p *Pair) EndTask(err error) {
+	s := p.protected
+	s.forwardMu.Lock()
+	s.taskErr = errors.Join(s.taskErr, err)
+	s.tasks--
+	if s.closing && s.tasks == 0 {
+		close(s.tasksDone)
+	}
+	s.forwardMu.Unlock()
+	if err != nil {
+		s.stop(err)
+	}
+}
+
+var protectedOwners = struct {
+	sync.Mutex
+	shutdown bool
+	pairs    map[*protectedPair]struct{}
+}{pairs: make(map[*protectedPair]struct{})}
+
+// registerProtectedPair races atomically with shim shutdown, before effects.
+func registerProtectedPair(p *protectedPair) error {
+	protectedOwners.Lock()
+	defer protectedOwners.Unlock()
+	if protectedOwners.shutdown {
+		return errors.New("shim shutdown has closed protected owner admission")
+	}
+	protectedOwners.pairs[p] = struct{}{}
+	return nil
+}
+
+// PrepareProtectedShutdown refuses shim exit while any protected owner is live
+// or incomplete, including startup failures with no published sandbox task.
+func PrepareProtectedShutdown() error {
+	protectedOwners.Lock()
+	defer protectedOwners.Unlock()
+	if len(protectedOwners.pairs) != 0 {
+		return fmt.Errorf("%d protected pair owners remain live or incomplete; retain shim and prepared inputs", len(protectedOwners.pairs))
+	}
+	protectedOwners.shutdown = true
+	return nil
+}
+
+// close is the single protected cleanup decision; it is never retried. Forward
+// users drain before workload termination. Relay, exports and root drain with
+// diode GCS alive; both actual VM exits precede native teardown/reclaim/release.
+// Any uncertainty retains this owner in protectedOwners without a receipt.
+func (p *protectedPair) close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
+	defer cancel()
+	select {
+	case <-p.startupDone:
+	case <-ctx.Done():
+		return fmt.Errorf("protected startup still owns resources: %w", ctx.Err())
+	}
+	var result error
+	if p.pair.interactiveCloser != nil {
+		result = errors.Join(result, p.pair.interactiveCloser.Close())
+	}
+	select {
+	case <-p.tasksDone:
+	case <-ctx.Done():
+		return errors.Join(result, fmt.Errorf("protected tasks still own resources: %w", ctx.Err()))
+	}
+	p.forwardMu.Lock()
+	result = errors.Join(result, p.taskErr)
+	p.forwardMu.Unlock()
+	p.stopWatch()
+	p.watchers.Wait()
+	result = errors.Join(result, p.joinServices(ctx, false))
+	if result != nil {
+		return result
+	}
+
+	// Workload termination can naturally close the relay before we signal it.
+	// Mark that EOF expected without canceling its still-needed dependencies.
+	p.forwardMu.Lock()
+	p.dependenciesClosing = true
+	p.forwardMu.Unlock()
+	if err := terminateProtectedVM(ctx, &p.workload); err != nil {
+		return err
+	}
+	p.stopDependencyServices(ctx)
+	if err := p.joinServices(ctx, true); err != nil {
+		return err
+	}
+	p.stopDependencies()
+	if p.backend != nil {
+		if err := p.workload.vm.SCSIManager.CloseProtectedSibling(ctx); err != nil {
+			return err
+		}
+	}
+	if p.rootAttempt && p.root == nil {
+		return errors.New("protected root attachment is unobservable; retain diode and backing")
+	}
+	if p.root != nil {
+		// Unload the provider while direct diode GCS still exists, then release
+		// the actual RP attachment. Never clear a record to simulate withdrawal.
+		if _, err := p.guest(ctx, &p.diode,
+			`if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; [ ! -d /sys/module/diode_storvsp ]`); err != nil {
+			return err
+		}
+		if err := p.root.Release(ctx); err != nil {
+			return err
+		}
+	}
+	if err := terminateProtectedVM(ctx, &p.diode); err != nil {
+		return err
+	}
+	if p.backing != nil {
+		if err := p.backing.BeginTeardown(ctx); err != nil {
+			return err
+		}
+		if err := p.backing.Reclaim(ctx); err != nil {
+			return err
+		}
+		if err := p.backing.Release(ctx); err != nil {
+			return err
+		}
+	}
+	// CloseCtx deletes VM-owned boot copies; it is deliberately last, never
+	// the protected stop operation. The caller-owned sandbox directory stays.
+	for _, v := range []*protectedVMAttempt{&p.workload, &p.diode} {
+		if v.vm != nil {
+			result = errors.Join(result, v.vm.CloseCtx(ctx))
+		}
+	}
+	if p.pair.uplinkCleanup != nil {
+		result = errors.Join(result, p.pair.uplinkCleanup())
+	} else if p.uplinkAttempt {
+		result = errors.Join(result, errors.New("protected uplink ownership is unknown"))
+	}
+	if p.diode.bundleOwned && result == nil {
+		// Only CreateLCOW's two known boot copies belong to this owner.
+		// An unexpected directory entry is retained, never recursively deleted.
+		if p.diode.createAttempt {
+			for _, name := range []string{p.diode.options.GuestStateFilePath, vmutils.DefaultDmVerityRootfsVhd} {
+				if err := os.Remove(filepath.Join(p.diode.options.BundleDirectory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					result = errors.Join(result, err)
+				}
+			}
+		}
+		if result == nil {
+			result = os.Remove(p.diode.options.BundleDirectory)
+		}
+	}
+	if p.log != nil {
+		_, err := fmt.Fprintf(p.log, "cleanup run=%s workload=%s diode=%s error=%v\n",
+			p.config.RunID, p.workload.options.ID, p.diode.options.ID, result)
+		result = errors.Join(result, err, p.log.Close())
+	}
+	result = errors.Join(result, ctx.Err())
+	if result != nil {
+		return result
+	}
+	if err := p.publishReceipt(); err != nil {
+		return err
+	}
+	protectedOwners.Lock()
+	delete(protectedOwners.pairs, p)
+	protectedOwners.Unlock()
+	return nil
+}
+
+// terminateProtectedVM requires observable native termination and output join,
+// not CloseCtx, a cached receipt, or a successful terminate submission alone.
+func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
+	if v.vm == nil {
+		if v.createAttempt {
+			return fmt.Errorf("protected VM %s creation is unobservable", v.options.ID)
+		}
+		return nil
+	}
+	err := v.vm.Terminate(ctx)
+	if hcsv2.IsAlreadyStopped(err) {
+		err = nil
+	}
+	return errors.Join(err, v.vm.WaitCtx(ctx))
+}
+
+// expectedCommandExit normalizes known exit status and already-stopped reports.
+// Callers require observed exit; other Wait, IO and close failures remain failures.
+func expectedCommandExit(err error) error {
+	if many, ok := err.(interface{ Unwrap() []error }); ok {
+		var result error
+		for _, child := range many.Unwrap() {
+			result = errors.Join(result, expectedCommandExit(child))
+		}
+		return result
+	}
+	if _, ok := err.(*cmd.ExitError); ok {
+		return nil
+	}
+	if hcsv2.IsAlreadyStopped(err) {
+		return nil
+	}
+	return err
+}
+
+// stopDependencyServices requests a trapped TERM, never cancellation's SIGKILL.
+// Each signal is counted before dispatch and joined before Process can close.
+func (p *protectedPair) stopDependencyServices(ctx context.Context) {
+	for _, service := range p.services {
+		if !service.dependency || service.startErr != nil {
+			continue
+		}
+		service.mu.Lock()
+		if service.retiring {
+			service.mu.Unlock()
+			continue
+		}
+		service.signals.Add(1)
+		service.mu.Unlock()
+		options, err := signals.ValidateSigstrLCOW("TERM", true)
+		if err == nil {
+			_, err = service.command.Process.Signal(ctx, options)
+		}
+		service.signalErr = err
+		service.signals.Done()
+	}
+}
+
+// joinServices settles one service class without canceling later dependencies.
+func (p *protectedPair) joinServices(ctx context.Context, dependency bool) error {
+	var result error
+	for _, service := range p.services {
+		if service.dependency != dependency {
+			continue
+		}
+		select {
+		case <-service.done:
+			err := service.err
+			if service.startErr == nil && service.exited {
+				err = expectedCommandExit(err)
+			}
+			result = errors.Join(result, err)
+		case <-ctx.Done():
+			return errors.Join(result, fmt.Errorf("protected service has not drained: %w", ctx.Err()))
+		}
+	}
+	return result
+}
+
+// publishReceipt atomically links a complete, flushed file to a fresh final
+// name without replacement. Publication failure never replays native cleanup.
+func (p *protectedPair) publishReceipt() error {
+	receipt := struct {
+		Version    int    `json:"version"`
+		RunID      string `json:"run_id"`
+		WorkloadID string `json:"workload_vm_id"`
+		DiodeID    string `json:"diode_vm_id"`
+		Result     string `json:"result"`
+	}{1, p.config.RunID, p.workload.options.ID, p.diode.options.ID, "released"}
+	file, err := os.CreateTemp(filepath.Dir(p.config.CleanupReceiptPath), ".protected-cleanup-*")
+	if err != nil {
+		return err
+	}
+	// The temporary name is ours even if final publication fails.
+	defer os.Remove(file.Name())
+	err = json.NewEncoder(file).Encode(receipt)
+	if err == nil {
+		err = file.Sync()
+	}
+	err = errors.Join(err, file.Close())
+	if err != nil {
+		return err
+	}
+	return os.Link(file.Name(), p.config.CleanupReceiptPath)
 }
 
 // configureNetwork overlaps carrier waits on both guests, then joins both

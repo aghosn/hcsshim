@@ -31,6 +31,7 @@ type Manager struct {
 	attachManager *attachManager
 	mountManager  *mountManager
 	grantVMAccess func(context.Context, string, string) error
+	protected     *protectedSiblingOperations
 }
 
 // Slot represents a single SCSI slot, consisting of a controller and LUN.
@@ -126,6 +127,12 @@ func (m *Mount) GuestPath() string {
 // reaches 0, the guest OS mount is removed. If the refcount for the SCSI attachment
 // reaches 0, the SCSI attachment is removed.
 func (m *Mount) Release(ctx context.Context) error {
+	if m.mgr.protected != nil {
+		if err := m.mgr.protected.begin(); err != nil {
+			return err
+		}
+		defer m.mgr.protected.operations.Done()
+	}
 	m.releaseMu.Lock()
 	defer m.releaseMu.Unlock()
 	if m.released {
@@ -164,6 +171,12 @@ func (m *Manager) AddVirtualDisk(
 ) (*Mount, error) {
 	if m == nil {
 		return nil, ErrNotInitialized
+	}
+	if m.protected != nil {
+		if err := m.protected.begin(); err != nil {
+			return nil, err
+		}
+		defer m.protected.operations.Done()
 	}
 	_, sibling := m.attachManager.attacher.(*siblingHostBackend)
 	if vmID != "" && !sibling {
@@ -215,6 +228,9 @@ func (m *Manager) AddPhysicalDisk(
 	if m == nil {
 		return nil, ErrNotInitialized
 	}
+	if m.protected != nil {
+		return nil, errors.New("protected sibling storage supports virtual disks only")
+	}
 	if vmID != "" {
 		if err := wclayer.GrantVmAccess(ctx, vmID, hostPath); err != nil {
 			return nil, err
@@ -262,6 +278,9 @@ func (m *Manager) AddExtensibleVirtualDisk(
 ) (*Mount, error) {
 	if m == nil {
 		return nil, ErrNotInitialized
+	}
+	if m.protected != nil {
+		return nil, errors.New("protected sibling storage supports virtual disks only")
 	}
 	evdType, mountPath, err := parseExtensibleVirtualDiskPath(hostPath)
 	if err != nil {

@@ -26,6 +26,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/oci"
 	"github.com/Microsoft/hcsshim/internal/shimdiag"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 )
 
 var empty = &emptypb.Empty{}
@@ -528,6 +529,9 @@ func (s *service) shutdownInternal(ctx context.Context, req *task.ShutdownReques
 	// shutdown request.
 	if req.ID != s.tid {
 		return empty, nil
+	}
+	if err := sibling.PrepareProtectedShutdown(); err != nil {
+		return nil, err
 	}
 
 	s.shutdownOnce.Do(func() {
