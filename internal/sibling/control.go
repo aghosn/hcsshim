@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -61,6 +62,28 @@ func runGuest(ctx context.Context, vm *uvm.UtilityVM, script string) (string, er
 		return out.String(), fmt.Errorf("diode guest command: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return out.String(), nil
+}
+
+// joinedGuestCommand binds creation and all command-owned callbacks to ctx.
+// The caller retains vm and output until Run/Wait returns, even past deadlines.
+func joinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) *cmd.Cmd {
+	command := cmd.CommandContext(ctx, contextHost{vm, ctx}, "/bin/sh", "-ec", script)
+	command.JoinBackgroundOperations = true
+	command.CopyAfterExitTimeout = 5 * time.Second
+	command.Stdout, command.Stderr = output, output
+	return command
+}
+
+// runGuestJoined is the protected setup/export path; ordinary runGuest stays
+// unchanged. Output is both captured and logged, and failure includes stderr.
+func runGuestJoined(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) (string, error) {
+	var out, stderr bytes.Buffer
+	command := joinedGuestCommand(ctx, vm, script, output)
+	command.Stdout, command.Stderr = io.MultiWriter(&out, output), io.MultiWriter(&stderr, output)
+	if err := command.Run(); err != nil {
+		return out.String(), fmt.Errorf("protected guest %s: %w: %s", vm.ID(), err, strings.TrimSpace(stderr.String()))
+	}
+	return out.String(), ctx.Err()
 }
 
 type export struct {

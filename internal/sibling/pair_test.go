@@ -92,6 +92,9 @@ func TestPairRejectsIncompatibleBaseBeforeCreatingVMs(t *testing.T) {
 	}
 }
 
+// TestPairConfigStrictOptIn checks pure version-1 opt-in decoding, including exact
+// protected mask presence/bits and excluded profiles. Invalid or ambiguous input
+// must fail before acquisition, rather than silently changing native policy.
 func TestPairConfigStrictOptIn(t *testing.T) {
 	for _, change := range []func(*Config){
 		func(c *Config) { c.Version = 0 },
@@ -124,6 +127,69 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 	}
 	if _, err := LoadConfig("relative"); err == nil {
 		t.Fatal("accepted relative config-file path")
+	}
+
+	protected := testConfig()
+	protected.ProtectedShared, protected.MediateGCS = true, true
+	protected.Interactive = true
+	protected.SharedMemoryBytes = 32 << 20
+	protected.RunID = "fresh-session"
+	protected.CleanupReceiptPath = `C:\session\protected-cleanup-result.json`
+	data, _ = json.Marshal(protected)
+	prefix := strings.TrimSuffix(string(data), "}")
+	zero, maximum := uint64(0), ^uint64(0)
+	for _, test := range []struct {
+		fields          string
+		diode, workload *uint64
+		reject          bool
+	}{
+		{"", nil, nil, false},
+		{`,"diode_partition_seal_mask":"0"`, &zero, nil, false},
+		{`,"workload_partition_seal_mask":"0"`, nil, &zero, false},
+		{`,"diode_partition_seal_mask":"18446744073709551615","workload_partition_seal_mask":"18446744073709551615"`, &maximum, &maximum, false},
+		{`,"diode_partition_seal_mask":null`, nil, nil, true},
+		{`,"workload_partition_seal_mask":null`, nil, nil, true},
+		{`,"diode_partition_seal_mask":0`, nil, nil, true},
+		{`,"diode_partition_seal_mask":""`, nil, nil, true},
+		{`,"diode_partition_seal_mask":"-1"`, nil, nil, true},
+		{`,"diode_partition_seal_mask":"+1"`, nil, nil, true},
+		{`,"diode_partition_seal_mask":"0x1"`, nil, nil, true},
+		{`,"diode_partition_seal_mask":"1.0"`, nil, nil, true},
+		{`,"workload_partition_seal_mask":"1e2"`, nil, nil, true},
+		{`,"workload_partition_seal_mask":" 1"`, nil, nil, true},
+		{`,"workload_partition_seal_mask":"18446744073709551616"`, nil, nil, true},
+		{`,"diode_partition_seal_mask":"1","diode_partition_seal_mask":"1"`, nil, nil, true},
+		{`,"workload_partition_seal_mask":"1","WORKLOAD_PARTITION_SEAL_MASK":"2"`, nil, nil, true},
+		{`,"mediate_gcs":false`, nil, nil, true},
+		{`,"interactive":false`, nil, nil, true},
+		{`,"shared_memory_bytes":16777216`, nil, nil, true},
+		{`,"unikraft_package":"C:\\unikraft"`, nil, nil, true},
+		{`,"run_id":""`, nil, nil, true},
+		{`,"cleanup_receipt_path":"relative.json"`, nil, nil, true},
+		{`,"partition_seal_pause_prefix":"C:\\pause"`, nil, nil, true},
+		{`,"static_exports":[]`, nil, nil, true},
+		{`,"cpu_group_id":"tuning"`, nil, nil, true},
+		{`,"late_ahv_attestation":true`, nil, nil, true},
+		{`,"protected_shared":false`, nil, nil, true},
+	} {
+		text := prefix + test.fields + "}"
+		config, err := decodeConfig(strings.NewReader(text))
+		if test.reject {
+			if err == nil {
+				t.Fatalf("accepted incompatible protected input: %s", text)
+			}
+		} else if err != nil || !reflect.DeepEqual(config.DiodePartitionSealMask, test.diode) ||
+			!reflect.DeepEqual(config.WorkloadPartitionSealMask, test.workload) {
+			t.Fatalf("protected mask selection/bits changed: %s: %+v %v", text, config, err)
+		}
+	}
+	for _, fields := range []string{
+		`,"diode_partition_seal_mask":"0"`, `,"workload_partition_seal_mask":"1"`,
+	} {
+		data, _ := json.Marshal(testConfig())
+		if _, err := decodeConfig(strings.NewReader(strings.TrimSuffix(string(data), "}") + fields + "}")); err == nil {
+			t.Fatalf("accepted protected mask without opt-in: %s", fields)
+		}
 	}
 }
 

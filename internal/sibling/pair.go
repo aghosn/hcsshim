@@ -3,6 +3,7 @@
 package sibling
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,14 +28,23 @@ import (
 
 // Config is an explicit host-side opt-in; it never names existing HCS systems.
 // The workload inherits the sandbox's security/integrity options without alteration.
+// Protected masks are optional decimal strings: nil is omitted, not selected zero.
+// RunID and CleanupReceiptPath identify the one final S3 cleanup result; early/late
+// AHV selection is already encoded in prepared boot inputs, not another shim flag.
+// The protected profile requires interactive endpoint acquisition before sealing.
 type Config struct {
-	Version                int    `json:"version"`
-	ModuleDirectory        string `json:"module_directory"`
-	SharedMemoryBytes      uint64 `json:"shared_memory_bytes"`
-	WorkloadGuestStateFile string `json:"workload_guest_state_file"`
-	Interactive            bool   `json:"interactive,omitempty"`
-	MediateGCS             bool   `json:"mediate_gcs,omitempty"`
-	UnikraftPackage        string `json:"unikraft_package,omitempty"`
+	Version                   int     `json:"version"`
+	ModuleDirectory           string  `json:"module_directory"`
+	SharedMemoryBytes         uint64  `json:"shared_memory_bytes"`
+	WorkloadGuestStateFile    string  `json:"workload_guest_state_file"`
+	Interactive               bool    `json:"interactive,omitempty"`
+	MediateGCS                bool    `json:"mediate_gcs,omitempty"`
+	UnikraftPackage           string  `json:"unikraft_package,omitempty"`
+	ProtectedShared           bool    `json:"protected_shared,omitempty"`
+	DiodePartitionSealMask    *uint64 `json:"diode_partition_seal_mask,omitempty,string"`
+	WorkloadPartitionSealMask *uint64 `json:"workload_partition_seal_mask,omitempty,string"`
+	RunID                     string  `json:"run_id,omitempty"`
+	CleanupReceiptPath        string  `json:"cleanup_receipt_path,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -51,9 +62,8 @@ func LoadConfig(path string) (*Config, error) {
 func decodeConfig(reader io.Reader) (*Config, error) {
 	limited := &io.LimitedReader{R: reader, N: (64 << 10) + 1}
 	decoder := json.NewDecoder(limited)
-	decoder.DisallowUnknownFields()
-	var config Config
-	if err := decoder.Decode(&config); err != nil {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, err
 	}
 	var extra interface{}
@@ -62,6 +72,15 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	}
 	if limited.N == 0 {
 		return nil, errors.New("sibling pair config exceeds 64 KiB")
+	}
+	if err := validateConfigMasks(raw); err != nil {
+		return nil, err
+	}
+	decoder = json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var config Config
+	if err := decoder.Decode(&config); err != nil {
+		return nil, err
 	}
 	if config.Version != 1 || !filepath.IsAbs(config.ModuleDirectory) ||
 		config.SharedMemoryBytes < 1<<20 || config.SharedMemoryBytes > 0x7ffff000 ||
@@ -76,7 +95,61 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		config.SharedMemoryBytes != 32<<20) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
 	}
+	if config.ProtectedShared {
+		if !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 || config.UnikraftPackage != "" ||
+			config.RunID == "" || len(config.RunID) > 128 ||
+			strings.Trim(config.RunID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" ||
+			!filepath.IsAbs(config.CleanupReceiptPath) || strings.ContainsRune(config.CleanupReceiptPath, '\x00') {
+			return nil, errors.New("protected owned pair requires mediated GCS/root, interactive endpoints, 32 MiB, Linux, a simple run ID and an absolute cleanup receipt path")
+		}
+	} else if config.DiodePartitionSealMask != nil || config.WorkloadPartitionSealMask != nil ||
+		config.RunID != "" || config.CleanupReceiptPath != "" {
+		return nil, errors.New("partition masks and cleanup receipt identity require protected_shared")
+	}
 	return &config, nil
+}
+
+// validateConfigMasks rejects ambiguous selection before normal strict decoding.
+// Only unsigned decimal JSON strings are accepted; omission is not selected zero.
+func validateConfigMasks(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("sibling pair config must be an object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name := token.(string)
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+		switch {
+		case strings.EqualFold(name, "diode_partition_seal_mask"):
+			name = "diode_partition_seal_mask"
+		case strings.EqualFold(name, "workload_partition_seal_mask"):
+			name = "workload_partition_seal_mask"
+		default:
+			continue
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate partition mask %q", name)
+		}
+		seen[name] = true
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil || text == "" ||
+			strings.Trim(text, "0123456789") != "" {
+			return fmt.Errorf("%s must be an unsigned decimal string, not null or a JSON number", name)
+		}
+		if _, err := strconv.ParseUint(text, 10, 64); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // Pair is the sole lifetime owner of two newly created UVMs and their shared
@@ -91,6 +164,7 @@ type Pair struct {
 	done            chan struct{}
 	unikraft        bool
 	unikraftConsole *ownedUnikraftConsole
+	protected       *protectedPair
 	// Closers are captured immediately after acquisition so partial startup
 	// follows the same consumer-before-provider ownership order.
 	workloadCloser    io.Closer
@@ -99,7 +173,9 @@ type Pair struct {
 	interactiveCloser io.Closer
 }
 
-func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+// commonPairOptions clones security and role settings without acquiring backing.
+// Callers assign either an ordinary section or a real protected capability later.
+func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
 	if base == nil || base.Options == nil || base.ConfidentialLCOWOptions == nil ||
 		base.ConfidentialCommonOptions == nil || !base.UseGuestConnection ||
 		!base.SecurityPolicyEnabled || !base.DmVerityMode || base.GuestStateFilePath == "" ||
@@ -110,6 +186,7 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 || len(base.AssignedDevices) != 0 {
 		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership or assigned devices")
 	}
+	// Each guest owns independent mutable option structs; policy bytes are unchanged.
 	clone := func(role Role, id, bundle string) (*uvm.OptionsLCOW, error) {
 		options := *base
 		common := *base.Options
@@ -119,14 +196,10 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 		options.ConfidentialCommonOptions = &security
 		options.ID, options.BundleDirectory = id, bundle
 		options.KernelBootOptions = strings.TrimSpace(base.KernelBootOptions + " hcs_shmem_diag.role=" + string(role))
-		options.SharedMemoryRegions = []uvm.LCOWSharedMemoryRegion{{
-			SectionName: section.HCSName, Length: int32(section.Size), AllowGuestWrite: true,
-		}}
 		endpoint, err := Endpoint(role, group)
 		if err != nil {
 			return nil, err
 		}
-		endpoint.SharedMemorySectionName = section.HCSName
 		options.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{endpoint}
 		if role == Workload {
 			options.SiblingRoot = true
@@ -145,6 +218,21 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 	return workload, diode, err
 }
 
+// pairOptions adds ordinary mapped-section settings to the common role options.
+func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	workload, diode, err := commonPairOptions(base, config, group)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, options := range []*uvm.OptionsLCOW{workload, diode} {
+		options.SharedMemoryRegions = []uvm.LCOWSharedMemoryRegion{{
+			SectionName: section.HCSName, Length: int32(section.Size), AllowGuestWrite: true,
+		}}
+		options.SiblingCommunicationEndpoints[0].SharedMemorySectionName = section.HCSName
+	}
+	return workload, diode, nil
+}
+
 // Start creates and bootstraps a pair in-process. Workload boot and diode root
 // provider bootstrap must overlap: the workload cannot reach GCS without root0.
 func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair, resultErr error) {
@@ -161,6 +249,9 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	config, err = decodeConfig(strings.NewReader(string(encoded)))
 	if err != nil {
 		return nil, err
+	}
+	if config.ProtectedShared {
+		return nil, errors.New("protected owned startup is gated until protected Close and admission integration is available")
 	}
 	native, err := loadOwnedUnikraft(config)
 	if err != nil {
@@ -446,6 +537,12 @@ func (p *Pair) Close() error {
 func (p *Pair) close(cause error) error {
 	if p == nil {
 		return nil
+	}
+	// S2 must never run ordinary CloseCtx (which deletes VMGS) on a protected owner.
+	// S3 replaces this gate with joined task drainage and the single native cleanup.
+	if p.protected != nil {
+		p.protected.stop(cause)
+		return errors.New("protected cleanup is not integrated; pair and dependencies retained")
 	}
 	p.closeOnce.Do(func() {
 		p.closeErr = cause
