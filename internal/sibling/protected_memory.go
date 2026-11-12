@@ -1,6 +1,6 @@
 //go:build windows
 
-package main
+package sibling
 
 import (
 	"context"
@@ -13,7 +13,9 @@ import (
 	"unsafe"
 
 	"github.com/Microsoft/hcsshim/internal/computecore"
+	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
+	"github.com/Microsoft/hcsshim/internal/uvm"
 	"golang.org/x/sys/windows"
 )
 
@@ -23,26 +25,26 @@ const (
 	// Matched merged guest gate: vsock-tun-forward/mshv/include/hyperv/
 	// sibling_link.h, sibling_link_validate, called by sibling_bus_probe.
 	// Descriptor admission is necessary, not proof of service-area capacity.
-	protectedTransportMinBytes = 0x20000
-	protectedTransportMaxBytes = 32 << 20
+	ProtectedBackingMinBytes = 0x20000
+	ProtectedBackingMaxBytes = 32 << 20
 
 	// SharedMemoryRegion.Length is signed int32 bytes; retain only whole pages.
-	protectedMaxBytes  = math.MaxInt32 & ^(protectedPageBytes - 1)
-	protectedSeal      = 2
-	protectedTeardown  = 3
-	protectedReclaim   = 4
-	protectedBusy      = uint32(0x80000011)
-	protectedInUse     = uint32(0xc0350019)
+	protectedMaxBytes = math.MaxInt32 & ^(protectedPageBytes - 1)
+	protectedSeal     = 2
+	protectedTeardown = 3
+	protectedReclaim  = 4
+	protectedBusy     = uint32(0x80000011)
+	protectedInUse    = uint32(0xc0350019)
 )
 
 // protectedControlRequest/Result match VidDefs.h's compact v2 ABI. Indices and
 // counts are 4-KiB pages, not bytes. Lifetime zero uses VID-owned descriptors.
 // Version zero in a result is unknown progress, never a zero-work receipt.
 type protectedControlRequest struct {
-	Version, Flags                uint32
+	Version, Flags                 uint32
 	LeaseID, PageIndex, LifetimeID uint64
-	PageCount, Operation          uint32
-	Reserved                      uint64
+	PageCount, Operation           uint32
+	Reserved                       uint64
 }
 
 type protectedControlResult struct {
@@ -50,13 +52,15 @@ type protectedControlResult struct {
 	LeaseID, PageCount, Initialized  uint64
 }
 
-// protectedSiblingMemory is a route-private concrete capability owner. There
+// ProtectedBacking owns one fresh section and its VID controller. There
 // is deliberately no ordinary Section embedding, content accessor or Close.
-// The pair goroutine exclusively owns all fields and serializes native calls.
+// One lifecycle owner must serialize every method, retaining all VM attempts
+// and borrowers until they drain before Reclaim and Release. Native calls are
+// synchronous; context cancellation bounds submission, not an executing call.
 // blocked is set BEFORE Bootstrap create dispatch; unknown is sticky. Only
 // explicit, fully framed reclaim permits a temporary verification view and
 // release. Cached startup receipts establish history, not release authority.
-type protectedSiblingMemory struct {
+type ProtectedBacking struct {
 	section, controller windows.Handle
 	control             *windows.LazyProc
 	hcsName             string
@@ -69,10 +73,19 @@ type protectedSiblingMemory struct {
 	resource            hcsv2.OperationResource
 }
 
-// validateProtectedControllerABI rejects unsupported architecture/layout before
+// ProtectedBackingDiagnostics is copied history for logging, not live native
+// inventory or release authority. Page counts use 4-KiB units.
+type ProtectedBackingDiagnostics struct {
+	LeaseID, PageCount, InitializedPages uint64
+	SealedPages, TeardownPages           uint64
+	ReclaimedPages, ZeroVerifiedBytes    uint64
+	CreateAttempted, Unknown             bool
+}
+
+// ValidateProtectedControllerABI rejects unsupported architecture/layout before
 // acquiring native resources. Every offset follows current VidDefs.h; it does
 // not establish deployed DLL provenance, which remains a manual prerequisite.
-func validateProtectedControllerABI() error {
+func ValidateProtectedControllerABI() error {
 	if runtime.GOARCH != "amd64" ||
 		unsafe.Sizeof(protectedControlRequest{}) != 48 ||
 		unsafe.Offsetof(protectedControlRequest{}.Version) != 0 ||
@@ -96,7 +109,17 @@ func validateProtectedControllerABI() error {
 	return nil
 }
 
-// newProtectedSiblingMemory creates fresh pagefile backing and an independent
+// ValidateProtectedBackingSize checks page-aligned bytes against the schema and
+// matched transport limits without acquiring resources.
+func ValidateProtectedBackingSize(size uint64) error {
+	if size < ProtectedBackingMinBytes || size > ProtectedBackingMaxBytes ||
+		size%protectedPageBytes != 0 || size > protectedMaxBytes {
+		return fmt.Errorf("protected backing requires page-aligned transport bytes in %d..%d", ProtectedBackingMinBytes, ProtectedBackingMaxBytes)
+	}
+	return nil
+}
+
+// NewProtectedBacking creates fresh pagefile backing and an independent
 // VID controller. size is page-aligned bytes within both the signed schema
 // bound and the matched merged transport's inclusive descriptor limits.
 // name must be a unique simple object name. No content view, seed, or pin is
@@ -104,19 +127,18 @@ func validateProtectedControllerABI() error {
 // On error all acquisitions made here are closed; success transfers ownership
 // to the pair. Session zero uses the actual global BaseNamedObjects directory,
 // not the ordinary helper's synthetic Sessions/0 path.
-func newProtectedSiblingMemory(name string, size uint64) (*protectedSiblingMemory, error) {
-	if err := validateProtectedControllerABI(); err != nil {
+func NewProtectedBacking(name string, size uint64) (*ProtectedBacking, error) {
+	if err := ValidateProtectedControllerABI(); err != nil {
 		return nil, err
 	}
-	if size < protectedTransportMinBytes || size > protectedTransportMaxBytes ||
-		size%protectedPageBytes != 0 || size > protectedMaxBytes {
-		return nil, fmt.Errorf("protected backing requires page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
+	if err := ValidateProtectedBackingSize(size); err != nil {
+		return nil, err
 	}
 	var session uint32
 	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &session); err != nil {
 		return nil, err
 	}
-	objectName, hcsName, err := sharedMemorySectionNames(name, session)
+	objectName, hcsName, err := SectionNames(name, session)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +183,7 @@ func newProtectedSiblingMemory(name string, size uint64) (*protectedSiblingMemor
 	if controller == 0 || controller == windows.InvalidHandle {
 		return nil, errors.Join(fmt.Errorf("create VID controller: %v", callErr), windows.CloseHandle(section))
 	}
-	return &protectedSiblingMemory{
+	return &ProtectedBacking{
 		section: section, controller: controller, control: control,
 		hcsName: hcsName, size: size, pages: size / protectedPageBytes,
 		resource: hcsv2.OperationResource{
@@ -171,13 +193,129 @@ func newProtectedSiblingMemory(name string, size uint64) (*protectedSiblingMemor
 	}, nil
 }
 
+// SectionName returns the immutable session-qualified HCS section path.
+func (m *ProtectedBacking) SectionName() string {
+	return m.hcsName
+}
+
+// Resource returns a borrowed file capability for VM creation or removal.
+// The lifecycle owner retains this backing until every borrower has drained.
+func (m *ProtectedBacking) Resource() hcsv2.OperationResource {
+	return m.resource
+}
+
+// Region returns startup settings for the retained section/controller. Import
+// requires known full initialization; Bootstrap uses lease zero. Neither mode
+// permits further creation after uncertainty.
+func (m *ProtectedBacking) Region(mode hcsschema.ProtectedSharedBackingMode) (hcsschema.SharedMemoryRegion, error) {
+	if m.unknown {
+		return hcsschema.SharedMemoryRegion{}, errors.New("protected creation denied: unknown progress")
+	}
+	var lease uint64
+	switch mode {
+	case hcsschema.ProtectedSharedBackingBootstrap:
+	case hcsschema.ProtectedSharedBackingImport:
+		if m.lease == 0 || m.initialized != m.pages {
+			return hcsschema.SharedMemoryRegion{}, errors.New("workload Import requires diode's completed native startup")
+		}
+		lease = m.lease
+	default:
+		return hcsschema.SharedMemoryRegion{}, errors.New("protected backing requires Bootstrap or Import mode")
+	}
+	return hcsschema.SharedMemoryRegion{
+		SectionName: m.hcsName, Length: int32(m.size), AllowGuestWrite: true,
+		ProtectedShared: true, ProtectedSharedControllerUri: m.resource.URI,
+		ProtectedSharedBackingMode: mode, ProtectedSharedLeaseId: lease,
+	}, nil
+}
+
+// MarkCreateAttempt denies content access/release before dispatching CreateLCOW,
+// including attempts whose native ownership cannot subsequently be observed.
+func (m *ProtectedBacking) MarkCreateAttempt() {
+	m.blocked = true
+}
+
+// MarkUnknown permanently records unobservable native progress.
+func (m *ProtectedBacking) MarkUnknown() {
+	m.unknown = true
+}
+
+// ObserveStartup validates the actual post-Start receipt and retains its lease
+// and full initialization history. The caller first matches the sole queried
+// region to SectionName. Failure makes uncertainty sticky; success never clears
+// prior uncertainty or authorizes release.
+func (m *ProtectedBacking) ObserveStartup(info *hcsschema.ProtectedSharedRegionInfo) error {
+	if err := uvm.ValidateProtectedSharedStartupResult(info, m.lease, m.pages); err != nil {
+		m.unknown = true
+		return err
+	}
+	m.lease, m.initialized = info.LeaseId, info.InitializedPages
+	return nil
+}
+
+// ObserveFailedStartup retains only structurally valid, nondecreasing cached
+// initialization history after failed Start. Uncertainty remains sticky even
+// when history is valid; this never establishes participant drain or reclaim.
+func (m *ProtectedBacking) ObserveFailedStartup(info *hcsschema.ProtectedSharedRegionInfo) error {
+	m.unknown = true
+	if err := uvm.ValidateProtectedSharedOperationResultStructure(info, m.lease, m.pages); err != nil {
+		return err
+	}
+	if info.InitializedPages < m.initialized {
+		return errors.New("protected initialization history decreased")
+	}
+	m.lease, m.initialized = info.LeaseId, info.InitializedPages
+	return nil
+}
+
+// Diagnostics returns copied history for the serial owner's existing logs.
+func (m *ProtectedBacking) Diagnostics() ProtectedBackingDiagnostics {
+	return ProtectedBackingDiagnostics{
+		LeaseID: m.lease, PageCount: m.pages, InitializedPages: m.initialized,
+		SealedPages: m.sealed, TeardownPages: m.teardown, ReclaimedPages: m.reclaimed,
+		ZeroVerifiedBytes: m.zeroVerifiedBytes, CreateAttempted: m.blocked, Unknown: m.unknown,
+	}
+}
+
+// SealAdmission seals each initialized page once, independently of participants.
+// Framed prefix progress is retained on error; callers must stop forward work.
+func (m *ProtectedBacking) SealAdmission(ctx context.Context) error {
+	if m.unknown {
+		return errors.New("protected admission seal denied: unknown progress")
+	}
+	return m.advance(ctx, protectedSeal, &m.sealed)
+}
+
+// BeginTeardown advances the known initialized prefix, including after failed
+// startup. The caller first drains borrowers as required by its VM profile.
+func (m *ProtectedBacking) BeginTeardown(ctx context.Context) error {
+	return m.advance(ctx, protectedTeardown, &m.teardown)
+}
+
+// Reclaim requires drained VM attempts/borrowers, complete known teardown and
+// a bounded cleanup context supplied by the owner.
+// Only framed zero-prefix contention is retried within ctx; other errors retain
+// progress and owners, never authorizing release or automatic replay.
+func (m *ProtectedBacking) Reclaim(ctx context.Context) error {
+	if m.unknown {
+		return errors.New("unknown protected progress; retain controller/backing and necessary owners in-process only")
+	}
+	if !m.blocked {
+		return nil
+	}
+	if m.initialized != m.pages || m.teardown != m.initialized {
+		return errors.New("incomplete protected initialization/teardown; retain backing")
+	}
+	return m.advance(ctx, protectedReclaim, &m.reclaimed)
+}
+
 // controlBatch submits one bounded admission/cleanup request, borrowing buffers
 // and the retained controller through synchronous native completion. ctx bounds
 // submission and subsequent batches, not an already executing kernel call.
 // Framed prefixes are returned even on errors; malformed output makes unknown
 // sticky. No goroutine abandons live native buffers on cancellation. Callers
 // consume Processed before errors and never replay partial/unknown progress.
-func (m *protectedSiblingMemory) controlBatch(ctx context.Context, operation uint32, index uint64, count uint32) (protectedControlResult, error) {
+func (m *ProtectedBacking) controlBatch(ctx context.Context, operation uint32, index uint64, count uint32) (protectedControlResult, error) {
 	var result protectedControlResult
 	if err := ctx.Err(); err != nil {
 		return result, err
@@ -215,7 +353,7 @@ func (m *protectedSiblingMemory) controlBatch(ctx context.Context, operation uin
 // reclaim contention is retried, within ctx; partial or unframed failures stop.
 // Caller serialization is required. Each page is sealed only once per backing,
 // independently of the number of participants or their GPA assignments.
-func (m *protectedSiblingMemory) advance(ctx context.Context, operation uint32, prefix *uint64) error {
+func (m *ProtectedBacking) advance(ctx context.Context, operation uint32, prefix *uint64) error {
 	for *prefix < m.initialized {
 		count := uint32(min(uint64(4), m.initialized-*prefix))
 		result, err := m.controlBatch(ctx, operation, *prefix, count)
@@ -243,13 +381,13 @@ func (m *protectedSiblingMemory) advance(ctx context.Context, operation uint32, 
 	return nil
 }
 
-// release verifies every initialized byte is zero ONLY after actual full
+// Release verifies every initialized byte is zero ONLY after actual full
 // reclaim, then closes controller/section. Before Bootstrap dispatch an empty
 // owner can also be released without a content read. Unknown progress prevents
 // either action. The caller must first drain all owned VM attempts; this method
-// is private to the pair cleanup and is not an ordinary unconditional Close.
+// is restricted to owner cleanup and is not an ordinary unconditional Close.
 // Failed verification retains handles; native close failures are returned.
-func (m *protectedSiblingMemory) release(ctx context.Context) error {
+func (m *ProtectedBacking) Release(ctx context.Context) error {
 	if m.unknown || (m.blocked && (m.initialized != m.pages || m.reclaimed != m.initialized)) {
 		return errors.New("protected release denied: unknown progress or incomplete reclaim")
 	}

@@ -41,9 +41,10 @@ const (
 )
 
 // protectedSiblingVM owns one attempt, including options before Create returns.
-// region retains immutable startup mode/permissions; only its actual lease is
-// filled in after Bootstrap succeeds. attempted with vm nil is unobservable,
-// never proof that native preparation did no work.
+// region selects startup mode before create and retains complete immutable
+// settings at dispatch; its actual lease follows the checked startup receipt.
+// attempted with vm nil is unobservable, never proof that native preparation
+// did no work.
 type protectedSiblingVM struct {
 	options     *uvm.OptionsLCOW
 	region      hcsschema.SharedMemoryRegion
@@ -72,7 +73,7 @@ type protectedSiblingService struct {
 // cleanup has its own independent budget and joins shell/command borrowers.
 type protectedSiblingPair struct {
 	profile     protectedSiblingProfile
-	memory      *protectedSiblingMemory
+	memory      *sibling.ProtectedBacking
 	workers     []*protectedSiblingVM
 	cpuGroups   *cpuGroupAssignments
 	uplinkClose func() error
@@ -282,9 +283,8 @@ func classifyProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, e
 		return profile, errors.New("protected mediated root requires a storage backend plan")
 	}
 	size := c.Uint64(sharedMemorySizeArgName)
-	if size < protectedTransportMinBytes || size > protectedTransportMaxBytes ||
-		size%protectedPageBytes != 0 || size > protectedMaxBytes {
-		return profile, fmt.Errorf("protected --shared-memory-size must be page-aligned transport bytes in %d..%d", protectedTransportMinBytes, protectedTransportMaxBytes)
+	if err := sibling.ValidateProtectedBackingSize(size); err != nil {
+		return profile, fmt.Errorf("protected --shared-memory-size must be page-aligned transport bytes in %d..%d", sibling.ProtectedBackingMinBytes, sibling.ProtectedBackingMaxBytes)
 	}
 	if profile == protectedSiblingMediatedRoot && size != protectedCombinedBytes {
 		return profile, errors.New("protected mediated root requires 32 MiB (8192 pages)")
@@ -358,7 +358,7 @@ func validateProtectedSiblingCLI(c *cli.Context) error {
 	if _, err := preflightProtectedSiblingProfile(c); err != nil {
 		return err
 	}
-	return validateProtectedControllerABI()
+	return sibling.ValidateProtectedControllerABI()
 }
 
 // runProtectedSibling owns the default-off experiment from preflight to bounded
@@ -527,7 +527,7 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		}
 		v.bundleOwned = true
 	}
-	p.memory, err = newProtectedSiblingMemory("uvmboot-protected-"+group.String(), c.Uint64(sharedMemorySizeArgName))
+	p.memory, err = sibling.NewProtectedBacking("uvmboot-protected-"+group.String(), c.Uint64(sharedMemorySizeArgName))
 	if err != nil {
 		return err
 	}
@@ -537,15 +537,13 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 			mode = hcsschema.ProtectedSharedBackingImport
 		}
 		v.region = hcsschema.SharedMemoryRegion{
-			SectionName: p.memory.hcsName, Length: int32(p.memory.size), AllowGuestWrite: true,
-			ProtectedShared: true, ProtectedSharedControllerUri: p.memory.resource.URI,
 			ProtectedSharedBackingMode: mode,
 		}
 		endpoint, err := siblingCommunicationEndpoint(v.options.ID, group.String())
 		if err != nil {
 			return err
 		}
-		endpoint.SharedMemorySectionName = p.memory.hcsName
+		endpoint.SharedMemorySectionName = p.memory.SectionName()
 		v.options.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{endpoint}
 	}
 	setupCtx, stopSetup := context.WithTimeout(ctx, p.setupBudget())
@@ -641,8 +639,8 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 		return err
 	}
 	fmt.Printf("protected sibling: checked network ready at %s; sealing backing lease=%d pages=%d once\n",
-		time.Now().UTC().Format(time.RFC3339Nano), p.memory.lease, p.memory.pages)
-	if err := p.memory.advance(setupCtx, protectedSeal, &p.memory.sealed); err != nil {
+		time.Now().UTC().Format(time.RFC3339Nano), p.memory.Diagnostics().LeaseID, p.memory.Diagnostics().PageCount)
+	if err := p.memory.SealAdmission(setupCtx); err != nil {
 		return err
 	}
 	stopSetup()
@@ -677,22 +675,20 @@ func (p *protectedSiblingPair) create(ctx context.Context, v *protectedSiblingVM
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if v.region.ProtectedSharedBackingMode == hcsschema.ProtectedSharedBackingImport {
-		if p.memory.lease == 0 || p.memory.initialized != p.memory.pages {
-			return errors.New("workload Import requires diode's completed native startup")
-		}
-		v.region.ProtectedSharedLeaseId = p.memory.lease
+	region, err := p.memory.Region(v.region.ProtectedSharedBackingMode)
+	if err != nil {
+		return err
 	}
+	v.region = region
 	v.options.SharedMemoryRegions = []hcsschema.SharedMemoryRegion{v.region}
-	v.options.ProtectedSharedResources = []hcsv2.OperationResource{p.memory.resource}
+	v.options.ProtectedSharedResources = []hcsv2.OperationResource{p.memory.Resource()}
 	// Native Start auto-initializes. Deny content/release BEFORE even Create,
 	// including failure paths where a returned VM/receipt becomes unavailable.
-	p.memory.blocked = true
+	p.memory.MarkCreateAttempt()
 	v.attempted = true
-	var err error
 	v.vm, err = uvm.CreateLCOW(ctx, v.options)
 	if err != nil {
-		p.memory.unknown = true
+		p.memory.MarkUnknown()
 		return fmt.Errorf("protected %s create (native ownership unobservable): %w", v.options.ID, err)
 	}
 	return nil
@@ -712,7 +708,7 @@ func (p *protectedSiblingPair) startCreated(ctx context.Context, v *protectedSib
 		startErr = v.vm.Start(ctx)
 	}
 	if startErr != nil {
-		p.memory.unknown = true
+		p.memory.MarkUnknown()
 		// Native failure cleanup may already have destroyed the observable
 		// owner. Preserve any structurally valid initialization history for
 		// teardown, but never clear uncertainty or authorize reclaim from it.
@@ -723,21 +719,19 @@ func (p *protectedSiblingPair) startCreated(ctx context.Context, v *protectedSib
 	p.watch(v)
 	regions, err := v.vm.SharedMemoryRegions(ctx)
 	if err != nil || len(regions) != 1 || regions[0].SectionName != v.region.SectionName {
-		p.memory.unknown = true
+		p.memory.MarkUnknown()
 		return errors.Join(err, fmt.Errorf("protected %s missing exact startup region", v.options.ID))
 	}
 	info := regions[0].ProtectedShared
-	if err := uvm.ValidateProtectedSharedStartupResult(info, p.memory.lease, p.memory.pages); err != nil {
-		p.memory.unknown = true
-		return fmt.Errorf("protected %s startup receipt: %w", v.options.ID, err)
-	}
 	// Retain valid initialization history before any later observation fails.
 	// These cached properties are not a live mapping inventory or scrub proof.
-	p.memory.lease, p.memory.initialized = info.LeaseId, info.InitializedPages
+	if err := p.memory.ObserveStartup(info); err != nil {
+		return fmt.Errorf("protected %s startup receipt: %w", v.options.ID, err)
+	}
 	v.region.ProtectedSharedLeaseId = info.LeaseId
 	gpa, err := uvm.SharedMemoryByteGPA(regions[0].GuestPhysicalAddress, int64(v.region.Length))
 	if err != nil {
-		p.memory.unknown = true
+		p.memory.MarkUnknown()
 		return err
 	}
 	fmt.Printf("protected sibling: vm=%s role=%s mode=%s lease=%d initialized=%d installed=true byte_gpa=%#x at=%s\n",
@@ -849,11 +843,9 @@ func (p *protectedSiblingPair) observeFailedStartup(v *protectedSiblingVM) {
 		return
 	}
 	info := regions[0].ProtectedShared
-	if err := uvm.ValidateProtectedSharedOperationResultStructure(info, p.memory.lease, p.memory.pages); err != nil ||
-		info.InitializedPages < p.memory.initialized {
+	if err := p.memory.ObserveFailedStartup(info); err != nil {
 		return
 	}
-	p.memory.lease, p.memory.initialized = info.LeaseId, info.InitializedPages
 	v.region.ProtectedSharedLeaseId = info.LeaseId
 }
 
@@ -1137,8 +1129,8 @@ func (p *protectedSiblingPair) cleanup() error {
 			safe = false
 		}
 	}
-	if p.profile == protectedSiblingDirectRoot && m != nil && m.initialized != 0 {
-		if err := m.advance(ctx, protectedTeardown, &m.teardown); err != nil {
+	if p.profile == protectedSiblingDirectRoot && m != nil && m.Diagnostics().InitializedPages != 0 {
+		if err := m.BeginTeardown(ctx); err != nil {
 			result = errors.Join(result, err)
 			safe = false
 		}
@@ -1179,8 +1171,8 @@ func (p *protectedSiblingPair) cleanup() error {
 		safe = safe && drained
 		// Provider I/O and every participant must be drained before changing
 		// protected mapping/backing state. Reclaim still uses its native gate.
-		if safe && m != nil && m.initialized != 0 {
-			if err := m.advance(ctx, protectedTeardown, &m.teardown); err != nil {
+		if safe && m != nil && m.Diagnostics().InitializedPages != 0 {
+			if err := m.BeginTeardown(ctx); err != nil {
 				result = errors.Join(result, err)
 				safe = false
 			}
@@ -1197,7 +1189,7 @@ func (p *protectedSiblingPair) cleanup() error {
 			if v.started && v.region.ProtectedSharedLeaseId != 0 && ctx.Err() == nil {
 				remove := v.region
 				remove.ProtectedSharedOperation = hcsschema.ProtectedSharedRemove
-				_, err := v.vm.ModifyProtectedShared(ctx, remove, m.resource)
+				_, err := v.vm.ModifyProtectedShared(ctx, remove, m.Resource())
 				// Remove's cache alone is not drain/reclaim proof. Even failed
 				// Remove may be safely superseded by observed VM termination.
 				if err != nil {
@@ -1225,21 +1217,18 @@ func (p *protectedSiblingPair) cleanup() error {
 		}
 	}
 	if m != nil {
-		if m.unknown {
+		if m.Diagnostics().Unknown {
 			result = errors.Join(result, errors.New("unknown protected progress; retain controller/backing and necessary owners in-process only"))
 			safe = false
 		}
-		if safe && m.blocked {
-			if m.initialized != m.pages || m.teardown != m.initialized {
-				result = errors.Join(result, errors.New("incomplete protected initialization/teardown; retain backing"))
-				safe = false
-			} else if err := m.advance(ctx, protectedReclaim, &m.reclaimed); err != nil {
+		if safe {
+			if err := m.Reclaim(ctx); err != nil {
 				result = errors.Join(result, err)
 				safe = false
 			}
 		}
 		if safe {
-			if err := m.release(ctx); err != nil {
+			if err := m.Release(ctx); err != nil {
 				result = errors.Join(result, err)
 				safe = false
 			}
@@ -1281,12 +1270,15 @@ func (p *protectedSiblingPair) cleanup() error {
 		protectedSiblingRetained.Unlock()
 		result = errors.Join(result, errors.New("protected pair not fully released; retained references last only until launcher exit"))
 		if m != nil {
+			history := m.Diagnostics()
 			result = errors.Join(result, fmt.Errorf("retained protected history: lease=%d initialized=%d sealed=%d teardown=%d reclaimed=%d zero-verified-bytes=%d unknown=%t",
-				m.lease, m.initialized, m.sealed, m.teardown, m.reclaimed, m.zeroVerifiedBytes, m.unknown))
+				history.LeaseID, history.InitializedPages, history.SealedPages, history.TeardownPages,
+				history.ReclaimedPages, history.ZeroVerifiedBytes, history.Unknown))
 		}
-	} else if m != nil && m.blocked {
+	} else if m != nil && m.Diagnostics().CreateAttempted {
+		history := m.Diagnostics()
 		fmt.Printf("protected sibling cleanup: lease=%d reclaimed=%d zero-verified-bytes=%d resources released\n",
-			m.lease, m.reclaimed, m.zeroVerifiedBytes)
+			history.LeaseID, history.ReclaimedPages, history.ZeroVerifiedBytes)
 	}
 	return errors.Join(result, ctx.Err())
 }

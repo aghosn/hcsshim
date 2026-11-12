@@ -169,7 +169,7 @@ func (p *protectedSiblingPair) pausePartitionSeals(prefix string) (resultErr err
 		Partitions  []partition `json:"partitions"`
 	}{
 		Run: p.run, ReadyAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Lease: p.memory.lease, SealedPages: p.memory.sealed, Resume: "continue\n",
+		Lease: p.memory.Diagnostics().LeaseID, SealedPages: p.memory.Diagnostics().SealedPages, Resume: "continue\n",
 	}
 	for _, s := range p.seals {
 		marker.Partitions = append(marker.Partitions, partition{
