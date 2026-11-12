@@ -14,6 +14,7 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
+	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
@@ -82,12 +83,17 @@ func NewJoinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, name string, 
 }
 
 // runGuestJoined is the protected setup/export path; ordinary runGuest stays
-// unchanged. Output is both captured and logged, and failure includes stderr.
+// unchanged. Capture required control output independently of best-effort logging;
+// a log write failure is not a guest-command or protected-ownership failure.
 func runGuestJoined(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) (string, error) {
 	var out, stderr bytes.Buffer
 	command := joinedGuestCommand(ctx, vm, script, output)
-	command.Stdout, command.Stderr = io.MultiWriter(&out, output), io.MultiWriter(&stderr, output)
-	if err := command.Run(); err != nil {
+	command.Stdout, command.Stderr = &out, &stderr
+	err := command.Run()
+	if _, logErr := fmt.Fprint(output, out.String(), stderr.String()); logErr != nil {
+		log.G(ctx).WithError(logErr).Warn("protected guest output could not be logged")
+	}
+	if err != nil {
 		return out.String(), fmt.Errorf("protected guest %s: %w: %s", vm.ID(), err, strings.TrimSpace(stderr.String()))
 	}
 	return out.String(), ctx.Err()

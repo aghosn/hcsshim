@@ -209,25 +209,12 @@ func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn ne
 		return nil
 	}
 	waitErr := command.Process.Wait()
+	_, exitErr := command.Process.ExitCode()
 	_ = conn.Close()
 	_ = writer.Close()
 	<-producerDone
-	err = command.Wait()
-	return errors.Join(waitErr, shellCommandError(expectedCommandExit(err)))
-}
-
-// shellCommandError normalizes only stream closure caused by session teardown;
-// native process/command errors still prevent protected cleanup completion.
-func shellCommandError(err error) error {
-	if many, ok := err.(interface{ Unwrap() []error }); ok {
-		var result error
-		for _, child := range many.Unwrap() {
-			result = errors.Join(result, shellCommandError(child))
-		}
-		return result
+	if err := command.Wait(); err != nil {
+		command.Log.WithError(err).Debug("protected shell command output completed")
 	}
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
-		return nil
-	}
-	return err
+	return errors.Join(waitErr, exitErr)
 }

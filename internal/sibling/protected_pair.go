@@ -17,6 +17,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
+	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/internal/signals"
 	"github.com/Microsoft/hcsshim/internal/uvm"
@@ -499,12 +500,11 @@ func (p *protectedPair) watch(v *protectedVMAttempt) {
 // guest uses the joined command path and correlates setup/export diagnostics.
 func (p *protectedPair) guest(ctx context.Context, v *protectedVMAttempt, script string) (string, error) {
 	if _, err := fmt.Fprintf(p.log, "guest run=%s vm=%s\n", p.config.RunID, v.options.ID); err != nil {
-		return "", err
+		log.G(ctx).WithError(err).Warn("protected guest command could not be logged")
 	}
 	output, err := runGuestJoined(ctx, v.vm, script, p.log)
 	if err != nil {
-		_, logErr := fmt.Fprintf(p.log, "guest run=%s vm=%s error=%v\n", p.config.RunID, v.options.ID, err)
-		err = errors.Join(err, logErr)
+		_, _ = fmt.Fprintf(p.log, "guest run=%s vm=%s error=%v\n", p.config.RunID, v.options.ID, err)
 	}
 	return output, err
 }
@@ -559,10 +559,7 @@ func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt,
 	p.services = append(p.services, service)
 	if _, err := fmt.Fprintf(p.log, "service run=%s vm=%s dependency=%t command=%s\n",
 		p.config.RunID, v.options.ID, dependency, script); err != nil {
-		service.startErr = err
-		service.err = err
-		close(service.done)
-		return err
+		command.Log.WithError(err).Warn("protected service command could not be logged")
 	}
 	service.attempted = true
 	if err := command.Start(); err != nil {
@@ -585,11 +582,14 @@ func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt,
 		service.retiring = true
 		service.mu.Unlock()
 		service.signals.Wait()
-		service.err = errors.Join(service.unexpected, waitErr, service.signalErr, command.Wait())
-		service.exited = command.ExitState.ExitCode() != -1
-		_, logErr := fmt.Fprintf(p.log, "service ended run=%s vm=%s exited=%t error=%v\n",
+		_, exitErr := command.Process.ExitCode()
+		if err := command.Wait(); err != nil {
+			command.Log.WithError(err).Debug("protected service command output completed")
+		}
+		service.err = errors.Join(service.unexpected, waitErr, exitErr, service.signalErr)
+		service.exited = exitErr == nil
+		_, _ = fmt.Fprintf(p.log, "service ended run=%s vm=%s exited=%t error=%v\n",
 			p.config.RunID, v.options.ID, service.exited, service.err)
-		service.err = errors.Join(service.err, logErr)
 		close(service.done)
 	}()
 	return nil
@@ -847,11 +847,17 @@ func (p *protectedPair) close() error {
 			return err
 		}
 	}
-	// CloseCtx deletes VM-owned boot copies; it is deliberately last, never
-	// the protected stop operation. The caller-owned sandbox directory stays.
+	// CloseCtx is deliberately last, never the protected stop operation.
+	// Its boot-copy deletion only logs errors, so verify our workload VMGS
+	// separately without deleting the caller-owned sandbox directory.
 	for _, v := range []*protectedVMAttempt{&p.workload, &p.diode} {
 		if v.vm != nil {
 			result = errors.Join(result, v.vm.CloseCtx(ctx))
+		}
+	}
+	if p.workload.vm != nil {
+		if err := os.Remove(filepath.Join(p.workload.options.BundleDirectory, p.workload.options.GuestStateFilePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			result = errors.Join(result, fmt.Errorf("remove owned workload VMGS copy: %w", err))
 		}
 	}
 	if p.pair.uplinkCleanup != nil {
@@ -876,7 +882,9 @@ func (p *protectedPair) close() error {
 	if p.log != nil {
 		_, err := fmt.Fprintf(p.log, "cleanup run=%s workload=%s diode=%s error=%v\n",
 			p.config.RunID, p.workload.options.ID, p.diode.options.ID, result)
-		result = errors.Join(result, err, p.log.Close())
+		if logErr := errors.Join(err, p.log.Close()); logErr != nil {
+			log.G(ctx).WithError(logErr).Warn("protected cleanup log could not be completed")
+		}
 	}
 	result = errors.Join(result, ctx.Err())
 	if result != nil {
@@ -907,25 +915,6 @@ func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
 	return errors.Join(err, v.vm.WaitCtx(ctx))
 }
 
-// expectedCommandExit normalizes known exit status and already-stopped reports.
-// Callers require observed exit; other Wait, IO and close failures remain failures.
-func expectedCommandExit(err error) error {
-	if many, ok := err.(interface{ Unwrap() []error }); ok {
-		var result error
-		for _, child := range many.Unwrap() {
-			result = errors.Join(result, expectedCommandExit(child))
-		}
-		return result
-	}
-	if _, ok := err.(*cmd.ExitError); ok {
-		return nil
-	}
-	if hcsv2.IsAlreadyStopped(err) {
-		return nil
-	}
-	return err
-}
-
 // stopDependencyServices requests a trapped TERM, never cancellation's SIGKILL.
 // Each signal is counted before dispatch and joined before Process can close.
 func (p *protectedPair) stopDependencyServices(ctx context.Context) {
@@ -944,6 +933,9 @@ func (p *protectedPair) stopDependencyServices(ctx context.Context) {
 		if err == nil {
 			_, err = service.command.Process.Signal(ctx, options)
 		}
+		if hcsv2.IsAlreadyStopped(err) {
+			err = nil
+		}
 		service.signalErr = err
 		service.signals.Done()
 	}
@@ -958,11 +950,7 @@ func (p *protectedPair) joinServices(ctx context.Context, dependency bool) error
 		}
 		select {
 		case <-service.done:
-			err := service.err
-			if service.startErr == nil && service.exited {
-				err = expectedCommandExit(err)
-			}
-			result = errors.Join(result, err)
+			result = errors.Join(result, service.err)
 		case <-ctx.Done():
 			return errors.Join(result, fmt.Errorf("protected service has not drained: %w", ctx.Err()))
 		}

@@ -17,6 +17,7 @@ import (
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
+	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/guestpath"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
@@ -215,14 +216,20 @@ func newHcsTask(
 		}
 	}
 	transferred := false
+	nativeAttempt := false
 	if protection != nil {
 		if err := protection.BeginTask(); err != nil {
 			return nil, err
 		}
-		// Before handoff, a failed create is unknown normal cleanup progress.
+		// Only a dispatched container create can leave unknown VM ownership.
+		// Upstream logger acquisition failures alone do not retain backing.
 		defer func() {
 			if !transferred {
-				protection.EndTask(err)
+				var cleanupErr error
+				if nativeAttempt {
+					cleanupErr = err
+				}
+				protection.EndTask(cleanupErr)
 			}
 		}()
 	}
@@ -261,22 +268,19 @@ func newHcsTask(
 	if shimOpts != nil {
 		ioRetryTimeout = time.Duration(shimOpts.IoRetryTimeoutInSec) * time.Second
 	}
-	if protection != nil {
-		// A disconnected client must not leave infinite reconnect producers
-		// underneath joined command cleanup.
-		ioRetryTimeout = 5 * time.Second
-	}
 	io, err := cmd.NewUpstreamIO(ctx, req.ID, req.Stdout, req.Stderr, req.Stdin, req.Terminal, ioRetryTimeout)
 	if err != nil {
 		return nil, err
 	}
-	// Failed creation must not leave the caller's IO connections unowned.
+	// Failed creation still releases upstream IO, without joining its logger
+	// as part of protected VM ownership.
 	defer func() {
 		if err != nil && protection != nil {
-			io.Close(context.Background())
+			go io.Close(context.Background())
 		}
 	}()
 
+	nativeAttempt = true
 	container, resources, err := createContainer(ctx, req.ID, owner, netNS, s, parent, shimOpts, req.Rootfs)
 	if err != nil {
 		return nil, err
@@ -856,8 +860,8 @@ func (ht *hcsTask) close(ctx context.Context) {
 			ht.ecl.Lock()
 			ht.execsClosing = true
 			ht.ecl.Unlock()
-			// No exec can now be added; stop and join every command before
-			// its container or resource owners are retired.
+			// No exec can now be added; join actual process/control users,
+			// not generic output delivery, before retiring their owners.
 			ht.cleanupErr = stderrors.Join(ht.operationErr, ht.drainProtectedExecs(ctx))
 			if ht.cleanupErr != nil {
 				ht.closeHost(ctx)
@@ -1024,7 +1028,7 @@ var incompleteProtectedTasks = struct {
 	tasks []*hcsTask
 }{}
 
-// drainProtectedExecs joins concrete command IO and container-exit callbacks.
+// drainProtectedExecs joins native process completion and control callbacks.
 // Errors retain the task and its ordinary resource owner instead of force-closing.
 func (ht *hcsTask) drainProtectedExecs(ctx context.Context) error {
 	var result error
@@ -1169,40 +1173,73 @@ func (ht *hcsTask) beginProtectedOperation(ctx context.Context) (context.Context
 	}, nil
 }
 
-// recordProtectedOperationError preserves unknown direct acquisition failures.
+// recordProtectedOperationError preserves unknown direct acquisition failures
+// and closes pair admission immediately, outside the operation lock.
 func (ht *hcsTask) recordProtectedOperationError(err error) {
 	if ht.protection != nil && err != nil {
 		ht.operationMu.Lock()
 		ht.operationErr = stderrors.Join(ht.operationErr, err)
 		ht.operationMu.Unlock()
+		ht.protection.Stop()
 	}
 }
 
 // execProtectedHost uses the existing command and pipe implementations, with
-// full command/IO ownership instead of the ordinary detached diagnostic path.
+// joined guest cancellation and native exit, not an upstream delivery fence.
 func (ht *hcsTask) execProtectedHost(ctx context.Context, req *shimdiag.ExecProcessRequest) (int, error) {
 	if len(req.Args) == 0 {
 		return -1, errors.New("missing command")
 	}
-	io, err := cmd.NewNpipeIO(ctx, req.Stdin, req.Stdout, req.Stderr, req.Terminal, 5*time.Second)
+	io, err := cmd.NewNpipeIO(ctx, req.Stdin, req.Stdout, req.Stderr, req.Terminal, 0)
 	if err != nil {
 		return -1, err
 	}
-	defer io.Close(context.Background())
 	command := sibling.NewJoinedGuestCommand(ctx, ht.host, req.Args[0], req.Args[1:]...)
+	// Own and join cancellation here so a blocked output consumer cannot
+	// postpone the end of Cmd's guest-Kill callback.
+	command.Context = nil
+	command.CopyAfterExitTimeout = 0
 	command.Spec.Terminal = req.Terminal
 	if req.Workdir != "" {
 		command.Spec.Cwd = req.Workdir
 	}
 	command.Stdin, command.Stdout, command.Stderr = io.Stdin(), io.Stdout(), io.Stderr()
 	if err := command.Start(); err != nil {
+		go io.Close(context.Background())
 		ht.recordProtectedOperationError(err)
 		return -1, err
 	}
+	var killErr error
+	killed := make(chan struct{})
+	// This is the only asynchronous guest-control borrower of this command.
+	stop := context.AfterFunc(ctx, func() {
+		_, killErr = command.Process.Kill(context.WithoutCancel(ctx))
+		close(killed)
+	})
 	waitErr := command.Process.Wait()
-	err = command.Wait()
-	ht.recordProtectedOperationError(stderrors.Join(waitErr, protectedCommandError(err)))
-	return command.ExitState.ExitCode(), stderrors.Join(waitErr, err)
+	code, exitErr := command.Process.ExitCode()
+	if !stop() {
+		<-killed
+	}
+	if hcs.IsAlreadyStopped(killErr) {
+		killErr = nil
+	}
+	nativeErr := stderrors.Join(waitErr, exitErr, killErr)
+	if _, ok := command.Process.(*gcs.Process); !ok {
+		nativeErr = stderrors.Join(nativeErr, errors.New("protected completion requires a GCS process"))
+	}
+	ht.recordProtectedOperationError(nativeErr)
+	// Validated GCS completion leaves only local stream forwarding/closure,
+	// including a possibly blocked upstream writer. Other process types retain
+	// their VM through nativeErr. Preserve normal output completion separately.
+	go func() {
+		_ = command.Wait()
+		io.Close(context.Background())
+	}()
+	if exitErr == nil && code != 0 {
+		err = fmt.Errorf("process exited with exit code %d", code)
+	}
+	return code, stderrors.Join(nativeErr, err)
 }
 
 func hcsPropertiesToWindowsStats(props *hcsschema.Properties) *stats.Statistics_Windows {

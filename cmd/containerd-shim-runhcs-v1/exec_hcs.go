@@ -5,8 +5,6 @@ package main
 import (
 	"context"
 	stderrors "errors"
-	"io"
-	"net"
 	"sync"
 	"time"
 
@@ -23,6 +21,7 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
+	"github.com/Microsoft/hcsshim/internal/gcs"
 	hcs "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/ot"
@@ -35,8 +34,8 @@ import (
 // newHcsExec creates an exec to track the lifetime of `spec` in `c` which is
 // actually created on the call to `Start()`. If `id==tid` then this is the init
 // exec and the exec will also start `c` on the call to `Start()` before execing
-// the process `spec.Process`. Protected execs publish completion only after
-// command IO and container-exit callbacks have joined.
+// the process `spec.Process`. Protected completion joins process control and
+// container-exit callbacks, not unrelated upstream output or logger completion.
 func newHcsExec(
 	ctx context.Context,
 	events publisher,
@@ -139,7 +138,7 @@ type hcsExec struct {
 	startDone     chan struct{}
 	containerDone chan struct{}
 	operations    sync.WaitGroup // Add under sl, join after exited state publication.
-	cleanupErr    error          // Published by exited after joined command/callback completion.
+	cleanupErr    error          // Published by exited after native completion and control joins.
 }
 
 func (he *hcsExec) ID() string {
@@ -501,8 +500,12 @@ func (he *hcsExec) exitFromCreatedL(ctx context.Context, status int) {
 		he.state = shimExecStateExited
 		he.exitStatus = uint32(status)
 		he.exitedAt = time.Now()
-		// Release all upstream IO connections (if any)
-		he.io.Close(ctx)
+		// Upstream cleanup can wait for an external logger, not a VM borrower.
+		if he.protected {
+			go he.io.Close(ctx)
+		} else {
+			he.io.Close(ctx)
+		}
 		// Free any waiters
 		he.exitedOnce.Do(func() {
 			close(he.exited)
@@ -527,7 +530,8 @@ func (he *hcsExec) exitFromCreatedL(ctx context.Context, status int) {
 // 3. Capture the process exit code and set `he.state`, `he.exitStatus` and
 // `he.exitedAt` to the exited values.
 //
-// 4. Wait for all IO to complete and release any upstream IO connections.
+// 4. Join process control callbacks. Ordinary execs also finish upstream IO here;
+// protected execs leave output forwarding outside their native completion.
 //
 // 5. Send the async `TaskExit` to upstream listeners of any events.
 //
@@ -569,15 +573,16 @@ func (he *hcsExec) waitForExit() {
 	if he.protected {
 		he.operations.Wait()
 		<-he.containerDone
-	}
-	// Wait for all IO copies to complete and free the resources.
-	commandErr := he.p.Wait()
-	if he.protected {
+		if _, ok := he.p.Process.(*gcs.Process); !ok {
+			exitErr = stderrors.Join(exitErr, errors.New("protected completion requires a GCS process"))
+		}
 		he.sl.Lock()
-		he.cleanupErr = stderrors.Join(he.cleanupErr, waitErr, exitErr, protectedCommandError(commandErr))
+		he.cleanupErr = stderrors.Join(he.cleanupErr, waitErr, exitErr)
 		he.sl.Unlock()
+	} else {
+		_ = he.p.Wait()
+		he.io.Close(ctx)
 	}
-	he.io.Close(ctx)
 
 	// Only send the `runtime.TaskExitEventTopic` notification if this is a true
 	// exec. For the `init` exec this is handled in task teardown.
@@ -601,6 +606,14 @@ func (he *hcsExec) waitForExit() {
 	he.exitedOnce.Do(func() {
 		close(he.exited)
 	})
+	if he.protected {
+		// For validated GCS processes with no Cmd cancellation callback,
+		// remaining Cmd work only forwards/closes local streams. An unexpected
+		// process type retains its owners through cleanupErr instead.
+		// Keep normal delivery/Close ordering, but not as a reclaim obligation.
+		_ = he.p.Wait()
+		he.io.Close(ctx)
+	}
 }
 
 // waitForContainerExit waits for `he.c` to exit. Depending on the exec's state
@@ -640,27 +653,4 @@ func (he *hcsExec) waitForContainerExit() {
 		// Process exited first. This is the normal case do nothing because
 		// `he.waitForExit` will release any waiters.
 	}
-}
-
-// protectedCommandError ignores application exit status, not command ownership
-// errors. Expected upstream stream closure is harmless after observed exit;
-// native wait/exit-code, other IO, callback and close failures remain sticky.
-func protectedCommandError(err error) error {
-	if many, ok := err.(interface{ Unwrap() []error }); ok {
-		var result error
-		for _, child := range many.Unwrap() {
-			result = stderrors.Join(result, protectedCommandError(child))
-		}
-		return result
-	}
-	if _, ok := err.(*cmd.ExitError); ok {
-		return nil
-	}
-	if stderrors.Is(err, net.ErrClosed) || stderrors.Is(err, io.ErrClosedPipe) {
-		return nil
-	}
-	if hcs.IsAlreadyStopped(err) {
-		return nil
-	}
-	return err
 }
