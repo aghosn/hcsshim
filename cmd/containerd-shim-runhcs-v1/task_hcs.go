@@ -648,8 +648,9 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 		// The task process may have already exited, and the status set to
 		// shimExecStateExited, but resources may still be in the process
 		// of being cleaned up. Wait for ht.closed to be closed. This signals
-		// that [hcsTask.waitInitExit]/[hcsTask.waitForHostExit] has finished destroying
-		// container resources and that layers were umounted.
+		// that [hcsTask.waitInitExit]/[hcsTask.waitForHostExit] has finished attempting
+		// container resource cleanup and layer unmounts. Protected native
+		// ownership failures are reported separately.
 		// If the shim exits before resources are cleaned up, those resources
 		// will remain locked and untracked, which leads to lingering sandboxes
 		// and container resources like base vhdx.
@@ -945,27 +946,22 @@ func (ht *hcsTask) close(ctx context.Context) {
 				ht.closeHost(ctx)
 				return
 			}
-			// Release any resources associated with the container.
+			// Per-container resource/file/handle cleanup is best effort. Final
+			// pair storage drainage and native reclaim still gate backing release.
 			entry.Trace("starting task resource cleanup")
 
 			if err := resources.ReleaseResources(ctx, ht.cr, ht.host, true); err != nil {
-				entry.WithError(err).Error("failed to release container resources")
-				if ht.protection != nil {
-					ht.cleanupErr = err
-					ht.closeHost(ctx)
-					return
-				}
+				entry.WithError(err).Warn("failed to release container resources")
 			}
 			if ht.protection != nil {
-				ht.cleanupErr = ht.host.DeleteContainerState(ctx, ht.id)
+				if err := ht.host.DeleteContainerState(ctx, ht.id); err != nil {
+					entry.WithError(err).Warn("failed to delete container state")
+				}
 			}
 
 			// Close the container handle invalidating all future access.
 			if err := ht.c.Close(); err != nil {
-				entry.WithError(err).Error("failed to close container")
-				if ht.protection != nil {
-					ht.cleanupErr = stderrors.Join(ht.cleanupErr, err)
-				}
+				entry.WithError(err).Warn("failed to close container")
 			}
 
 			entry.Trace("task resource cleanup completed")
