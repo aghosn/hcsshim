@@ -65,7 +65,7 @@ type protectedService struct {
 }
 
 // protectedPair is a serial lifecycle owner, not a second VM/task implementation.
-// Close joins startup, tasks, attach, watchers and services before retiring
+// Close joins startup, tasks, watchers and services before retiring
 // their owners. Dependencies intentionally survive stop: workload shutdown
 // still needs the diode's root/provider/relay. No implicit backing Close exists.
 type protectedPair struct {
@@ -770,8 +770,8 @@ func PrepareProtectedShutdown() error {
 	return nil
 }
 
-// close is the single protected cleanup decision; it is never retried. Forward
-// users drain before workload termination. Relay, exports and root drain with
+// close is the single protected cleanup decision; it is never retried. Tasks
+// drain before workload termination. Relay, exports and root drain with
 // diode GCS alive; both actual VM exits precede native teardown/reclaim/release.
 // Any uncertainty retains this owner in protectedOwners without a receipt.
 func (p *protectedPair) close() error {

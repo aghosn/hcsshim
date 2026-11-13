@@ -25,8 +25,6 @@ type pairShells struct {
 	conns     map[net.Conn]struct{}
 	closed    bool
 	protected bool
-	workers   sync.WaitGroup
-	err       error
 }
 
 type shellGuest struct {
@@ -53,18 +51,12 @@ func startPairShells(pair *Pair) (*pairShells, error) {
 			return nil, errors.Join(err, server.Close())
 		}
 		server.listeners = append(server.listeners, listener)
-		if server.protected {
-			server.workers.Add(1)
-		}
 		go server.accept(listener, peer.vm, peer.name)
 	}
 	return server, nil
 }
 
 func (s *pairShells) accept(listener net.Listener, vm *uvm.UtilityVM, name string) {
-	if s.protected {
-		defer s.workers.Done()
-	}
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -77,34 +69,24 @@ func (s *pairShells) accept(listener net.Listener, vm *uvm.UtilityVM, name strin
 			return
 		}
 		s.conns[conn] = struct{}{}
-		if s.protected {
-			s.workers.Add(1)
-		}
 		s.mu.Unlock()
 		// A handler owns its connection and guest command until the joined
 		// command and frame producer have both returned.
 		go func() {
-			if s.protected {
-				defer s.workers.Done()
-			}
 			defer func() {
 				_ = conn.Close()
 				s.mu.Lock()
 				delete(s.conns, conn)
 				s.mu.Unlock()
 			}()
-			err := servePairShell(s.ctx, vm, name, conn, s.protected)
-			if s.protected {
-				s.mu.Lock()
-				s.err = errors.Join(s.err, err)
-				s.mu.Unlock()
-			}
+			servePairShell(s.ctx, vm, name, conn, s.protected)
 		}()
 	}
 }
 
+// Close stops shell admission, cancels sessions and closes their endpoints without
+// waiting for handlers. Guest process/TTY completion must not delay VM termination.
 func (s *pairShells) Close() error {
-	s.cancel()
 	s.mu.Lock()
 	s.closed = true
 	listeners := append([]net.Listener(nil), s.listeners...)
@@ -113,6 +95,7 @@ func (s *pairShells) Close() error {
 		conns = append(conns, conn)
 	}
 	s.mu.Unlock()
+	s.cancel()
 	var result error
 	for _, listener := range listeners {
 		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -123,12 +106,6 @@ func (s *pairShells) Close() error {
 		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
 			result = errors.Join(result, err)
 		}
-	}
-	if s.protected {
-		s.workers.Wait()
-		s.mu.Lock()
-		result = errors.Join(result, s.err)
-		s.mu.Unlock()
 	}
 	return result
 }
@@ -145,14 +122,14 @@ func readShellFrame(reader io.Reader) (byte, []byte, error) {
 
 // servePairShell reuses the attach framing for a guest shell. Protected sessions
 // return only after the guest command and the connection's input producer join.
-func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, protected ...bool) error {
+func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, protected ...bool) {
 	kind, payload, err := readShellFrame(conn)
 	if err != nil {
-		return nil
+		return
 	}
 	if kind != 1 || len(payload) != 4 {
 		_, _ = fmt.Fprint(conn, "Use run.ps1 container for the containerd-managed image lifecycle.\r\n")
-		return nil
+		return
 	}
 	shellCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -175,10 +152,7 @@ func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn ne
 	if err := command.Start(); err != nil {
 		_, _ = fmt.Fprintf(conn, "Start sibling shell: %v\r\n", err)
 		_ = writer.Close()
-		if joined {
-			return err
-		}
-		return nil
+		return
 	}
 	producerDone := make(chan struct{})
 	// Closing conn and input unblocks both frame reads and writes before join.
@@ -206,15 +180,13 @@ func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn ne
 	}()
 	if !joined {
 		_ = command.Wait()
-		return nil
+		return
 	}
-	waitErr := command.Process.Wait()
-	_, exitErr := command.Process.ExitCode()
+	_ = command.Process.Wait()
 	_ = conn.Close()
 	_ = writer.Close()
 	<-producerDone
 	if err := command.Wait(); err != nil {
 		command.Log.WithError(err).Debug("protected shell command output completed")
 	}
-	return errors.Join(waitErr, exitErr)
 }
