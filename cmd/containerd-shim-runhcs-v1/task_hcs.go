@@ -466,15 +466,18 @@ func (ht *hcsTask) ListExecs() (_ []shimExec, err error) {
 }
 
 func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all bool) error {
-	if ht.protection != nil && eid == "" && (signal == 9 || signal == 15) {
-		ht.protection.Stop()
-	}
 	e, err := ht.GetExec(eid)
 	if err != nil {
 		return err
 	}
 	if all && eid != "" {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "cannot signal all for non-empty exec: '%s'", eid)
+	}
+	if ht.protection != nil && eid == "" && (signal == 9 || signal == 15) {
+		ht.protection.Stop()
+		// Observed native exit fulfills this terminal signal without a guest
+		// RPC. The pair owner independently validates reclaim and release.
+		return ht.host.WaitNativeExit(ctx)
 	}
 	if all {
 		// We are in a kill all on the init task. Signal everything.
