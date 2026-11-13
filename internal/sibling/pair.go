@@ -39,6 +39,7 @@ type Config struct {
 	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
 	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
 	VMResources            []VMResources `json:"vm_resources,omitempty"`
+	PublishedTCPPorts      []uint16      `json:"published_tcp_ports,omitempty"`
 	directory              string
 }
 
@@ -77,9 +78,12 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	if config.Version != 1 {
 		return nil, errors.New("sibling config requires version 1")
 	}
+	if err := diodecontrol.ValidatePublishedTCPPorts(config.PublishedTCPPorts); err != nil {
+		return nil, err
+	}
 	if config.Standalone {
 		if config.ModuleDirectory != "" || config.SharedMemoryBytes != 0 ||
-			config.MediateGCS || config.UnikraftPackage != "" {
+			config.MediateGCS || config.UnikraftPackage != "" || len(config.PublishedTCPPorts) != 0 {
 			return nil, errors.New("standalone cannot configure a diode, shared memory, modules or GCS mediation")
 		}
 	} else if !filepath.IsAbs(config.ModuleDirectory) ||
@@ -286,6 +290,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
+	var diodeUplink string
 	err = bootstrap(ctx, func(bootCtx context.Context) error {
 		if err := pair.Workload.Start(bootCtx); err != nil {
 			return fmt.Errorf("start sibling workload: %w", err)
@@ -329,7 +334,8 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return err
 		}
 		pair.uplinkCleanup = cleanup
-		_, err = runBootstrapGuest(bootCtx, pair.Diode, "diode network and GCS relay", diodeBootstrapCommand(uplink, config.MediateGCS))
+		diodeUplink = uplink.Address
+		_, err = runBootstrapGuest(bootCtx, pair.Diode, "diode network and GCS relay", diodeBootstrapCommand(uplink, config.MediateGCS, config.PublishedTCPPorts...))
 		return err
 	})
 	if err != nil {
@@ -374,6 +380,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	}); err != nil {
 		return nil, err
 	}
+	if native != nil && len(config.PublishedTCPPorts) != 0 {
+		if err := nativeControl.PublishTCPPorts(ctx, config.PublishedTCPPorts); err != nil {
+			return nil, fmt.Errorf("publish owned workload TCP ports: %w", err)
+		}
+	}
 	var control scsi.SiblingExportControl
 	if native != nil {
 		control = nativeControl
@@ -409,6 +420,22 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		if err := pair.unikraftConsole.Err(); err != nil {
 			return nil, err
 		}
+	}
+	provider := "linux"
+	if native != nil {
+		provider, diodeUplink = "unikraft", native.Network.Uplink.String()
+	}
+	if consoleDirectory != "" {
+		metadata, err := newBenchmarkNetwork(ip, diodeUplink, provider, pair.Workload.ID(), pair.Diode.ID())
+		if err != nil {
+			return nil, err
+		}
+		metadata.PublishedTCPPorts = append([]uint16(nil), config.PublishedTCPPorts...)
+		if err := writeBenchmarkNetwork(consoleDirectory, metadata); err != nil {
+			return nil, err
+		}
+	}
+	if native != nil {
 		pair.watchOwnedProvider(nativeControl)
 	} else {
 		go func() {
@@ -444,8 +471,16 @@ func GCSRelayCommand() string {
 		`sleep 0.1; done; echo 'GCS_RELAY_READY: workload control and stdio through diode; Plan9 unchanged'`
 }
 
-func diodeBootstrapCommand(uplink *Uplink, mediateGCS bool) string {
+func diodeBootstrapCommand(uplink *Uplink, mediateGCS bool, ports ...uint16) string {
 	command := diodeNetworkCommand(uplink)
+	if len(ports) != 0 {
+		command += " || exit 1"
+	}
+	for _, port := range ports {
+		address := strings.SplitN(uplink.Address, "/", 2)[0]
+		command += fmt.Sprintf(`; /run/sibling-exec/ipt iptables -w -t nat -A PREROUTING -i "$up" -d %s -p tcp --dport %d -j DNAT --to-destination 10.200.0.2:%d || exit 1`,
+			Quote(address), port, port)
+	}
 	if mediateGCS {
 		command += "; " + GCSRelayCommand()
 	}

@@ -101,6 +101,7 @@ func main() {
 
 	app.Commands = []cli.Command{
 		cpuTopologyCommand,
+		cpuGroupCommand,
 		lcowCommand,
 		wcowCommand,
 		cwcowCommand,

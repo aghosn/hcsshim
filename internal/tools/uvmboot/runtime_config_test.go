@@ -14,9 +14,116 @@ import (
 	"testing"
 
 	"github.com/Microsoft/hcsshim/internal/hns"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/pelletier/go-toml"
 	"github.com/urfave/cli"
 )
+
+func TestBenchmarkClientRuntimeUsesOwnedUplinkCNI(t *testing.T) {
+	for _, plugin := range []string{"io.containerd.cri.v1.runtime", "io.containerd.grpc.v1.cri"} {
+		t.Run(plugin, func(t *testing.T) {
+			root := t.TempDir()
+			input := `[plugins."` + plugin + `".containerd]
+default_runtime_name='runhcs-lcow'
+[plugins."` + plugin + `".containerd.runtimes.runhcs-lcow]
+runtime_type='io.containerd.runhcs.v1'
+snapshotter='windows-lcow'
+pod_annotations=['existing.*']
+[plugins."` + plugin + `".containerd.runtimes.runhcs-lcow.options]
+SandboxIsolation=1
+LCOWSecurityPolicyEnabled=true
+[plugins."` + plugin + `".cni]
+conf_dir='C:\owned\baseline-cni'
+[plugins."io.containerd.cri.v1.images"]
+snapshotter='windows-lcow'
+[plugins."io.containerd.cri.v1.images".runtime_platforms.runhcs-lcow]
+platform='linux/amd64'
+snapshotter='windows-lcow'
+`
+			owned, err := isolatedRuntimeConfig([]byte(input), root, root, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _ := toml.LoadBytes(owned)
+			output, err := benchmarkClientRuntimeConfig(owned, root, func(name string) (*hns.HNSNetwork, error) {
+				if name != sibling.UplinkNetworkName {
+					t.Fatalf("unexpected network lookup %s", name)
+				}
+				return &hns.HNSNetwork{Type: "NAT", Subnets: []hns.Subnet{{
+					AddressPrefix: sibling.UplinkSubnet, GatewayAddress: sibling.UplinkGateway,
+				}}}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := toml.LoadBytes(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := after.GetPath([]string{"plugins", plugin, "containerd", "runtimes", "runhcs-benchmark-client"}).(*toml.Tree)
+			if client.Get("cni_conf_dir") != filepath.Join(root, "benchmark-client-cni") {
+				t.Fatal("client did not select its own CNI directory")
+			}
+			cniPath := []string{"plugins", plugin, "cni", "conf_dir"}
+			if after.GetPath(cniPath) != filepath.Join(root, "benchmark-client-cni") {
+				t.Fatal("older containerd would use the installed network instead of the owned uplink")
+			}
+			client.Delete("cni_conf_dir")
+			original := before.GetPath([]string{"plugins", plugin, "containerd", "runtimes", "runhcs-sibling"}).(*toml.Tree)
+			if !reflect.DeepEqual(client.ToMap(), original.ToMap()) {
+				t.Fatal("client must clone owned runtime options including matching shim and annotations")
+			}
+			images := []string{"plugins", "io.containerd.cri.v1.images", "runtime_platforms"}
+			if !reflect.DeepEqual(after.GetPath(append(images, "runhcs-benchmark-client")).(*toml.Tree).ToMap(),
+				before.GetPath(append(images, "runhcs-sibling")).(*toml.Tree).ToMap()) {
+				t.Fatal("client lost LCOW image platform/snapshotter")
+			}
+			after.DeletePath([]string{"plugins", plugin, "containerd", "runtimes", "runhcs-benchmark-client"})
+			after.DeletePath([]string{"plugins", "io.containerd.cri.v1.images", "runtime_platforms", "runhcs-benchmark-client"})
+			after.SetPath(cniPath, before.GetPath(cniPath))
+			if !reflect.DeepEqual(before.ToMap(), after.ToMap()) {
+				t.Fatal("changed settings beyond the benchmark handler, image platform and owned CNI")
+			}
+			data, err := os.ReadFile(filepath.Join(root, "benchmark-client-cni", "0-benchmark-client.conf"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var network struct {
+				CNIVersion, Name, Type string
+				IPAM                   struct {
+					Subnet string
+					Routes []struct{ Dst, GW string }
+				}
+			}
+			if err := json.Unmarshal(data, &network); err != nil {
+				t.Fatal(err)
+			}
+			if network.CNIVersion != "0.2.0" || network.Name != sibling.UplinkNetworkName || network.Type != "nat" ||
+				network.IPAM.Subnet != sibling.UplinkSubnet || len(network.IPAM.Routes) != 1 ||
+				network.IPAM.Routes[0].Dst != "0.0.0.0/0" || network.IPAM.Routes[0].GW != sibling.UplinkGateway {
+				t.Fatalf("incorrect client CNI: %s", data)
+			}
+		})
+	}
+}
+
+func TestBenchmarkClientRejectsForeignNetworkWithoutCreatingCNI(t *testing.T) {
+	for _, network := range []*hns.HNSNetwork{
+		nil, {Type: "NAT"},
+		{Type: "NAT", Subnets: []hns.Subnet{{AddressPrefix: sibling.UplinkSubnet, GatewayAddress: "172.31.250.2"}}},
+		{Type: "NAT", Subnets: []hns.Subnet{{AddressPrefix: "172.31.251.0/24", GatewayAddress: sibling.UplinkGateway}}},
+	} {
+		root := t.TempDir()
+		config := []byte(`[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runhcs-sibling]
+runtime_type='io.containerd.runhcs.v1'`)
+		if _, err := benchmarkClientRuntimeConfig(config, root, func(string) (*hns.HNSNetwork, error) { return network, nil }); err == nil {
+			t.Fatalf("accepted foreign network: %+v", network)
+		}
+		if _, err := os.Stat(filepath.Join(root, "benchmark-client-cni")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("created CNI for an invalid network")
+		}
+	}
+}
 
 func TestOwnedCNIIsAppliedByRuntimeConfigCommand(t *testing.T) {
 	fixture := t.TempDir()

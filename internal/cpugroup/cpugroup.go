@@ -18,6 +18,14 @@ const NullGroupID = "00000000-0000-0000-0000-000000000000"
 // MaxSchedulingPriority is the highest Hyper-V CPU group scheduling priority.
 const MaxSchedulingPriority uint32 = 7
 
+// ErrNotFound identifies a successful host query with no matching CPU group.
+var ErrNotFound = errors.New("CPU group not found")
+
+type notFoundError struct{ id string }
+
+func (e *notFoundError) Error() string { return fmt.Sprintf("no cpugroup exists with id %v", e.id) }
+func (e *notFoundError) Unwrap() error { return ErrNotFound }
+
 type setPropertyOperation struct {
 	GroupId       string
 	PropertyCode  uint32
@@ -102,5 +110,5 @@ func GetCPUGroupConfig(ctx context.Context, id string) (*hcsschema.CpuGroupConfi
 			return &c, nil
 		}
 	}
-	return nil, fmt.Errorf("no cpugroup exists with id %v", id)
+	return nil, &notFoundError{id: id}
 }

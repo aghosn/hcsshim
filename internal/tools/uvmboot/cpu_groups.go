@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/urfave/cli"
 
 	"github.com/Microsoft/hcsshim/internal/cpugroup"
@@ -45,6 +47,133 @@ type cpuGroupReport struct {
 }
 
 const cpuGroupPrioritiesArgName = "cpu-group-priorities"
+
+func checkedCPUGroup(ctx context.Context, id string, lps []uint32, priority uint32, ops cpuGroupOperations) (*cpugroup.Report, error) {
+	config, err := ops.query(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if config == nil || !strings.EqualFold(config.GroupId, id) || config.Affinity == nil {
+		return nil, errors.New("CPU group returned missing or mismatched identity/affinity")
+	}
+	actual := make([]uint32, len(config.Affinity.LogicalProcessors))
+	for i, lp := range config.Affinity.LogicalProcessors {
+		if lp < 0 {
+			return nil, fmt.Errorf("CPU group returned negative LP %d", lp)
+		}
+		actual[i] = uint32(lp)
+	}
+	actual, actualKey, err := canonicalLPs(actual)
+	_, expectedKey, expectedErr := canonicalLPs(lps)
+	if err != nil || expectedErr != nil || actualKey != expectedKey ||
+		config.Affinity.LogicalProcessorCount != int32(len(lps)) {
+		return nil, errors.New("CPU group affinity mismatch")
+	}
+	found := false
+	for _, property := range config.GroupProperties {
+		if property.PropertyCode == hcsschema.CPUSchedulingPriorityProperty {
+			if found || property.PropertyValue != priority {
+				return nil, errors.New("CPU group scheduling priority mismatch")
+			}
+			found = true
+		}
+	}
+	if !found {
+		return nil, errors.New("CPU group returned no scheduling priority")
+	}
+	return &cpugroup.Report{GroupID: config.GroupId, LogicalProcessors: actual, SchedulingPriority: priority}, nil
+}
+
+func manageCPUGroup(ctx context.Context, action, id string, lps []uint32, priority uint32, ifExists bool, ops cpuGroupOperations) (_ *cpugroup.Report, resultErr error) {
+	parsed, err := guid.FromString(id)
+	if err != nil || parsed == (guid.GUID{}) {
+		return nil, errors.New("CPU group requires a nonzero GUID")
+	}
+	id = parsed.String()
+	lps, _, err = canonicalLPs(lps)
+	if err != nil {
+		return nil, err
+	}
+	if priority > cpugroup.MaxSchedulingPriority {
+		return nil, errors.New("CPU group scheduling priority must be 0 through 7")
+	}
+	switch action {
+	case "create":
+		if err := ops.create(ctx, id, lps); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if resultErr != nil {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				if err := ops.delete(cleanupCtx, id); err != nil {
+					resultErr = errors.Join(resultErr, fmt.Errorf("rollback CPU group %s: %w", id, err))
+				}
+			}
+		}()
+		if err := ops.setPriority(ctx, id, priority); err != nil {
+			return nil, err
+		}
+	case "query", "delete":
+	default:
+		return nil, fmt.Errorf("unknown CPU group action %q", action)
+	}
+	report, err := checkedCPUGroup(ctx, id, lps, priority, ops)
+	if err != nil {
+		if action == "delete" && ifExists && errors.Is(err, cpugroup.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if action == "delete" {
+		return nil, ops.delete(ctx, id)
+	}
+	return report, nil
+}
+
+func cpuGroupSubcommand(action string) cli.Command {
+	flags := []cli.Flag{
+		cli.StringFlag{Name: "id", Required: true},
+		cli.StringFlag{Name: "lps", Required: true},
+		cli.UintFlag{Name: "priority", Required: true},
+	}
+	if action == "delete" {
+		flags = append(flags, cli.BoolFlag{Name: "if-exists", Usage: "Ignore only a successful host query proving the group is absent"})
+	}
+	return cli.Command{
+		Name:  action,
+		Flags: flags,
+		Action: func(c *cli.Context) error {
+			if c.NArg() != 0 {
+				return errors.New("unexpected CPU group positional arguments")
+			}
+			var lps []uint32
+			for _, part := range strings.Split(c.String("lps"), ",") {
+				lp, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+				if err != nil {
+					return fmt.Errorf("invalid logical processor %q: %w", part, err)
+				}
+				lps = append(lps, uint32(lp))
+			}
+			if c.Uint("priority") > uint(cpugroup.MaxSchedulingPriority) {
+				return errors.New("CPU group scheduling priority must be 0 through 7")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			report, err := manageCPUGroup(ctx, action, c.String("id"), lps, uint32(c.Uint("priority")), c.Bool("if-exists"), hostCPUGroupOperations)
+			if err != nil || report == nil {
+				return err
+			}
+			return json.NewEncoder(c.App.Writer).Encode(report)
+		},
+	}
+}
+
+var cpuGroupCommand = cli.Command{
+	Name:        "cpu-group",
+	Usage:       "Manage an explicitly owned CPU group with identity, affinity and priority readback",
+	Subcommands: []cli.Command{cpuGroupSubcommand("create"), cpuGroupSubcommand("query"), cpuGroupSubcommand("delete")},
+}
 
 func parseCPUGroupPriorities(value string) ([]uint32, error) {
 	if value == "" {

@@ -22,8 +22,11 @@ const (
 	QuerySize               = 8
 	MaxFrame                = HeaderSize + QuerySize + MaxExports*ExportSize
 
-	Response uint16 = 1
-	Storage  uint16 = 1
+	Response             uint16 = 1
+	Storage              uint16 = 1
+	Network              uint16 = 2
+	PublishTCP           uint16 = 1
+	MaxPublishedTCPPorts        = 16
 
 	Capabilities uint16 = 1
 	Query        uint16 = 2
@@ -187,8 +190,53 @@ type Frame struct {
 	Body   []byte
 }
 
+// ValidatePublishedTCPPorts bounds the explicit, opt-in workload publications.
+func ValidatePublishedTCPPorts(ports []uint16) error {
+	if len(ports) > MaxPublishedTCPPorts {
+		return errors.New("at most 16 published TCP ports are supported")
+	}
+	seen := map[uint16]bool{}
+	for _, port := range ports {
+		if port == 0 || seen[port] {
+			return errors.New("published TCP ports must be nonzero and distinct")
+		}
+		seen[port] = true
+	}
+	return nil
+}
+
+func validateFrame(h Header, p []byte) error {
+	if h.Service == Storage {
+		return ValidateStorage(h, p)
+	}
+	if !h.valid() || h.Service != Network || h.Operation != PublishTCP || len(p) != int(h.Length)-HeaderSize {
+		return errInvalidFrame
+	}
+	if h.Flags == Response && h.Status != OK {
+		if len(p) == 0 && h.Status != Pending {
+			return nil
+		}
+		return errInvalidFrame
+	}
+	if len(p) < 4 || binary.LittleEndian.Uint16(p[2:]) != 0 {
+		return errInvalidFrame
+	}
+	count := int(binary.LittleEndian.Uint16(p))
+	if count > MaxPublishedTCPPorts || len(p) != 4+2*count {
+		return errInvalidFrame
+	}
+	ports := make([]uint16, count)
+	for i := range ports {
+		ports[i] = binary.LittleEndian.Uint16(p[4+2*i:])
+	}
+	if ValidatePublishedTCPPorts(ports) != nil {
+		return errInvalidFrame
+	}
+	return nil
+}
+
 func (f Frame) MarshalBinary() ([]byte, error) {
-	if err := ValidateStorage(f.Header, f.Body); err != nil {
+	if err := validateFrame(f.Header, f.Body); err != nil {
 		return nil, err
 	}
 	p, err := f.Header.MarshalBinary()
@@ -213,7 +261,7 @@ func ReadFrame(r io.Reader) (Frame, error) {
 	if _, err := io.ReadFull(r, body); err != nil {
 		return Frame{}, fmt.Errorf("read diode control body: %w", err)
 	}
-	if err := ValidateStorage(h, body); err != nil {
+	if err := validateFrame(h, body); err != nil {
 		return Frame{}, err
 	}
 	return Frame{Header: h, Body: body}, nil

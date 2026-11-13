@@ -5,12 +5,24 @@ package cpugroup
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 )
+
+func TestCPUGroupNotFoundPreservesMessageAndIdentity(t *testing.T) {
+	err := &notFoundError{id: "fixture-id"}
+	if err.Error() != "no cpugroup exists with id fixture-id" || !errors.Is(fmt.Errorf("query: %w", err), ErrNotFound) {
+		t.Fatalf("missing CPU group lost diagnostic or error identity: %v", err)
+	}
+	if errors.Is(errors.New(err.Error()), ErrNotFound) {
+		t.Fatal("text-only failures must not be interpreted as a missing group")
+	}
+}
 
 func TestSchedulingPriorityOperationJSON(t *testing.T) {
 	for _, priority := range []uint64{0, 2, 7, 1 << 32} {

@@ -12,6 +12,33 @@ import (
 	"testing"
 )
 
+func TestWirePublishedTCPPorts(t *testing.T) {
+	for _, response := range []bool{false, true} {
+		valid := frame(PublishTCP, response, []byte{1, 0, 0, 0, 0xcb, 0x2b})
+		valid.Header.Service = Network
+		data, err := valid.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual, err := ReadFrame(bytes.NewReader(data))
+		if err != nil || actual.Header != valid.Header || !bytes.Equal(actual.Body, valid.Body) {
+			t.Fatalf("publication wire roundtrip failed: %+v, %v", actual, err)
+		}
+		for _, body := range [][]byte{
+			nil, {1, 0, 0, 0}, {1, 0, 1, 0, 0xcb, 0x2b},
+			{1, 0, 0, 0, 0, 0}, {17, 0, 0, 0},
+			{2, 0, 0, 0, 0xcb, 0x2b, 0xcb, 0x2b},
+		} {
+			bad := valid
+			bad.Body = body
+			bad.Header.Length = uint32(HeaderSize + len(body))
+			if _, err := bad.MarshalBinary(); err == nil {
+				t.Fatalf("accepted malformed publication body: %x", body)
+			}
+		}
+	}
+}
+
 func frame(operation uint16, response bool, body []byte) Frame {
 	h := Header{Service: Storage, Operation: operation, Length: uint32(HeaderSize + len(body)),
 		Request: 0x0807060504030201, Session: 0x1817161514131211}

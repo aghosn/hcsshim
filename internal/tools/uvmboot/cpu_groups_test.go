@@ -3,15 +3,188 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Microsoft/hcsshim/internal/cpugroup"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/urfave/cli"
 )
+
+func TestOwnedCPUGroupCLI(t *testing.T) {
+	original := hostCPUGroupOperations
+	defer func() { hostCPUGroupOperations = original }()
+	ops, _, deleted := fakeCPUGroupOperations()
+	create := ops.create
+	ops.create = func(ctx context.Context, id string, lps []uint32) error {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 30*time.Second {
+			t.Fatal("CPU group CLI must bound host operations")
+		}
+		return create(ctx, id, lps)
+	}
+	hostCPUGroupOperations = ops
+	id := "da4f09a9-dc31-4910-8793-3117a6e93a82"
+	var output bytes.Buffer
+	app := cli.NewApp()
+	app.Writer = &output
+	app.Commands = []cli.Command{cpuGroupCommand}
+	for _, action := range []string{"create", "query", "delete"} {
+		output.Reset()
+		if err := app.Run([]string{"uvmboot", "cpu-group", action, "--id", id, "--lps", "24,8", "--priority", "1"}); err != nil {
+			t.Fatal(err)
+		}
+		if action == "delete" {
+			if output.Len() != 0 || !reflect.DeepEqual(*deleted, []string{id}) {
+				t.Fatal("delete must emit no JSON and delete only the verified group")
+			}
+			continue
+		}
+		var actual map[string]interface{}
+		if err := json.Unmarshal(output.Bytes(), &actual); err != nil {
+			t.Fatal(err)
+		}
+		if len(actual) != 3 || actual["group_id"] != id || actual["scheduling_priority"] != float64(1) ||
+			!reflect.DeepEqual(actual["logical_processors"], []interface{}{float64(8), float64(24)}) {
+			t.Fatalf("unexpected report: %s", output.String())
+		}
+	}
+	hostCPUGroupOperations.query = func(context.Context, string) (*hcsschema.CpuGroupConfig, error) {
+		return nil, cpugroup.ErrNotFound
+	}
+	if err := app.Run([]string{"uvmboot", "cpu-group", "delete", "--id", id, "--lps", "8,24", "--priority", "1", "--if-exists"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*deleted) != 1 {
+		t.Fatal("missing group cleanup must not invoke deletion")
+	}
+}
+
+func TestOwnedCPUGroupRejectsInputsBeforeHostAccess(t *testing.T) {
+	id := "da4f09a9-dc31-4910-8793-3117a6e93a82"
+	for _, test := range []struct {
+		id       string
+		lps      []uint32
+		priority uint32
+	}{
+		{"invalid", []uint32{8, 24}, 1},
+		{"00000000-0000-0000-0000-000000000000", []uint32{8, 24}, 1},
+		{id, nil, 1},
+		{id, []uint32{8, 8}, 1},
+		{id, []uint32{1 << 31}, 1},
+		{id, []uint32{8, 24}, 8},
+	} {
+		for _, action := range []string{"create", "query", "delete"} {
+			if _, err := manageCPUGroup(context.Background(), action, test.id, test.lps, test.priority, false, cpuGroupOperations{}); err == nil {
+				t.Fatalf("accepted invalid %s input: %+v", action, test)
+			}
+		}
+	}
+}
+
+func TestOwnedCPUGroupReadbackAndRollback(t *testing.T) {
+	id := "da4f09a9-dc31-4910-8793-3117a6e93a82"
+	for _, failure := range []string{"create", "priority", "query", "nil", "affinity", "id", "negative", "count", "lps", "missing", "duplicate", "mismatch", "cleanup"} {
+		for _, action := range []string{"create", "query", "delete"} {
+			t.Run(action+"/"+failure, func(t *testing.T) {
+				ops, _, deleted := fakeCPUGroupOperations()
+				if action != "create" {
+					if err := ops.create(context.Background(), id, []uint32{8, 24}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch failure {
+				case "create":
+					if action != "create" {
+						return
+					}
+					ops.create = func(context.Context, string, []uint32) error { return errors.New("create failure") }
+				case "priority", "cleanup":
+					if action != "create" {
+						return
+					}
+					ops.setPriority = func(context.Context, string, uint32) error { return errors.New("priority failure") }
+					if failure == "cleanup" {
+						deleteGroup := ops.delete
+						ops.delete = func(ctx context.Context, id string) error {
+							_ = deleteGroup(ctx, id)
+							return errors.New("cleanup failure")
+						}
+					}
+				default:
+					query := ops.query
+					ops.query = func(ctx context.Context, id string) (*hcsschema.CpuGroupConfig, error) {
+						config, _ := query(ctx, id)
+						switch failure {
+						case "query":
+							return nil, errors.New("query failure")
+						case "nil":
+							return nil, nil
+						case "affinity":
+							config.Affinity = nil
+						case "id":
+							config.GroupId = "foreign"
+						case "negative":
+							config.Affinity.LogicalProcessors[0] = -1
+						case "count":
+							config.Affinity.LogicalProcessorCount++
+						case "lps":
+							config.Affinity.LogicalProcessors[0]++
+						case "missing":
+							config.GroupProperties = nil
+						case "duplicate":
+							config.GroupProperties = append(config.GroupProperties, config.GroupProperties[0])
+						case "mismatch":
+							config.GroupProperties[0].PropertyValue = 7
+						}
+						return config, nil
+					}
+				}
+				_, err := manageCPUGroup(context.Background(), action, id, []uint32{24, 8}, 1, false, ops)
+				if err == nil {
+					t.Fatal("accepted failed/mismatched readback")
+				}
+				expectedDeletes := 0
+				if action == "create" && failure != "create" {
+					expectedDeletes = 1
+				}
+				if len(*deleted) != expectedDeletes {
+					t.Fatalf("deleted unknown group or failed rollback: %v", *deleted)
+				}
+				if failure == "cleanup" && !strings.Contains(err.Error(), "cleanup failure") {
+					t.Fatalf("lost cleanup failure: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestOwnedCPUGroupDeleteIfExistsOnlyIgnoresTypedMissingQuery(t *testing.T) {
+	id := "da4f09a9-dc31-4910-8793-3117a6e93a82"
+	for _, missing := range []bool{false, true} {
+		for _, ifExists := range []bool{false, true} {
+			ops, _, deleted := fakeCPUGroupOperations()
+			ops.query = func(context.Context, string) (*hcsschema.CpuGroupConfig, error) {
+				if missing {
+					return nil, fmt.Errorf("host query: %w", cpugroup.ErrNotFound)
+				}
+				return nil, errors.New("no cpugroup exists with id " + id)
+			}
+			_, err := manageCPUGroup(context.Background(), "delete", id, []uint32{8, 24}, 1, ifExists, ops)
+			if (err == nil) != (missing && ifExists) || len(*deleted) != 0 {
+				t.Fatalf("unsafe missing-group cleanup: missing=%v ifExists=%v error=%v deletes=%v", missing, ifExists, err, *deleted)
+			}
+		}
+	}
+}
 
 func fakeCPUGroupOperations() (cpuGroupOperations, map[string][]uint32, *[]string) {
 	groups := map[string][]uint32{}

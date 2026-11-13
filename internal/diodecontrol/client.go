@@ -1,6 +1,7 @@
 package diodecontrol
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -33,6 +34,7 @@ func (e *StatusError) Error() string {
 }
 
 type pendingCall struct {
+	service   uint16
 	operation uint16
 	reply     chan Frame
 }
@@ -118,7 +120,7 @@ func (c *Client) receive() {
 		c.mu.Lock()
 		call, ok := c.pending[frame.Header.Request]
 		valid := ok && frame.Header.Flags == Response &&
-			frame.Header.Service == Storage && frame.Header.Operation == call.operation
+			frame.Header.Service == call.service && frame.Header.Operation == call.operation
 		if valid && c.session == 0 && call.operation == Capabilities {
 			c.session = frame.Header.Session
 		}
@@ -150,6 +152,10 @@ func acquire(ctx context.Context, gate chan struct{}, done <-chan struct{}) erro
 }
 
 func (c *Client) request(ctx context.Context, operation uint16, body []byte) (Frame, error) {
+	return c.requestService(ctx, Storage, operation, body)
+}
+
+func (c *Client) requestService(ctx context.Context, service, operation uint16, body []byte) (Frame, error) {
 	if err := acquire(ctx, c.send, c.done); err != nil {
 		return Frame{}, err
 	}
@@ -166,11 +172,11 @@ func (c *Client) request(ctx context.Context, operation uint16, body []byte) (Fr
 	}
 	c.next++
 	id, session := c.next, c.session
-	call := pendingCall{operation: operation, reply: make(chan Frame, 1)}
+	call := pendingCall{service: service, operation: operation, reply: make(chan Frame, 1)}
 	c.pending[id] = call
 	c.mu.Unlock()
 	data, err := (Frame{Header: Header{
-		Service: Storage, Operation: operation, Length: uint32(HeaderSize + len(body)),
+		Service: service, Operation: operation, Length: uint32(HeaderSize + len(body)),
 		Request: id, Session: session,
 	}, Body: body}).MarshalBinary()
 	if err == nil {
@@ -214,6 +220,33 @@ func (c *Client) request(ctx context.Context, operation uint16, body []byte) (Fr
 	case <-c.done:
 		return Frame{}, c.Err()
 	}
+}
+
+// PublishTCPPorts publishes an immutable, bounded allowlist on the owned uplink.
+// The diode forwards packets and preserves ports; TCP still terminates in Linux.
+func (c *Client) PublishTCPPorts(ctx context.Context, ports []uint16) error {
+	if err := ValidatePublishedTCPPorts(ports); err != nil {
+		return err
+	}
+	body := make([]byte, 4+2*len(ports))
+	binary.LittleEndian.PutUint16(body, uint16(len(ports)))
+	for i, port := range ports {
+		binary.LittleEndian.PutUint16(body[4+2*i:], port)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := acquire(ctx, c.operations, c.done); err != nil {
+		return err
+	}
+	defer func() { <-c.operations }()
+	reply, err := c.requestService(ctx, Network, PublishTCP, body)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(reply.Body, body) {
+		return errors.New("diode TCP publication readback mismatch")
+	}
+	return nil
 }
 
 func (c *Client) query(ctx context.Context) ([]Export, error) {

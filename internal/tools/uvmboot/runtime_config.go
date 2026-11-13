@@ -13,6 +13,7 @@ import (
 
 	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/internal/hns"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/pelletier/go-toml"
 	"github.com/urfave/cli"
 )
@@ -28,6 +29,7 @@ var siblingRuntimeConfigCommand = cli.Command{
 		cli.StringFlag{Name: "root", Usage: "Owned runtime state directory"},
 		cli.StringFlag{Name: "image-cache-root", Usage: "Persistent owned image store; runtime state remains per session"},
 		cli.StringFlag{Name: "runtime-directory", Usage: "Directory containing the matching runhcs shim"},
+		cli.BoolFlag{Name: "benchmark-client", Usage: "Add an ordinary LCOW client handler on the validated diode uplink"},
 	},
 	Action: func(c *cli.Context) error {
 		for _, name := range []string{"source", "output", "root", "runtime-directory"} {
@@ -50,6 +52,15 @@ var siblingRuntimeConfigCommand = cli.Command{
 		if err != nil {
 			return fmt.Errorf("prepare owned CNI configuration: %w", err)
 		}
+		if c.Bool("benchmark-client") {
+			if _, err := sibling.EnsureUplinkNetwork(); err != nil {
+				return fmt.Errorf("ensure benchmark client uplink: %w", err)
+			}
+			config, err = benchmarkClientRuntimeConfig(config, c.String("root"), hns.GetHNSNetworkByName)
+			if err != nil {
+				return fmt.Errorf("prepare benchmark client runtime: %w", err)
+			}
+		}
 		file, err := os.OpenFile(c.String("output"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		if err != nil {
 			return err
@@ -58,6 +69,77 @@ var siblingRuntimeConfigCommand = cli.Command{
 		closeErr := file.Close()
 		return errors.Join(writeErr, closeErr)
 	},
+}
+
+func benchmarkClientRuntimeConfig(data []byte, root string, lookup func(string) (*hns.HNSNetwork, error)) ([]byte, error) {
+	config, err := toml.LoadBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	var selected []string
+	for _, plugin := range []string{"io.containerd.cri.v1.runtime", "io.containerd.grpc.v1.cri"} {
+		path := []string{"plugins", plugin, "containerd", "runtimes", "runhcs-sibling"}
+		if _, ok := config.GetPath(path).(*toml.Tree); ok {
+			if selected != nil {
+				return nil, errors.New("ambiguous owned sibling runtime")
+			}
+			selected = path
+		}
+	}
+	if selected == nil || !filepath.IsAbs(root) {
+		return nil, errors.New("benchmark client requires an owned sibling runtime and absolute root")
+	}
+	network, err := lookup(sibling.UplinkNetworkName)
+	if err != nil {
+		return nil, err
+	}
+	if network == nil || !strings.EqualFold(network.Type, "nat") || len(network.Subnets) != 1 ||
+		network.Subnets[0].AddressPrefix != sibling.UplinkSubnet || network.Subnets[0].GatewayAddress != sibling.UplinkGateway {
+		return nil, errors.New("benchmark client diode-uplink subnet or gateway mismatch")
+	}
+	content, err := ownedNATGateway([]byte(`{"cniVersion":"0.2.0","name":"diode-uplink","type":"nat"}`),
+		func(string) (*hns.HNSNetwork, error) { return network, nil })
+	if err != nil {
+		return nil, err
+	}
+	runtime, err := toml.TreeFromMap(config.GetPath(selected).(*toml.Tree).ToMap())
+	if err != nil {
+		return nil, err
+	}
+	directory := filepath.Join(root, "benchmark-client-cni")
+	runtime.Set("cni_conf_dir", directory)
+	// Older containerd uses only the daemon-wide CNI directory. This daemon is
+	// owned by this campaign, so select the uplink there as well.
+	config.SetPath([]string{"plugins", selected[1], "cni", "conf_dir"}, directory)
+	target := append(append([]string(nil), selected[:len(selected)-1]...), "runhcs-benchmark-client")
+	config.SetPath(target, runtime)
+	if images, ok := config.GetPath([]string{"plugins", "io.containerd.cri.v1.images"}).(*toml.Tree); ok {
+		platform, ok := images.GetPath([]string{"runtime_platforms", "runhcs-sibling"}).(*toml.Tree)
+		if !ok {
+			return nil, errors.New("owned sibling image platform is missing")
+		}
+		copy, err := toml.TreeFromMap(platform.ToMap())
+		if err != nil {
+			return nil, err
+		}
+		images.SetPath([]string{"runtime_platforms", "runhcs-benchmark-client"}, copy)
+	}
+	output, err := config.ToTomlString()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Mkdir(directory, 0700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(directory, "0-benchmark-client.conf"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	_, writeErr := file.Write(content)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		return nil, err
+	}
+	return []byte(output), nil
 }
 
 func isolatedRuntimeCNI(data []byte, root string, lookup func(string) (*hns.HNSNetwork, error)) ([]byte, error) {
