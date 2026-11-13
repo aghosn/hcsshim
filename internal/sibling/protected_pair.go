@@ -534,7 +534,7 @@ func (p *protectedPair) stage(ctx context.Context, v *protectedVMAttempt) error 
 
 // startService retains the concrete process before creation, then owns its sole
 // joined Wait. ctx bounds creation, not the process lifetime. Dependencies use
-// trapped TERM only after workload exit, with signal borrowers joined before Wait.
+// trapped TERM only after storage cleanup, with signal borrowers joined before Wait.
 // A premature exit cancels forward work, not the still-needed root/relay.
 func (p *protectedPair) startService(ctx context.Context, v *protectedVMAttempt, script string, dependency bool) error {
 	lifetime := p.ctx
@@ -771,8 +771,9 @@ func PrepareProtectedShutdown() error {
 }
 
 // close is the single protected cleanup decision; it is never retried. Tasks
-// drain before workload termination. Relay, exports and root drain with
-// diode GCS alive; both actual VM exits precede native teardown/reclaim/release.
+// drain before workload termination. Exports and root drain with diode GCS alive;
+// returned cleanup errors do not prevent termination of known participants.
+// Both actual VM exits and command/control joins precede native backing release.
 // Any uncertainty retains this owner in protectedOwners without a receipt.
 func (p *protectedPair) close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
@@ -796,45 +797,62 @@ func (p *protectedPair) close() error {
 	p.forwardMu.Unlock()
 	p.stopWatch()
 	p.watchers.Wait()
-	result = errors.Join(result, p.joinServices(ctx, false))
-	if result != nil {
-		return result
-	}
 
 	// Workload termination can naturally close the relay before we signal it.
 	// Mark that EOF expected without canceling its still-needed dependencies.
 	p.forwardMu.Lock()
 	p.dependenciesClosing = true
 	p.forwardMu.Unlock()
-	if err := terminateProtectedVM(ctx, &p.workload); err != nil {
-		return err
+	// A returned cleanup operation may have exhausted the shared budget.
+	// Still allow one bounded terminal attempt, never replay or detach it.
+	if ctx.Err() != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), protectedCleanupBudget)
+		defer cancel()
+	}
+	workloadErr := terminateProtectedVM(ctx, &p.workload)
+	result = errors.Join(result, workloadErr)
+	if workloadErr == nil {
+		if p.backend != nil {
+			result = errors.Join(result, p.workload.vm.SCSIManager.CloseProtectedSibling(ctx))
+		}
+		if p.rootAttempt && p.root == nil {
+			result = errors.Join(result, errors.New("protected root attachment is unobservable; retain backing"))
+		}
+		if p.root != nil {
+			// A failed bootstrap may leave the dependency shell still starting
+			// the provider. Its existing ready file proves insmod has returned;
+			// otherwise leave the disk attached until native diode termination.
+			script := `if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; [ ! -d /sys/module/diode_storvsp ]`
+			for _, service := range p.services {
+				if service.dependency && service.attempted {
+					script = `test -f /run/sibling-exec/gcs-relay.ready; ` + script
+					break
+				}
+			}
+			// Keep direct diode GCS through provider quiescence and the actual
+			// RP release. A failed quiescence never authorizes disk detachment.
+			if _, err := p.guest(ctx, &p.diode, script); err != nil {
+				result = errors.Join(result, err)
+			} else {
+				result = errors.Join(result, p.root.Release(ctx))
+			}
+		}
 	}
 	p.stopDependencyServices(ctx)
-	if err := p.joinServices(ctx, true); err != nil {
-		return err
+	// A failed provider/storage operation or TERM must not leave the diode
+	// running merely because it consumed the preceding cleanup allowance.
+	if ctx.Err() != nil {
+		ctx, cancel = context.WithTimeout(context.Background(), protectedCleanupBudget)
+		defer cancel()
 	}
+	result = errors.Join(result, terminateProtectedVM(ctx, &p.diode))
 	p.stopDependencies()
-	if p.backend != nil {
-		if err := p.workload.vm.SCSIManager.CloseProtectedSibling(ctx); err != nil {
-			return err
-		}
-	}
-	if p.rootAttempt && p.root == nil {
-		return errors.New("protected root attachment is unobservable; retain diode and backing")
-	}
-	if p.root != nil {
-		// Unload the provider while direct diode GCS still exists, then release
-		// the actual RP attachment. Never clear a record to simulate withdrawal.
-		if _, err := p.guest(ctx, &p.diode,
-			`if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; [ ! -d /sys/module/diode_storvsp ]`); err != nil {
-			return err
-		}
-		if err := p.root.Release(ctx); err != nil {
-			return err
-		}
-	}
-	if err := terminateProtectedVM(ctx, &p.diode); err != nil {
-		return err
+	// External UVM process signals need not succeed for the VM to terminate.
+	// terminateProtectedVM closes GCS after exit, releasing waits and callbacks;
+	// join those users before retiring VM handles or the shared log.
+	result = errors.Join(result, p.joinServices(ctx))
+	if result != nil {
+		return result
 	}
 	if p.backing != nil {
 		if err := p.backing.BeginTeardown(ctx); err != nil {
@@ -899,8 +917,10 @@ func (p *protectedPair) close() error {
 	return nil
 }
 
-// terminateProtectedVM requires observed native exit, not output completion,
-// handle closure, a cached receipt, or terminate submission alone.
+// terminateProtectedVM observes native exit before closing the existing GCS
+// connection to release outstanding RPC waits. Terminate/connection errors are
+// diagnostic after confirmed exit; neither submission nor handle closure proves
+// exit. Unobservable creation or failed exit observation still denies release.
 func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
 	if v.vm == nil {
 		if v.createAttempt {
@@ -912,7 +932,19 @@ func terminateProtectedVM(ctx context.Context, v *protectedVMAttempt) error {
 	if hcsv2.IsAlreadyStopped(err) {
 		err = nil
 	}
-	return errors.Join(err, v.vm.WaitNativeExit(ctx))
+	if waitErr := v.vm.WaitNativeExit(ctx); waitErr != nil {
+		return errors.Join(err, fmt.Errorf("protected VM %s native exit unobserved: %w", v.options.ID, waitErr))
+	}
+	if err != nil {
+		log.G(ctx).WithField("vm", v.options.ID).WithError(err).Warn("protected VM exited after terminate error")
+	}
+	// UtilityVM's background waiter closes exitCh, not the external GCS
+	// bridge. Close it here so service Wait does not need a process-exit RPC
+	// from a guest that has already terminated. No VM handles are closed yet.
+	if err := v.vm.CloseGCSConnection(); err != nil {
+		log.G(ctx).WithField("vm", v.options.ID).WithError(err).Warn("protected VM exited with GCS close error")
+	}
+	return nil
 }
 
 // stopDependencyServices requests a trapped TERM, never cancellation's SIGKILL.
@@ -941,21 +973,21 @@ func (p *protectedPair) stopDependencyServices(ctx context.Context) {
 	}
 }
 
-// joinServices settles one service class without canceling later dependencies.
-func (p *protectedPair) joinServices(ctx context.Context, dependency bool) error {
-	var result error
+// joinServices joins actual command/control users after participant termination
+// attempts. Completed process/signal errors are diagnostics, not VM-exit evidence;
+// an unfinished callback still retains its owners and prevents backing release.
+func (p *protectedPair) joinServices(ctx context.Context) error {
 	for _, service := range p.services {
-		if service.dependency != dependency {
-			continue
-		}
 		select {
 		case <-service.done:
-			result = errors.Join(result, service.err)
+			if service.err != nil {
+				service.command.Log.WithError(service.err).Warn("protected service cleanup completed with diagnostic errors")
+			}
 		case <-ctx.Done():
-			return errors.Join(result, fmt.Errorf("protected service has not drained: %w", ctx.Err()))
+			return fmt.Errorf("protected service has not drained: %w", ctx.Err())
 		}
 	}
-	return result
+	return nil
 }
 
 // publishReceipt atomically links a complete, flushed file to a fresh final
