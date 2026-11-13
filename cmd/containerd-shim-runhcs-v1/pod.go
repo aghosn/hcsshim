@@ -480,13 +480,11 @@ func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all 
 	if all && eid != "" {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "cannot signal all with non empty ExecID: '%s'", eid)
 	}
-	if all && tid == p.id && p.pair != nil && p.pair.IsProtected() && (signal == 9 || signal == 15) {
-		// Native pair shutdown stops every guest process; competing GCS kills
-		// can only race the bridge closure and falsely fail sandbox stop.
-		return t.KillExec(ctx, eid, signal, all)
-	}
 	eg := errgroup.Group{}
 	if all && tid == p.id {
+		if p.pair != nil && p.pair.IsProtected() && (signal == 9 || signal == 15) {
+			p.pair.Stop()
+		}
 		// We are in a kill all on the sandbox task. Signal everything.
 		p.workloadTasks.Range(func(key, value interface{}) bool {
 			wt := value.(shimTask)
