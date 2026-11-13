@@ -380,9 +380,10 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 }
 
 // CloseAfterNativeExit verifies native exit before releasing VM resources,
-// without joining output forwarding. Callers must first drain guest/control
-// borrowers and release any protected backing. Started log handlers retain
-// their local references and connections until they finish independently.
+// without joining output forwarding. Callers must first settle Start's ordinary
+// resource publication as well as native Create/Start/control work and release
+// any protected backing. Waiting for publication is a VM-handle lifetime rule,
+// not a protected backing release prerequisite.
 func (uvm *UtilityVM) CloseAfterNativeExit(ctx context.Context) error {
 	if err := uvm.WaitNativeExit(ctx); err != nil {
 		return err

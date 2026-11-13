@@ -5,6 +5,7 @@ package uvm
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -74,6 +75,21 @@ func (uvm *UtilityVM) StartWithGCSConnectionTimeout(ctx context.Context, connect
 	return uvm.start(ctx, connectionTimeout)
 }
 
+// StartWithNativeStartCompletion invokes nativeComplete synchronously after HCS
+// Start returns, before waiting for entropy/output connections or GCS bootstrap.
+// The callback may observe native receipts and return an error to abort bootstrap;
+// it cannot mask a native Start error. VM resources must remain open until this
+// method returns, even if protected backing is released after the callback.
+func (uvm *UtilityVM) StartWithNativeStartCompletion(ctx context.Context, connectionTimeout time.Duration, nativeComplete func(context.Context, error) error) error {
+	if connectionTimeout <= 0 {
+		return fmt.Errorf("GCS connection timeout must be positive: %s", connectionTimeout)
+	}
+	if nativeComplete == nil {
+		return fmt.Errorf("native Start completion callback is required")
+	}
+	return uvm.startWithNativeStartCompletion(ctx, connectionTimeout, nativeComplete)
+}
+
 // gcsBootstrapContext bounds Start's native/GCS bootstrap without detaching it
 // from its parent. Termination continues to use the original parent context.
 func gcsBootstrapContext(parent context.Context, connectionTimeout time.Duration) (context.Context, context.CancelFunc) {
@@ -83,6 +99,10 @@ func gcsBootstrapContext(parent context.Context, connectionTimeout time.Duration
 // start is the shared production core for Start and its per-call timeout entry.
 // Both paths retain identical entropy, output, termination and borrower joins.
 func (uvm *UtilityVM) start(ctx context.Context, connectionTimeout time.Duration) (err error) {
+	return uvm.startWithNativeStartCompletion(ctx, connectionTimeout, nil)
+}
+
+func (uvm *UtilityVM) startWithNativeStartCompletion(ctx context.Context, connectionTimeout time.Duration, nativeComplete func(context.Context, error) error) (err error) {
 	uvm.startInvoked.Store(true)
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
@@ -180,17 +200,22 @@ func (uvm *UtilityVM) start(ctx context.Context, connectionTimeout time.Duration
 	}
 
 	err = uvm.hcsSystem.Start(ctx)
+	if err == nil {
+		defer func() {
+			if err != nil {
+				// Use the parent so the connection budget cannot shorten the
+				// termination operation's own timeout.
+				_ = uvm.hcsSystem.Terminate(pCtx)
+				_ = uvm.hcsSystem.WaitCtx(pCtx)
+			}
+		}()
+	}
+	if nativeComplete != nil {
+		err = errors.Join(err, nativeComplete(ctx, err))
+	}
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			// Use the parent so the connection budget cannot shorten the
-			// termination operation's own timeout.
-			_ = uvm.hcsSystem.Terminate(pCtx)
-			_ = uvm.hcsSystem.WaitCtx(pCtx)
-		}
-	}()
 
 	// Start waiting on the utility VM.
 	go func() {

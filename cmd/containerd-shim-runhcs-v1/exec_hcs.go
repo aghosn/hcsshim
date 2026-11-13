@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	stderrors "errors"
 	"sync"
 	"time"
 
@@ -21,7 +20,6 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
-	"github.com/Microsoft/hcsshim/internal/gcs"
 	hcs "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/ot"
@@ -34,8 +32,7 @@ import (
 // newHcsExec creates an exec to track the lifetime of `spec` in `c` which is
 // actually created on the call to `Start()`. If `id==tid` then this is the init
 // exec and the exec will also start `c` on the call to `Start()` before execing
-// the process `spec.Process`. Protected completion joins process control and
-// container-exit callbacks, not unrelated upstream output or logger completion.
+// the process `spec.Process`.
 func newHcsExec(
 	ctx context.Context,
 	events publisher,
@@ -45,7 +42,7 @@ func newHcsExec(
 	id, bundle string,
 	isWCOW bool,
 	spec *specs.Process,
-	io cmd.UpstreamIO, protected ...bool) shimExec {
+	io cmd.UpstreamIO) shimExec {
 	log.G(ctx).WithFields(logrus.Fields{
 		"tid":    tid,
 		"eid":    id, // Init exec ID is always same as Task ID
@@ -54,22 +51,19 @@ func newHcsExec(
 	}).Trace("newHcsExec")
 
 	he := &hcsExec{
-		events:        events,
-		tid:           tid,
-		host:          host,
-		c:             c,
-		id:            id,
-		bundle:        bundle,
-		isWCOW:        isWCOW,
-		spec:          spec,
-		io:            io,
-		processDone:   make(chan struct{}),
-		state:         shimExecStateCreated,
-		exitStatus:    255, // By design for non-exited process status.
-		exited:        make(chan struct{}),
-		protected:     len(protected) != 0 && protected[0],
-		containerDone: make(chan struct{}),
-		startDone:     make(chan struct{}),
+		events:      events,
+		tid:         tid,
+		host:        host,
+		c:           c,
+		id:          id,
+		bundle:      bundle,
+		isWCOW:      isWCOW,
+		spec:        spec,
+		io:          io,
+		processDone: make(chan struct{}),
+		state:       shimExecStateCreated,
+		exitStatus:  255, // By design for non-exited process status.
+		exited:      make(chan struct{}),
 	}
 	go he.waitForContainerExit()
 	return he
@@ -131,14 +125,8 @@ type hcsExec struct {
 	p          *cmd.Cmd
 
 	// exited is a wait block which waits async for the process to exit.
-	exited        chan struct{}
-	exitedOnce    sync.Once
-	protected     bool
-	starting      bool // Guarded by sl; Start releases sl across native work.
-	startDone     chan struct{}
-	containerDone chan struct{}
-	operations    sync.WaitGroup // Add under sl, join after exited state publication.
-	cleanupErr    error          // Published by exited after native completion and control joins.
+	exited     chan struct{}
+	exitedOnce sync.Once
 }
 
 func (he *hcsExec) ID() string {
@@ -188,38 +176,13 @@ func (he *hcsExec) Status() *task.StateResponse {
 
 func (he *hcsExec) startInternal(ctx context.Context, initializeContainer bool) (err error) {
 	he.sl.Lock()
-	if he.state != shimExecStateCreated || he.starting {
-		state := he.state
-		he.sl.Unlock()
-		return newExecInvalidStateError(he.tid, he.id, state, "start")
+	defer he.sl.Unlock()
+	if he.state != shimExecStateCreated {
+		return newExecInvalidStateError(he.tid, he.id, he.state, "start")
 	}
-	if he.protected {
-		he.starting = true
-		he.sl.Unlock()
-	}
-	// Protected Start cannot hold the state lock over guest creation or event
-	// publication. ForceExit joins startDone rather than missing a partial start.
 	defer func() {
-		if he.protected && err != nil && he.p != nil {
-			_, killErr := he.p.Process.Kill(context.Background())
-			he.cleanupErr = stderrors.Join(he.cleanupErr, killErr)
-		}
-		if he.protected {
-			he.sl.Lock()
-		}
-		if he.protected {
-			he.starting = false
-			close(he.startDone)
-		}
-		if err != nil && (!he.protected || he.p == nil) {
-			if he.protected {
-				he.cleanupErr = stderrors.Join(he.cleanupErr, err)
-			}
+		if err != nil {
 			he.exitFromCreatedL(ctx, 1)
-		}
-		he.sl.Unlock()
-		if he.protected && he.p != nil {
-			go he.waitForExit()
 		}
 	}()
 	if initializeContainer {
@@ -228,7 +191,7 @@ func (he *hcsExec) startInternal(ctx context.Context, initializeContainer bool) 
 			return err
 		}
 		defer func() {
-			if err != nil && !he.protected {
+			if err != nil {
 				_ = he.c.Terminate(ctx)
 				he.c.Close()
 			}
@@ -243,8 +206,7 @@ func (he *hcsExec) startInternal(ctx context.Context, initializeContainer bool) 
 			"tid": he.tid,
 			"eid": he.id,
 		}),
-		CopyAfterExitTimeout:     time.Second * 1,
-		JoinBackgroundOperations: he.protected,
+		CopyAfterExitTimeout: time.Second * 1,
 	}
 	if he.isWCOW || he.id != he.tid {
 		// An init exec passes the process as part of the config. We only pass
@@ -255,17 +217,11 @@ func (he *hcsExec) startInternal(ctx context.Context, initializeContainer bool) 
 	if err != nil {
 		return err
 	}
-	if he.protected {
-		he.sl.Lock()
-	}
 	he.p = cmd
 
 	// Assign the PID and transition the state.
 	he.pid = he.p.Process.Pid()
 	he.state = shimExecStateRunning
-	if he.protected {
-		he.sl.Unlock()
-	}
 
 	// Publish the task/exec start event. This MUST happen before waitForExit to
 	// avoid publishing the exit previous to the start.
@@ -293,9 +249,7 @@ func (he *hcsExec) startInternal(ctx context.Context, initializeContainer bool) 
 	}
 
 	// wait in the background for the exit.
-	if !he.protected {
-		go he.waitForExit()
-	}
+	go he.waitForExit()
 	return nil
 }
 
@@ -305,23 +259,9 @@ func (he *hcsExec) Start(ctx context.Context) (err error) {
 	return he.startInternal(ctx, he.id == he.tid)
 }
 
-func (he *hcsExec) Kill(ctx context.Context, signal uint32) (result error) {
+func (he *hcsExec) Kill(ctx context.Context, signal uint32) error {
 	he.sl.Lock()
-	locked := true
-	// The ordinary lock contract stays unchanged; protected native operations
-	// hold a count, not the state lock, until the command waiter can close it.
-	defer func() {
-		if locked {
-			he.sl.Unlock()
-		}
-	}()
-	if he.protected && he.starting {
-		done := he.startDone
-		he.sl.Unlock()
-		locked = false
-		<-done
-		return he.Kill(ctx, signal)
-	}
+	defer he.sl.Unlock()
 	switch he.state {
 	case shimExecStateCreated:
 		he.exitFromCreatedL(ctx, 1)
@@ -350,20 +290,6 @@ func (he *hcsExec) Kill(ctx context.Context, signal uint32) (result error) {
 			return errors.Wrapf(errdefs.ErrFailedPrecondition, "signal %d: %v", signal, err)
 		}
 		var delivered bool
-		if he.protected {
-			he.operations.Add(1)
-			he.sl.Unlock()
-			locked = false
-			// Publish operation errors before releasing the process-close fence.
-			defer func() {
-				if result != nil && !stderrors.Is(result, errdefs.ErrNotFound) {
-					he.sl.Lock()
-					he.cleanupErr = stderrors.Join(he.cleanupErr, result)
-					he.sl.Unlock()
-				}
-				he.operations.Done()
-			}()
-		}
 		if supported && options != nil {
 			if he.isWCOW {
 				// Servercore images block on signaling and wait until the target process
@@ -417,22 +343,14 @@ func (he *hcsExec) Kill(ctx context.Context, signal uint32) (result error) {
 
 func (he *hcsExec) ResizePty(ctx context.Context, width, height uint32) error {
 	he.sl.Lock()
+	defer he.sl.Unlock()
 	if !he.io.Terminal() {
-		he.sl.Unlock()
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "exec: '%s' in task: '%s' is not a tty", he.id, he.tid)
 	}
 
 	if he.state == shimExecStateRunning {
-		if he.protected {
-			he.operations.Add(1)
-			he.sl.Unlock()
-			defer he.operations.Done()
-			return he.p.Process.ResizeConsole(ctx, uint16(width), uint16(height))
-		}
-		defer he.sl.Unlock()
 		return he.p.Process.ResizeConsole(ctx, uint16(width), uint16(height))
 	}
-	he.sl.Unlock()
 	return nil
 }
 
@@ -451,10 +369,6 @@ func (he *hcsExec) Wait() *task.StateResponse {
 }
 
 func (he *hcsExec) ForceExit(ctx context.Context, status int) {
-	if he.protected {
-		_ = he.Kill(ctx, 9)
-		return
-	}
 	he.sl.Lock()
 	defer he.sl.Unlock()
 	if he.state != shimExecStateExited {
@@ -500,12 +414,8 @@ func (he *hcsExec) exitFromCreatedL(ctx context.Context, status int) {
 		he.state = shimExecStateExited
 		he.exitStatus = uint32(status)
 		he.exitedAt = time.Now()
-		// Upstream cleanup can wait for an external logger, not a VM borrower.
-		if he.protected {
-			go he.io.Close(ctx)
-		} else {
-			he.io.Close(ctx)
-		}
+		// Release all upstream IO connections (if any)
+		he.io.Close(ctx)
 		// Free any waiters
 		he.exitedOnce.Do(func() {
 			close(he.exited)
@@ -530,8 +440,7 @@ func (he *hcsExec) exitFromCreatedL(ctx context.Context, status int) {
 // 3. Capture the process exit code and set `he.state`, `he.exitStatus` and
 // `he.exitedAt` to the exited values.
 //
-// 4. Join process control callbacks. Ordinary execs also finish upstream IO here;
-// protected execs leave output forwarding outside their native completion.
+// 4. Wait for all IO to complete and release any upstream IO connections.
 //
 // 5. Send the async `TaskExit` to upstream listeners of any events.
 //
@@ -547,7 +456,6 @@ func (he *hcsExec) waitForExit() {
 		attribute.String("eid", he.id))
 
 	err = he.p.Process.Wait()
-	waitErr := err
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed process Wait")
 	}
@@ -557,7 +465,6 @@ func (he *hcsExec) waitForExit() {
 	he.processDoneOnce.Do(func() { close(he.processDone) })
 
 	code, err := he.p.Process.ExitCode()
-	exitErr := err
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to get ExitCode")
 	} else {
@@ -570,19 +477,9 @@ func (he *hcsExec) waitForExit() {
 	he.exitedAt = time.Now()
 	he.sl.Unlock()
 
-	if he.protected {
-		he.operations.Wait()
-		<-he.containerDone
-		if _, ok := he.p.Process.(*gcs.Process); !ok {
-			exitErr = stderrors.Join(exitErr, errors.New("protected completion requires a GCS process"))
-		}
-		he.sl.Lock()
-		he.cleanupErr = stderrors.Join(he.cleanupErr, waitErr, exitErr)
-		he.sl.Unlock()
-	} else {
-		_ = he.p.Wait()
-		he.io.Close(ctx)
-	}
+	// Wait for all IO copies to complete and free the resources.
+	_ = he.p.Wait()
+	he.io.Close(ctx)
 
 	// Only send the `runtime.TaskExitEventTopic` notification if this is a true
 	// exec. For the `init` exec this is handled in task teardown.
@@ -606,14 +503,6 @@ func (he *hcsExec) waitForExit() {
 	he.exitedOnce.Do(func() {
 		close(he.exited)
 	})
-	if he.protected {
-		// For validated GCS processes with no Cmd cancellation callback,
-		// remaining Cmd work only forwards/closes local streams. An unexpected
-		// process type retains its owners through cleanupErr instead.
-		// Keep normal delivery/Close ordering, but not as a reclaim obligation.
-		_ = he.p.Wait()
-		he.io.Close(ctx)
-	}
 }
 
 // waitForContainerExit waits for `he.c` to exit. Depending on the exec's state
@@ -622,9 +511,6 @@ func (he *hcsExec) waitForExit() {
 //
 // This MUST be called via a goroutine at exec create.
 func (he *hcsExec) waitForContainerExit() {
-	if he.protected {
-		defer close(he.containerDone)
-	}
 	ctx, span := ot.StartSpan(context.Background(), "hcsExec::waitForContainerExit")
 	defer span.End()
 	span.SetAttributes(
@@ -634,10 +520,6 @@ func (he *hcsExec) waitForContainerExit() {
 	// wait for container or process to exit and ckean up resrources
 	select {
 	case <-he.c.WaitChannel():
-		if he.protected {
-			he.ForceExit(context.Background(), 1)
-			return
-		}
 		// Container exited first. We need to force the process into the exited
 		// state and cleanup any resources
 		he.sl.Lock()

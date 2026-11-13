@@ -153,7 +153,8 @@ func validateConfigMasks(raw []byte) error {
 }
 
 // Pair is the sole lifetime owner of two newly created UVMs and their shared
-// section. Workload tasks borrow Workload; only the sandbox closes the Pair.
+// section. The sandbox owns Pair closure; protected participant/service loss
+// also requests native shutdown independently of workload task cleanup.
 type Pair struct {
 	Workload        *uvm.UtilityVM
 	Diode           *uvm.UtilityVM
@@ -536,9 +537,9 @@ func workloadNICCommandForMAC(mac string) string {
 		`[ "$count" -eq 1 ]; do sleep 0.1; done; printf '%s\n' "$dev"`
 }
 
-// Close makes one cleanup decision. Protected callers first settle the sandbox's
-// own task obligation; other admitted tasks are joined before any VM is retired.
-// An error is sticky and must not be interpreted as backing release or retried.
+// Close makes one cleanup decision. Protected native dispatch is serialized with
+// termination and reclaim, independently of child-task or guest IO completion.
+// Native incompleteness and released-with-publication-failure are cached, never replayed.
 func (p *Pair) Close() error {
 	return p.close(nil)
 }

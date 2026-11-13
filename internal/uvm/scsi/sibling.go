@@ -23,18 +23,14 @@ type siblingAttachment struct {
 	mount     *Mount
 	token     uint64
 	withdrawn bool
-	uncertain error
 }
 
 type siblingHostBackend struct {
-	diode     *Manager
-	diodeID   string
-	control   SiblingExportControl
-	mu        sync.Mutex
-	disks     map[uint]*siblingAttachment
-	protected bool // Immutable after pre-task EnableProtectedSibling.
-	// The existing attach manager serializes each LUN's removal. Final
-	// protected drainage runs only after the full manager-operation fence.
+	diode   *Manager
+	diodeID string
+	control SiblingExportControl
+	mu      sync.Mutex
+	disks   map[uint]*siblingAttachment
 }
 
 // NewSiblingHostBackend keeps RP attachments on the diode while exporting the
@@ -105,10 +101,6 @@ func (b *siblingHostBackend) attach(ctx context.Context, controller, lun uint, c
 
 	attachment.mount, err = b.diode.AddVirtualDisk(ctx, config.path, config.readOnly, b.diodeID, "", nil)
 	if err != nil {
-		if b.protected {
-			attachment.uncertain = err
-			return fmt.Errorf("diode attachment uncertain; retained: %w", err)
-		}
 		b.mu.Lock()
 		delete(b.disks, lun)
 		b.mu.Unlock()
@@ -129,13 +121,10 @@ func (b *siblingHostBackend) detach(ctx context.Context, controller, lun uint) e
 		return errors.New("invalid sibling export location")
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	attachment, exists := b.disks[lun]
-	b.mu.Unlock()
 	if !exists {
 		return fmt.Errorf("sibling LUN %d has no tracked attachment", lun)
-	}
-	if attachment.uncertain != nil || attachment.mount == nil {
-		return errors.Join(errors.New("sibling attachment ownership is unknown"), attachment.uncertain)
 	}
 	if !attachment.withdrawn {
 		if err := b.control.Remove(ctx, uint8(lun), attachment.token); err != nil {
@@ -146,16 +135,14 @@ func (b *siblingHostBackend) detach(ctx context.Context, controller, lun uint) e
 	if err := attachment.mount.Release(ctx); err != nil {
 		return fmt.Errorf("release diode backing for LUN %d: %w", lun, err)
 	}
-	b.mu.Lock()
 	delete(b.disks, lun)
-	b.mu.Unlock()
 	return nil
 }
 
 func (b *siblingHostBackend) beforeUnplug(ctx context.Context, controller, lun uint) error {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	attachment, exists := b.disks[lun]
-	b.mu.Unlock()
 	if controller != 0 || !exists {
 		return fmt.Errorf("invalid sibling unplug location %d:%d", controller, lun)
 	}
@@ -166,61 +153,4 @@ func (b *siblingHostBackend) beforeUnplug(ctx context.Context, controller, lun u
 		attachment.withdrawn = true
 	}
 	return nil
-}
-
-// protectedSiblingOperations fences complete manager operations, not just host
-// callbacks. Rollback and guest mounting stay inside the admitted operation.
-type protectedSiblingOperations struct {
-	mu         sync.Mutex
-	closing    bool
-	operations sync.WaitGroup
-}
-
-// begin rejects all work after final storage drainage begins.
-func (g *protectedSiblingOperations) begin() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.closing {
-		return errors.New("protected sibling storage is closing")
-	}
-	g.operations.Add(1)
-	return nil
-}
-
-// EnableProtectedSibling opts into retained failures and full-operation joins.
-// Call once after ConfigureSibling, before admitting any task.
-func (m *Manager) EnableProtectedSibling() error {
-	b, ok := m.attachManager.attacher.(*siblingHostBackend)
-	if !ok || m.protected != nil {
-		return errors.New("protected storage requires a fresh sibling manager")
-	}
-	b.protected = true
-	m.protected = &protectedSiblingOperations{}
-	return nil
-}
-
-// CloseProtectedSibling joins full operations and withdraws residual exports
-// using their real diode mounts. The pair first drains tasks and observes workload
-// exit; diode GCS must remain alive. Failed records are not discarded or replayed.
-func (m *Manager) CloseProtectedSibling(ctx context.Context) error {
-	if m.protected == nil {
-		return errors.New("protected sibling storage was not enabled")
-	}
-	g := m.protected
-	g.mu.Lock()
-	g.closing = true
-	g.mu.Unlock()
-	g.operations.Wait()
-	b := m.attachManager.attacher.(*siblingHostBackend)
-	b.mu.Lock()
-	luns := make([]uint, 0, len(b.disks))
-	for lun := range b.disks {
-		luns = append(luns, lun)
-	}
-	b.mu.Unlock()
-	var result error
-	for _, lun := range luns {
-		result = errors.Join(result, b.detach(ctx, 0, lun))
-	}
-	return result
 }

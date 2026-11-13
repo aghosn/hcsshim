@@ -414,26 +414,51 @@ receipt, correlates guest/service diagnostics with run/VM IDs; ordinary CRI
 logs and binary-logger support are unchanged. External logger completion is
 not a native reclaim prerequisite.
 
+Sandbox stop and participant/service loss directly request pair-native shutdown,
+without waiting for child processes, attach output or guest startup commands.
+Only backing acquisition, protected VM Create/native HCS Start and native receipt
+observation, seals and controller calls are serialized against final reclaim;
+ordinary GCS bootstrap/policy RPCs are outside that boundary. Relay-listener
+replacement is a short serialized pre-Start publication. GCS/listener/resource
+closure waits for ordinary startup publication to settle, not vice versa:
+it cannot delay native reclaim or the receipt. No per-task/exec/SCSI borrower
+graph is required. Workload then diode termination are both attempted, with
+actual native exit observation. Root/storage may remain attached until their VMs stop, as in
+ordinary cleanup; there is no mandatory driver unload, disconnect, successful
+SCSI drain, service Wait/ExitCode or guest signal prerequisite.
+
+After both known native exits, the pair attempts BeginTeardown/Reclaim despite
+ordinary guest/disk/log diagnostics. Native participant, registration and exact
+progress checks still decide reclaim, followed by the unchanged authorized zero
+verification and backing/controller release. Unknown native creation, exit or
+progress retains the owner and blocks shim shutdown. Cleanup is decided once;
+repeated deletion never replays native controls.
+
 Existing `owner.json` records protected selection, the fresh session's run ID,
 expected receipt path, dispatch and sandbox reconciliation. Protected CRI
 timeouts are `runp` 30 minutes and `stopp`/`rmp` 3 minutes; ordinary values
 remain unchanged. The shim publishes only one terminal file, atomically and
-without overwrite, after actual successful pair cleanup:
+without overwrite, after actual native backing release:
 
 ```json
 {"version":1,"run_id":"<session>","workload_vm_id":"<sandbox>@vm","diode_vm_id":"<sandbox>@vm-diode","result":"released"}
 ```
 
 It lives at `<fresh-session>\protected-cleanup-result.json`, with no mirrored
-phase/counter/history protocol. It communicates completion, not attestation
+phase/counter/history protocol. It communicates backing release, not completion
+of every ordinary cleanup action, attestation
 or independent native authority. After dispatch, the runner requires sandbox
 reconciliation **and** this exact matching result before terminating its
 verified private daemon. Lost `runp` replies may use the existing owner label;
 unknown sandbox, empty list, lost reply, daemon exit or `rmp` success alone
 cannot authorize stop. Missing/malformed/mismatched completion retains daemon,
 boot copies and diagnostics with `cleanup-incomplete` and an explicit manual
-intervention error. Receipt publication failure never replays native controls;
-reconciled removal is persisted so a later stop only checks completion.
+intervention error. VMGS/bundle/HCN housekeeping failures are warnings and do
+not suppress a released receipt or fail sandbox deletion. Housekeeping can wait
+for ordinary startup return after native release. A publication failure instead
+explicitly reports **backing released, receipt publication failed**; the backing
+owner is no longer retained and native controls are never replayed.
+Reconciled removal is persisted so a later stop only checks completion.
 Before dispatch, its own daemon may be closed normally. No forced shim kill,
 service change, crash recovery or uncertain-work replay is provided.
 Builds, regressions and H1-H3 hardware acceptance remain pending.
@@ -1036,5 +1061,5 @@ are the lookup anchors.
 | Exact masks and truthful submission evidence | hcsshim `protected_sibling.go`: `sealPartitions`, `reportSeal`; `internal/uvm/partition.go`, `internal/hcs/v2/system.go`, `internal/computecore/computecore.go` | M05/M06 |
 | Exclusive marker sharing/content/cleanup and interactive lifetime | hcsshim `protected_sibling_pause.go`; `interactive.go`: protected server and `siblingShellSession`; `internal/cmd/cmd.go` opt-in joining | M05/M07 |
 | Prefix accounting/authorized reclaim/no ordinary close | Standalone `internal/tools/uvmboot/protected_sibling.go`: `cleanup`; shared `internal/sibling/protected_memory.go`: `ProtectedBacking`, `controlBatch`, `advance`, `Release` (the former standalone memory file was removed) | M07 |
-| Owned configuration, Bootstrap-before-Import, joined cleanup and one final receipt | hcsshim `internal/sibling/pair.go`: `Config`, `decodeConfig`; `protected_pair.go`: `start`, `close`, `publishReceipt`; companion `runtime/start-uvms.ps1`, `run-workload-container.ps1` | H1-H3 pending |
+| Owned configuration, Bootstrap-before-Import, pair-native cleanup and one release receipt | hcsshim `internal/sibling/pair.go`: `Config`, `decodeConfig`; `protected_pair.go`: `start`, `close`, `publishReceipt`; companion `runtime/start-uvms.ps1`, `run-workload-container.ps1` | H1-H3 pending |
 | Generation/build and explicit builder checkout | plan S8; hcsshim `go.mod`, computecore generator directive; matched companion `203341899db940bc4165507f0371a1eed10d5949`: `scripts/{build-hcs-launcher.ps1,resolve-build-root.py}` | M08 |

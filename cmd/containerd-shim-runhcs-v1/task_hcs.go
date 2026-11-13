@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/stats"
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/cow"
-	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/guestpath"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	"github.com/Microsoft/hcsshim/internal/hcs/schema1"
@@ -215,24 +213,6 @@ func newHcsTask(
 			protection = nil
 		}
 	}
-	transferred := false
-	nativeAttempt := false
-	if protection != nil {
-		if err := protection.BeginTask(); err != nil {
-			return nil, err
-		}
-		// Only a dispatched container create can leave unknown VM ownership.
-		// Upstream logger acquisition failures alone do not retain backing.
-		defer func() {
-			if !transferred {
-				var cleanupErr error
-				if nativeAttempt {
-					cleanupErr = err
-				}
-				protection.EndTask(cleanupErr)
-			}
-		}()
-	}
 	ctx, entry := log.SetEntry(ctx, logrus.Fields{logfields.TaskID: req.ID})
 	entry.WithFields(logrus.Fields{
 		"hasHost":      parent != nil,
@@ -272,15 +252,7 @@ func newHcsTask(
 	if err != nil {
 		return nil, err
 	}
-	// Failed creation still releases upstream IO, without joining its logger
-	// as part of protected VM ownership.
-	defer func() {
-		if err != nil && protection != nil {
-			go io.Close(context.Background())
-		}
-	}()
 
-	nativeAttempt = true
 	container, resources, err := createContainer(ctx, req.ID, owner, netNS, s, parent, shimOpts, req.Rootfs)
 	if err != nil {
 		return nil, err
@@ -299,15 +271,9 @@ func newHcsTask(
 		ioRetryTimeout: ioRetryTimeout,
 		protection:     protection,
 	}
-	if protection != nil {
-		ht.operationCtx, ht.stopOperations = context.WithCancel(context.Background())
-		ht.hostWatchCtx, ht.stopHostWatch = context.WithCancel(context.Background())
-	}
 	if len(hostOwner) != 0 {
 		ht.hostOwner = hostOwner[0]
 	}
-	// Transfer completion before even the init exec's container watcher starts.
-	transferred = true
 	ht.init = newHcsExec(
 		ctx,
 		events,
@@ -319,15 +285,12 @@ func newHcsTask(
 		ht.isWCOW,
 		s.Process,
 		io,
-		protection != nil,
 	)
+
 	if parent != nil {
 		// We have a parent UVM. Listen for its exit and forcibly close this
 		// task. This is not expected but in the event of a UVM crash we need to
 		// handle this case.
-		if protection != nil {
-			ht.hostWatcher.Add(1)
-		}
 		go ht.waitForHostExit()
 	}
 
@@ -350,11 +313,6 @@ func newHcsTask(
 			Checkpoint: "",
 			Pid:        uint32(ht.init.Pid()),
 		}); err != nil {
-		if protection != nil {
-			ht.init.ForceExit(context.Background(), 1)
-			ht.close(context.Background())
-			return nil, stderrors.Join(err, ht.cleanupErr)
-		}
 		return nil, err
 	}
 	return ht, nil
@@ -406,25 +364,13 @@ type hcsTask struct {
 	host *uvm.UtilityVM
 	// hostOwner closes companion resources together with the hosting VM.
 	// It is set before lifecycle goroutines start; only the sandbox invokes Close.
-	hostOwner         interface{ Close() error }
-	protection        *sibling.Pair
-	cleanupErr        error // Published by closed, never inferred from process status.
-	execsClosing      bool  // Guarded by ecl.
-	hostWatchCtx      context.Context
-	stopHostWatch     context.CancelFunc
-	hostWatcher       sync.WaitGroup
-	operationCtx      context.Context
-	stopOperations    context.CancelFunc
-	operationMu       sync.Mutex
-	operationsClosing bool
-	operations        sync.WaitGroup
-	operationErr      error
+	hostOwner  interface{ Close() error }
+	protection *sibling.Pair // Sandbox stop reaches native shutdown before guest cleanup.
 
-	// ecl prevents exec ID duplication. Protected creates reserve a pending ID
-	// under it, then use the task operation fence across IO and publication.
-	ecl          sync.Mutex
-	execs        sync.Map
-	execCreating map[string]bool // Protected pending IDs, guarded by ecl.
+	// ecl is the exec create lock for all non-init execs and MUST be held
+	// during create to prevent ID duplication.
+	ecl   sync.Mutex
+	execs sync.Map
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -444,44 +390,17 @@ func (ht *hcsTask) ID() string {
 }
 
 func (ht *hcsTask) CreateExec(ctx context.Context, req *task.ExecProcessRequest, spec *specs.Process) error {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return err
-	}
-	defer finish()
 	ht.ecl.Lock()
-	locked := true
-	// Protected creation reserves only its ID while connecting IO. The task
-	// operation fence joins the whole create before cleanup snapshots execs.
-	defer func() {
-		if locked {
-			ht.ecl.Unlock()
-		} else {
-			ht.ecl.Lock()
-			delete(ht.execCreating, req.ExecID)
-			ht.ecl.Unlock()
-		}
-	}()
-	if ht.protection != nil && ht.execsClosing {
-		return errors.New("protected task exec admission is closed")
-	}
+	defer ht.ecl.Unlock()
 
 	// If the task exists or we got a request for "" which is the init task
 	// fail.
-	if _, loaded := ht.execs.Load(req.ExecID); loaded || req.ExecID == "" || ht.execCreating[req.ExecID] {
+	if _, loaded := ht.execs.Load(req.ExecID); loaded || req.ExecID == "" {
 		return errors.Wrapf(errdefs.ErrAlreadyExists, "exec: '%s' in task: '%s' already exists", req.ExecID, ht.id)
 	}
 
 	if ht.init.State() != shimExecStateRunning {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "exec: '' in task: '%s' must be running to create additional execs", ht.id)
-	}
-	if ht.protection != nil {
-		if ht.execCreating == nil {
-			ht.execCreating = make(map[string]bool)
-		}
-		ht.execCreating[req.ExecID] = true
-		ht.ecl.Unlock()
-		locked = false
 	}
 
 	if oci.IsJobContainer(ht.taskSpec) && oci.IsIsolated(ht.taskSpec) {
@@ -504,7 +423,6 @@ func (ht *hcsTask) CreateExec(ctx context.Context, req *task.ExecProcessRequest,
 		ht.isWCOW,
 		spec,
 		io,
-		ht.protection != nil,
 	)
 
 	ht.execs.Store(req.ExecID, he)
@@ -555,6 +473,12 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 	if all && eid != "" {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "cannot signal all for non-empty exec: '%s'", eid)
 	}
+	if ht.protection != nil && eid == "" && (signal == 9 || signal == 15) {
+		ht.protection.Stop()
+		// Observed native exit fulfills this terminal signal without a guest
+		// RPC. The pair owner independently validates reclaim and release.
+		return ht.host.WaitNativeExit(ctx)
+	}
 	if all {
 		// We are in a kill all on the init task. Signal everything.
 		ht.execs.Range(func(key, value interface{}) bool {
@@ -573,16 +497,6 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 	}
 	if signal == 0x9 && eid == "" && ht.host != nil &&
 		(ht.ownsHost || !ht.host.UsesSiblingNetworking()) {
-		if ht.protection != nil {
-			// The watchdog uses the same drainage decision, never early VM
-			// CloseCtx. Failure to join retains the pair and resource owners.
-			go ht.watchProtectedKill(e.(*hcsExec))
-			err := e.Kill(ctx, signal)
-			if stderrors.Is(err, errdefs.ErrNotFound) && e.State() == shimExecStateExited {
-				return nil
-			}
-			return err
-		}
 		// If this is a SIGKILL against the init process we start a background
 		// timer and wait on either the timer expiring or the process exiting
 		// cleanly. If the timer expires first we forcibly close the UVM as we
@@ -604,11 +518,7 @@ func (ht *hcsTask) KillExec(ctx context.Context, eid string, signal uint32, all 
 			}
 		}()
 	}
-	err = e.Kill(ctx, signal)
-	if ht.protection != nil && stderrors.Is(err, errdefs.ErrNotFound) && e.State() == shimExecStateExited {
-		return nil
-	}
-	return err
+	return e.Kill(ctx, signal)
 }
 
 func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, time.Time, error) {
@@ -616,7 +526,15 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 	if err != nil {
 		return 0, 0, time.Time{}, err
 	}
-	if eid == "" && ht.protection == nil {
+	if eid == "" && ht.protection != nil {
+		if state := e.State(); state == shimExecStateRunning {
+			return 0, 0, time.Time{}, newExecInvalidStateError(ht.id, eid, state, "delete")
+		}
+		if err := ht.protection.Close(); err != nil {
+			return 0, 0, time.Time{}, err
+		}
+	}
+	if eid == "" {
 		// We are deleting the init exec. Forcibly exit any additional exec's.
 		ht.execs.Range(func(key, value interface{}) bool {
 			ex := value.(shimExec)
@@ -649,15 +567,11 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 		// shimExecStateExited, but resources may still be in the process
 		// of being cleaned up. Wait for ht.closed to be closed. This signals
 		// that [hcsTask.waitInitExit]/[hcsTask.waitForHostExit] has finished attempting
-		// container resource cleanup and layer unmounts. Protected native
-		// ownership failures are reported separately.
+		// container resource cleanup and layer unmounts.
 		// If the shim exits before resources are cleaned up, those resources
 		// will remain locked and untracked, which leads to lingering sandboxes
 		// and container resources like base vhdx.
-		timeout := 30 * time.Second
-		if ht.protection != nil {
-			timeout = 2 * time.Minute
-		}
+		const timeout = 30 * time.Second
 		entry.WithField(logfields.Timeout, timeout).Trace("waiting for task to be closed")
 		select {
 		case <-time.After(timeout):
@@ -665,9 +579,6 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 			return 0, 0, time.Time{}, errors.Wrap(hcs.ErrTimeout, "waiting for container resource cleanup")
 		case <-ht.closed:
 			entry.Trace("received task close signal")
-		}
-		if ht.protection != nil && ht.cleanupErr != nil {
-			return 0, 0, time.Time{}, ht.cleanupErr
 		}
 
 		// The init task has now exited. A ForceExit() has already been sent to
@@ -685,7 +596,7 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 		})
 
 		// cleanup the container directories inside the UVM if required.
-		if ht.host != nil && ht.protection == nil {
+		if ht.host != nil {
 			if err := ht.host.DeleteContainerState(ctx, ht.id); err != nil {
 				log.G(ctx).WithError(err).Errorf("failed to delete container state")
 			}
@@ -694,14 +605,6 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 
 	status := e.Status()
 	if eid != "" {
-		if ht.protection != nil {
-			he := e.(*hcsExec)
-			he.Wait()
-			<-he.containerDone
-			if he.cleanupErr != nil {
-				return 0, 0, time.Time{}, he.cleanupErr
-			}
-		}
 		ht.execs.Delete(eid)
 	}
 
@@ -723,11 +626,6 @@ func (ht *hcsTask) DeleteExec(ctx context.Context, eid string) (int, uint32, tim
 }
 
 func (ht *hcsTask) Pids(ctx context.Context) ([]*runhcsopts.ProcessDetails, error) {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer finish()
 	// Map all user created exec's to pid/exec-id
 	pidMap := make(map[int]string)
 	ht.execs.Range(func(key, value interface{}) bool {
@@ -798,15 +696,6 @@ func (ht *hcsTask) waitInitExit() {
 // Note: For Windows process isolated containers there is no host virtual
 // machine so this should not be called.
 func (ht *hcsTask) waitForHostExit() {
-	if ht.protection != nil {
-		defer ht.hostWatcher.Done()
-		_ = ht.host.WaitCtx(ht.hostWatchCtx)
-		if ht.hostWatchCtx.Err() == nil {
-			ht.protection.Stop()
-			ht.init.ForceExit(context.Background(), 1)
-		}
-		return
-	}
 	ctx, span := ot.StartSpan(context.Background(), "hcsTask::waitForHostExit")
 	defer span.End()
 	span.SetAttributes(
@@ -814,7 +703,13 @@ func (ht *hcsTask) waitForHostExit() {
 		attribute.Bool("host", ht.host != nil),
 		attribute.Bool("ownsHost", ht.ownsHost))
 
-	err := ht.host.WaitCtx(ctx)
+	var err error
+	if ht.protection != nil {
+		err = ht.host.WaitNativeExit(ctx)
+		ht.protection.Stop()
+	} else {
+		err = ht.host.WaitCtx(ctx)
+	}
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to wait for host virtual machine exit")
 	} else {
@@ -840,34 +735,10 @@ func (ht *hcsTask) waitForHostExit() {
 // == nil`.
 func (ht *hcsTask) close(ctx context.Context) {
 	ht.closeOnce.Do(func() {
-		if ht.protection != nil {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
-			defer cancel()
-		}
 		entry := log.G(ctx)
 		entry.Debug("hcsTask::closeOnce")
 		if ht.protection != nil {
-			if ht.ownsHost {
-				ht.protection.Stop()
-			}
-			ht.stopHostWatch()
-			ht.hostWatcher.Wait()
-			ht.operationMu.Lock()
-			ht.operationsClosing = true
-			ht.operationMu.Unlock()
-			ht.stopOperations()
-			ht.operations.Wait()
-			ht.ecl.Lock()
-			ht.execsClosing = true
-			ht.ecl.Unlock()
-			// No exec can now be added; join actual process/control users,
-			// not generic output delivery, before retiring their owners.
-			ht.cleanupErr = stderrors.Join(ht.operationErr, ht.drainProtectedExecs(ctx))
-			if ht.cleanupErr != nil {
-				ht.closeHost(ctx)
-				return
-			}
+			ht.protection.Stop()
 		}
 
 		// ht.c should never be nil for a real task but in testing we stub
@@ -921,9 +792,6 @@ func (ht *hcsTask) close(ctx context.Context) {
 							entry.WithError(err).Error("failed to wait for container terminate")
 						}
 					case <-t.C:
-						if ht.protection != nil {
-							err = hcs.ErrTimeout
-						}
 						entry.WithFields(logrus.Fields{
 							logfields.Timeout: tearDownTimeout,
 							logrus.ErrorKey:   hcs.ErrTimeout,
@@ -931,32 +799,12 @@ func (ht *hcsTask) close(ctx context.Context) {
 					}
 				}
 			}
-			if ht.protection != nil && err != nil {
-				if hcs.IsAlreadyStopped(err) {
-					select {
-					case <-ch:
-						err = werr
-					case <-ctx.Done():
-						err = ctx.Err()
-					}
-				}
-			}
-			if ht.protection != nil && err != nil {
-				ht.cleanupErr = err
-				ht.closeHost(ctx)
-				return
-			}
-			// Per-container resource/file/handle cleanup is best effort. Final
-			// pair storage drainage and native reclaim still gate backing release.
+
+			// Release any resources associated with the container.
 			entry.Trace("starting task resource cleanup")
 
 			if err := resources.ReleaseResources(ctx, ht.cr, ht.host, true); err != nil {
 				entry.WithError(err).Warn("failed to release container resources")
-			}
-			if ht.protection != nil {
-				if err := ht.host.DeleteContainerState(ctx, ht.id); err != nil {
-					entry.WithError(err).Warn("failed to delete container state")
-				}
 			}
 
 			// Close the container handle invalidating all future access.
@@ -981,23 +829,10 @@ func (ht *hcsTask) closeHost(ctx context.Context) {
 	ht.closeHostOnce.Do(func() {
 		entry := log.G(ctx)
 		entry.Debug("hcsTask::closeHostOnce")
-		if ht.protection != nil {
-			// Settle our own obligation BEFORE Pair.Close, which joins the
-			// other tasks. In particular the sandbox must not wait on itself.
-			if ht.cleanupErr != nil {
-				incompleteProtectedTasks.Lock()
-				incompleteProtectedTasks.tasks = append(incompleteProtectedTasks.tasks, ht)
-				incompleteProtectedTasks.Unlock()
-			}
-			ht.protection.EndTask(ht.cleanupErr)
-		}
 
 		if ht.ownsHost && ht.host != nil {
 			if err := ht.shutdownHost(); err != nil {
 				entry.WithError(err).Error("failed host vm shutdown")
-				if ht.protection != nil {
-					ht.cleanupErr = stderrors.Join(ht.cleanupErr, err)
-				}
 			}
 		}
 		// Send the `init` exec exit notification always.
@@ -1019,52 +854,6 @@ func (ht *hcsTask) closeHost(ctx context.Context) {
 	})
 }
 
-var incompleteProtectedTasks = struct {
-	sync.Mutex
-	tasks []*hcsTask
-}{}
-
-// drainProtectedExecs joins native process completion and control callbacks.
-// Errors retain the task and its ordinary resource owner instead of force-closing.
-func (ht *hcsTask) drainProtectedExecs(ctx context.Context) error {
-	var result error
-	// A failed create publication can enter close before waitInitExit.
-	execs := []*hcsExec{ht.init.(*hcsExec)}
-	// Snapshot only: never hold the exec admission lock across guest calls.
-	ht.execs.Range(func(_, value interface{}) bool {
-		execs = append(execs, value.(*hcsExec))
-		return true
-	})
-	for _, he := range execs {
-		he.ForceExit(ctx, 1)
-		select {
-		case <-he.exited:
-		case <-ctx.Done():
-			return stderrors.Join(result, ctx.Err())
-		}
-		select {
-		case <-he.containerDone:
-		case <-ctx.Done():
-			return stderrors.Join(result, ctx.Err())
-		}
-		result = stderrors.Join(result, he.cleanupErr)
-	}
-	return result
-}
-
-// watchProtectedKill escalates an unresponsive sandbox through task cleanup,
-// preserving its command/resource error rather than closing its VM underneath it.
-func (ht *hcsTask) watchProtectedKill(exec *hcsExec) {
-	timer := time.NewTimer(30 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-exec.exited:
-	case <-timer.C:
-		ht.protection.Stop()
-		ht.close(context.Background())
-	}
-}
-
 func (ht *hcsTask) shutdownHost() error {
 	if ht.hostOwner != nil {
 		return ht.hostOwner.Close()
@@ -1076,14 +865,6 @@ func (ht *hcsTask) shutdownHost() error {
 }
 
 func (ht *hcsTask) ExecInHost(ctx context.Context, req *shimdiag.ExecProcessRequest) (int, error) {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return -1, err
-	}
-	defer finish()
-	if ht.protection != nil {
-		return ht.execProtectedHost(ctx, req)
-	}
 	cmdReq := &cmd.CmdProcessRequest{
 		Args:     req.Args,
 		Workdir:  req.Workdir,
@@ -1102,11 +883,6 @@ func (ht *hcsTask) ExecInHost(ctx context.Context, req *shimdiag.ExecProcessRequ
 }
 
 func (ht *hcsTask) DumpGuestStacks(ctx context.Context) string {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return ""
-	}
-	defer finish()
 	if ht.host != nil {
 		stacks, err := ht.host.DumpStacks(ctx)
 		if err != nil {
@@ -1119,123 +895,10 @@ func (ht *hcsTask) DumpGuestStacks(ctx context.Context) string {
 }
 
 func (ht *hcsTask) Share(ctx context.Context, req *shimdiag.ShareRequest) error {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return err
-	}
-	defer finish()
 	if ht.host == nil {
 		return errTaskNotIsolated
 	}
-	err = ht.host.Share(ctx, req.HostPath, req.UvmPath, req.ReadOnly)
-	ht.recordProtectedOperationError(err)
-	return err
-}
-
-// beginProtectedOperation closes direct host admission before task resource
-// cleanup and joins its cancellation bridge. Ordinary tasks keep RPC lifetime.
-func (ht *hcsTask) beginProtectedOperation(ctx context.Context) (context.Context, func(), error) {
-	if ht.protection == nil {
-		// Ordinary operations have no additional ownership obligation.
-		return ctx, func() {}, nil
-	}
-	ht.operationMu.Lock()
-	if ht.operationsClosing {
-		ht.operationMu.Unlock()
-		return nil, nil, errors.New("protected task host operations are closing")
-	}
-	select {
-	case <-ht.protection.Done():
-		ht.operationMu.Unlock()
-		return nil, nil, errors.New("protected pair is stopping")
-	default:
-	}
-	ht.operations.Add(1)
-	ht.operationMu.Unlock()
-	operation, cancel := context.WithCancel(ctx)
-	bridge := make(chan struct{})
-	// Cancellation owns no VM; its completion is still joined before handoff.
-	stop := context.AfterFunc(ht.operationCtx, func() {
-		cancel()
-		close(bridge)
-	})
-	// End the bridge and operation before task cleanup can retire its owners.
-	return operation, func() {
-		if !stop() {
-			<-bridge
-		}
-		cancel()
-		ht.operations.Done()
-	}, nil
-}
-
-// recordProtectedOperationError preserves unknown direct acquisition failures
-// and closes pair admission immediately, outside the operation lock.
-func (ht *hcsTask) recordProtectedOperationError(err error) {
-	if ht.protection != nil && err != nil {
-		ht.operationMu.Lock()
-		ht.operationErr = stderrors.Join(ht.operationErr, err)
-		ht.operationMu.Unlock()
-		ht.protection.Stop()
-	}
-}
-
-// execProtectedHost uses the existing command and pipe implementations, with
-// joined guest cancellation and native exit, not an upstream delivery fence.
-func (ht *hcsTask) execProtectedHost(ctx context.Context, req *shimdiag.ExecProcessRequest) (int, error) {
-	if len(req.Args) == 0 {
-		return -1, errors.New("missing command")
-	}
-	io, err := cmd.NewNpipeIO(ctx, req.Stdin, req.Stdout, req.Stderr, req.Terminal, 0)
-	if err != nil {
-		return -1, err
-	}
-	command := sibling.NewJoinedGuestCommand(ctx, ht.host, req.Args[0], req.Args[1:]...)
-	// Own and join cancellation here so a blocked output consumer cannot
-	// postpone the end of Cmd's guest-Kill callback.
-	command.Context = nil
-	command.CopyAfterExitTimeout = 0
-	command.Spec.Terminal = req.Terminal
-	if req.Workdir != "" {
-		command.Spec.Cwd = req.Workdir
-	}
-	command.Stdin, command.Stdout, command.Stderr = io.Stdin(), io.Stdout(), io.Stderr()
-	if err := command.Start(); err != nil {
-		go io.Close(context.Background())
-		ht.recordProtectedOperationError(err)
-		return -1, err
-	}
-	var killErr error
-	killed := make(chan struct{})
-	// This is the only asynchronous guest-control borrower of this command.
-	stop := context.AfterFunc(ctx, func() {
-		_, killErr = command.Process.Kill(context.WithoutCancel(ctx))
-		close(killed)
-	})
-	waitErr := command.Process.Wait()
-	code, exitErr := command.Process.ExitCode()
-	if !stop() {
-		<-killed
-	}
-	if hcs.IsAlreadyStopped(killErr) {
-		killErr = nil
-	}
-	nativeErr := stderrors.Join(waitErr, exitErr, killErr)
-	if _, ok := command.Process.(*gcs.Process); !ok {
-		nativeErr = stderrors.Join(nativeErr, errors.New("protected completion requires a GCS process"))
-	}
-	ht.recordProtectedOperationError(nativeErr)
-	// Validated GCS completion leaves only local stream forwarding/closure,
-	// including a possibly blocked upstream writer. Other process types retain
-	// their VM through nativeErr. Preserve normal output completion separately.
-	go func() {
-		_ = command.Wait()
-		io.Close(context.Background())
-	}()
-	if exitErr == nil && code != 0 {
-		err = fmt.Errorf("process exited with exit code %d", code)
-	}
-	return code, stderrors.Join(nativeErr, err)
+	return ht.host.Share(ctx, req.HostPath, req.UvmPath, req.ReadOnly)
 }
 
 func hcsPropertiesToWindowsStats(props *hcsschema.Properties) *stats.Statistics_Windows {
@@ -1271,11 +934,6 @@ func hcsPropertiesToWindowsStats(props *hcsschema.Properties) *stats.Statistics_
 }
 
 func (ht *hcsTask) Stats(ctx context.Context) (*stats.Statistics, error) {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer finish()
 	s := &stats.Statistics{}
 	props, err := ht.c.PropertiesV2(ctx, hcsschema.PTStatistics)
 	if err != nil {
@@ -1303,11 +961,6 @@ func (ht *hcsTask) Stats(ctx context.Context) (*stats.Statistics, error) {
 }
 
 func (ht *hcsTask) Update(ctx context.Context, req *task.UpdateTaskRequest) error {
-	ctx, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return err
-	}
-	defer finish()
 	resources, err := typeurl.UnmarshalAny(req.Resources)
 	if err != nil {
 		return errors.Wrapf(err, "failed to unmarshal resources for container %s update request", req.ID)
@@ -1471,11 +1124,6 @@ func (ht *hcsTask) requestUpdateContainer(ctx context.Context, resourcePath stri
 }
 
 func (ht *hcsTask) ProcessorInfo(ctx context.Context) (*processorInfo, error) {
-	_, finish, err := ht.beginProtectedOperation(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer finish()
 	if ht.host == nil {
 		return nil, errTaskNotIsolated
 	}
