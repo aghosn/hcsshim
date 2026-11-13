@@ -76,6 +76,7 @@ type protectedPair struct {
 	workload            protectedVMAttempt
 	rootAttempt         bool
 	root                *scsi.Mount
+	providerStarted     bool // Latched readiness proves insmod returned, not current liveness.
 	uplinkAttempt       bool
 	services            []*protectedService
 	control             *ExportControl
@@ -358,6 +359,9 @@ func (p *protectedPair) bootstrap(group string) error {
 		`until [ -f /run/sibling-exec/gcs-relay.ready ]; do sleep 0.1; done`); err != nil {
 		return err
 	}
+	// The relay removes its ready file when its session ends. Retain the
+	// observed provider-start completion across workload termination.
+	p.providerStarted = true
 	if err := p.configure(setup); err != nil {
 		return err
 	}
@@ -819,19 +823,22 @@ func (p *protectedPair) close() error {
 			result = errors.Join(result, errors.New("protected root attachment is unobservable; retain backing"))
 		}
 		if p.root != nil {
-			// A failed bootstrap may leave the dependency shell still starting
-			// the provider. Its existing ready file proves insmod has returned;
-			// otherwise leave the disk attached until native diode termination.
-			script := `if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; [ ! -d /sys/module/diode_storvsp ]`
+			// An attempted provider starter may still be in insmod if startup
+			// never observed relay readiness. A later relay exit does not undo
+			// that observation or prevent provider quiescence.
+			providerStarting := false
 			for _, service := range p.services {
-				if service.dependency && service.attempted {
-					script = `test -f /run/sibling-exec/gcs-relay.ready; ` + script
+				if service.dependency && service.attempted && !p.providerStarted {
+					providerStarting = true
 					break
 				}
 			}
 			// Keep direct diode GCS through provider quiescence and the actual
 			// RP release. A failed quiescence never authorizes disk detachment.
-			if _, err := p.guest(ctx, &p.diode, script); err != nil {
+			if providerStarting {
+				result = errors.Join(result, errors.New("protected provider startup completion is unobserved; retain root attachment"))
+			} else if _, err := p.guest(ctx, &p.diode,
+				`if [ -d /sys/module/diode_storvsp ]; then rmmod diode_storvsp; fi; [ ! -d /sys/module/diode_storvsp ]`); err != nil {
 				result = errors.Join(result, err)
 			} else {
 				result = errors.Join(result, p.root.Release(ctx))
