@@ -7,6 +7,7 @@
 // drops later never reaches the process. See run_relay below for the details.
 
 #include "vsock.h"
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -207,6 +208,52 @@ _Noreturn static void usage(const char* argv0) {
     exit(1);
 }
 
+// log_relay_selected reads the measured selector independently of init's child
+// environment. Missing, truncated or ambiguous configuration fails before any
+// socket is opened; only exact whitespace-delimited selector tokens are used.
+static int log_relay_selected(void) {
+    const char key[] = "vsockexec.log_relay";
+    char cmdline[65536];
+    FILE* file = fopen("/proc/cmdline", "r");
+    if (file == NULL) {
+        perror("vsockexec: read /proc/cmdline");
+        return -1;
+    }
+    size_t n = fread(cmdline, 1, sizeof(cmdline), file);
+    int failed = ferror(file) || n == sizeof(cmdline);
+    if (fclose(file) != 0) {
+        failed = 1;
+    }
+    if (failed || memchr(cmdline, '\0', n) != NULL) {
+        fprintf(stderr, "vsockexec: unreadable or truncated /proc/cmdline\n");
+        return -1;
+    }
+    int selected = 0;
+    int seen = 0;
+    for (size_t pos = 0; pos < n;) {
+        while (pos < n && isspace((unsigned char)cmdline[pos])) {
+            pos++;
+        }
+        size_t start = pos;
+        while (pos < n && !isspace((unsigned char)cmdline[pos])) {
+            pos++;
+        }
+        size_t len = pos - start;
+        if (len >= sizeof(key) - 1 &&
+            memcmp(cmdline + start, key, sizeof(key) - 1) == 0 &&
+            (len == sizeof(key) - 1 || cmdline[start + sizeof(key) - 1] == '=')) {
+            if (seen || len != sizeof(key) + 1 ||
+                (cmdline[pos - 1] != '0' && cmdline[pos - 1] != '1')) {
+                fprintf(stderr, "vsockexec: invalid or duplicate log relay selector\n");
+                return -1;
+            }
+            seen = 1;
+            selected = cmdline[pos - 1] == '1';
+        }
+    }
+    return selected;
+}
+
 int main(int argc, char** argv) {
     unsigned int ports[3] = {0};
     int sockets[3] = {-1, -1, -1};
@@ -241,6 +288,18 @@ int main(int argc, char** argv) {
         usage(argv[0]);
     }
 
+    int log_relay = log_relay_selected();
+    if (log_relay < 0) {
+        return 1;
+    }
+    if (log_relay && (reconnect || ports[0] != 0 ||
+        (ports[1] == 0 && ports[2] == 0) ||
+        (ports[1] != 0 && ports[1] != 109) ||
+        (ports[2] != 0 && ports[2] != 109) || tcpmode)) {
+        fprintf(stderr, "vsockexec: log relay requires plain stdout/stderr port 109 only\n");
+        return 1;
+    }
+
     if (reconnect) {
         // Resilient path: wait for the host if it isn't listening yet and
         // reconnect if the connection later drops. The plain connect-and-exec
@@ -264,7 +323,7 @@ int main(int argc, char** argv) {
             }
 
             if (j == i) {
-                int s = tcpmode ? opentcp(ports[i]) : openvsock(VMADDR_CID_HOST, ports[i]);
+                int s = tcpmode ? opentcp(ports[i]) : openvsock(log_relay ? 4 : VMADDR_CID_HOST, ports[i]);
                 if (s < 0) {
                     fprintf(stderr, "connect: port %u: %s", ports[i], strerror(errno));
                     return 1;

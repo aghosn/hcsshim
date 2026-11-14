@@ -62,9 +62,30 @@ func Run(ctx context.Context, readyPath string) error {
 	return run(ctx, readyPath, nativeDependencies())
 }
 
+// run keeps existing callers on the logging-disabled control path.
 func run(ctx context.Context, readyPath string, d dependencies) error {
+	return runWithLogging(ctx, readyPath, d, false)
+}
+
+// RunWithLogging adds a required, one-way log leg to Run. Log acceptance runs
+// before control acceptance/readiness to avoid the vsockexec startup cycle.
+// Established log failures are diagnosed once, never through session.launch;
+// control/parent exit closes and joins logs independently of control framing.
+func RunWithLogging(ctx context.Context, readyPath string) error {
+	return runWithLogging(ctx, readyPath, nativeDependencies(), true)
+}
+
+// runWithLogging shares Run's control path and owns the optional log lifetime.
+func runWithLogging(ctx context.Context, readyPath string, d dependencies, logging bool) error {
 	if readyPath == "" {
 		return errors.New("gcsrelay: readiness path is required")
+	}
+	if logging {
+		stop, err := startLogRelay(ctx, d)
+		if err != nil {
+			return err
+		}
+		defer stop()
 	}
 	listener, err := d.listen(localCID, prot.LinuxGcsVsockPort)
 	if err != nil {
