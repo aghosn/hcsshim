@@ -23,6 +23,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/uvm/scsi"
 	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -171,6 +172,29 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 // preflightProtectedPair rejects excluded profiles and missing inputs before
 // startProtectedPair acquires its log, bundle, backing or native controller.
 func preflightProtectedPair(ctx context.Context, config *Config, workload, diode *uvm.OptionsLCOW) error {
+	if config.PageMetadataOutputPath != "" {
+		// Inspect every component without accepting any reparse-point redirection.
+		for path := filepath.Clean(config.PageMetadataOutputPath); ; path = filepath.Dir(path) {
+			info, err := os.Lstat(path)
+			if err != nil {
+				return fmt.Errorf("page metadata output directory %q: %w", path, err)
+			}
+			name, err := windows.UTF16PtrFromString(path)
+			if err != nil {
+				return err
+			}
+			attributes, err := windows.GetFileAttributes(name)
+			if err != nil {
+				return fmt.Errorf("page metadata output directory attributes %q: %w", path, err)
+			}
+			if !info.IsDir() || attributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+				return fmt.Errorf("page metadata output %q must be a directory without links or reparse points", path)
+			}
+			if filepath.Dir(path) == path {
+				break
+			}
+		}
+	}
 	if err := ValidateProtectedControllerABI(); err != nil {
 		return err
 	}
@@ -230,7 +254,8 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 }
 
 // protectedPairInputs is the minimal owned profile, excluding benchmark/demo
-// services and host page-metadata exports. The workload client stays in its root.
+// services. The optional diode output directory is not a staged tool input.
+// The workload client stays in its root.
 func protectedPairInputs() []string {
 	return []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "ahv-guest-ctl"}
 }
@@ -264,6 +289,12 @@ func (p *protectedPair) bootstrap(group string) error {
 	if _, err := fmt.Fprintf(p.log, "protected owned pair run=%s diode=%s workload=%s\n",
 		p.config.RunID, p.diode.options.ID, p.workload.options.ID); err != nil {
 		return err
+	}
+	if p.config.PageMetadataOutputPath != "" {
+		if _, err := fmt.Fprintf(p.log, "page metadata output run=%s vm=%s host=%q guest=/run/page-metadata-results writable=true\n",
+			p.config.RunID, p.diode.options.ID, p.config.PageMetadataOutputPath); err != nil {
+			return err
+		}
 	}
 	if err := os.Mkdir(p.diode.options.BundleDirectory, 0700); err != nil {
 		return fmt.Errorf("create owned diode bundle: %w", err)
@@ -526,10 +557,17 @@ func (p *protectedPair) guest(ctx context.Context, v *protectedVMAttempt, script
 // stage mounts executable storage once, before diode services start. The
 // collector is /run/sibling-exec/ahv-guest-ctl only on the diode; no workload copy
 // replaces /usr/bin/ahv-guest-ctl from the verified root.
+// An optional writable output share is mounted only on the diode before services
+// and sealing; the VM owns cleanup and existing host captures are left untouched.
 func (p *protectedPair) stage(ctx context.Context, v *protectedVMAttempt) error {
 	names := []string{"sibling_bus.ko"}
 	if v == &p.diode {
 		names = protectedPairInputs()
+		if p.config.PageMetadataOutputPath != "" {
+			if err := v.vm.Share(ctx, p.config.PageMetadataOutputPath, "/run/page-metadata-results", false); err != nil {
+				return fmt.Errorf("share diode page metadata output: %w", err)
+			}
+		}
 	}
 	for _, name := range names {
 		if err := v.vm.Share(ctx, filepath.Join(p.config.ModuleDirectory, name), "/run/sibling/"+name, true); err != nil {
