@@ -14,6 +14,7 @@ import (
 
 	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/hcsshim/internal/cmd"
+	"github.com/Microsoft/hcsshim/internal/cow"
 	"github.com/Microsoft/hcsshim/internal/timesync"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/windows"
@@ -40,6 +41,71 @@ type pairTimesync struct {
 	closed        bool
 }
 
+// timesyncCommandHost preserves NewJoinedGuestCommand's creation context and
+// ownership, adapting only protocol stdout for completion supervision.
+type timesyncCommandHost struct {
+	cow.ProcessHost
+}
+
+// CreateProcess keeps the actual process owner and all its close/wait methods.
+// The adapter changes only the stdout reader exposed to Cmd's relay.
+func (h timesyncCommandHost) CreateProcess(ctx context.Context, settings interface{}) (cow.Process, error) {
+	process, err := h.ProcessHost.CreateProcess(ctx, settings)
+	if err != nil {
+		return process, err
+	}
+	return &timesyncCommandProcess{Process: process}, nil
+}
+
+// timesyncCommandProcess borrows the original process; Cmd still owns its
+// streams, callbacks and final Close through the unchanged joined path.
+type timesyncCommandProcess struct {
+	cow.Process
+}
+
+// Stdio hides stdout WriterTo because io.Copy prioritizes it over the
+// destination's ReaderFrom. GCS currently exposes an ioChannel (Read/Write/Close,
+// no WriterTo), but supervision must not silently disappear if that changes.
+// Native stdin closability and the independent diagnostic stderr are preserved.
+func (p *timesyncCommandProcess) Stdio() (io.Writer, io.Reader, io.Reader) {
+	stdin, stdout, stderr := p.Process.Stdio()
+	if stdout != nil {
+		stdout = struct{ io.Reader }{Reader: stdout}
+	}
+	return stdin, stdout, stderr
+}
+
+// timesyncCommandInput transfers the same interruptible PipeReader to Cmd.
+// Its WriterTo observes the entire stdin copy, including native write failure.
+type timesyncCommandInput struct {
+	*io.PipeReader
+	relay *pairTimesync
+}
+
+// WriteTo reports protocol stdin completion before Cmd closes native stdin or
+// waits for process exit. EOF is loss too: this is a pair-lifetime stream.
+func (s *timesyncCommandInput) WriteTo(dst io.Writer) (int64, error) {
+	n, err := io.Copy(struct{ io.Writer }{Writer: dst}, struct{ io.Reader }{Reader: s.PipeReader})
+	s.relay.fail(errors.Join(errors.New("protected timesync protocol stdin copy ended unexpectedly"), err))
+	return n, err
+}
+
+// timesyncCommandOutput observes Cmd's stdout copy, rather than waiting for
+// process exit to expose its result. Stdio guarantees ReaderFrom dispatch.
+type timesyncCommandOutput struct {
+	*io.PipeWriter
+	relay *pairTimesync
+}
+
+// ReadFrom reports stdout EOF/read/write failure and interrupts external pumps
+// before Cmd's CloseStdout or any joins. Reader/writer-only views keep this inner
+// copy from bypassing supervision through another optimized copy method.
+func (s *timesyncCommandOutput) ReadFrom(src io.Reader) (int64, error) {
+	n, err := io.Copy(struct{ io.Writer }{Writer: s.PipeWriter}, struct{ io.Reader }{Reader: src})
+	s.relay.fail(errors.Join(errors.New("protected timesync protocol stdout copy ended unexpectedly"), err))
+	return n, err
+}
+
 // startTimesync creates the separate foreground diode relay before workload
 // Start, without waiting for its device or native pipe. Creation/acquisition use
 // setup budgets; established I/O and exit observation retain the pair lifetime.
@@ -62,7 +128,10 @@ func (p *protectedPair) startTimesync(setup context.Context) error {
 	// Only CreateProcess borrows setup. As with startService, the native VM
 	// owner stops the foreground process; no expiring RPC context owns it.
 	command.Context = nil
-	command.Stdin, command.Stdout, command.Stderr = t.input, t.output, p.log
+	command.Host = timesyncCommandHost{ProcessHost: command.Host}
+	command.Stdin = &timesyncCommandInput{PipeReader: t.input, relay: t}
+	command.Stdout = &timesyncCommandOutput{PipeWriter: t.output, relay: t}
+	command.Stderr = p.log
 	command.Log = command.Log.WithField("protected_run", p.config.RunID).WithField("vm", p.diode.options.ID)
 	t.command = command
 	if err := command.Start(); err != nil {
