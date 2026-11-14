@@ -503,6 +503,11 @@ func applyLCOWVMGSStorage(doc *hcsschema.ComputeSystem, opts *OptionsLCOW, uvm *
 		doc.VirtualMachine.Devices.Scsi = maps.Clone(opts.Appliance.SCSI)
 		return
 	}
+	if opts.SiblingRoot && len(opts.SharedMemoryRegions) == 1 && opts.SharedMemoryRegions[0].ProtectedShared {
+		// Keep logical SCSI capacity for ConfigureSiblingStorage, but do not
+		// offer empty RP controllers to the protected workload.
+		return
+	}
 	if uvm.scsiControllerCount == 0 {
 		return
 	}
