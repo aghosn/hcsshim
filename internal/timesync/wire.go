@@ -85,7 +85,7 @@ func Validate(record []byte, direction Direction) error {
 		if direction == Request && (frames == 0 || messages == 0) {
 			return errors.New("timesync: empty negotiation request")
 		}
-		if direction == Response && !((frames == 0 && messages == 0) || (frames == 1 && messages == 1)) {
+		if direction == Response && (frames != 0 || messages != 0) && (frames != 1 || messages != 1) {
 			return errors.New("timesync: invalid negotiation response counts")
 		}
 	case 4:
