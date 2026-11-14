@@ -33,6 +33,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/guest/prot"
 	"github.com/Microsoft/hcsshim/internal/guest/runtime/hcsv2"
 	"github.com/Microsoft/hcsshim/internal/guest/runtime/runc"
+	"github.com/Microsoft/hcsshim/internal/guest/timesyncrelay"
 	"github.com/Microsoft/hcsshim/internal/guest/transport"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/ot"
@@ -301,7 +302,8 @@ func main() {
 		"Stance: allow, deny.")
 	siblingRelay := flag.Bool("sibling-relay", false, "Relay workload GCS and stdio through the diode's native sibling vsock.")
 	siblingLogRelay := flag.Bool("sibling-log-relay", false, "Also relay workload logs; requires -sibling-relay.")
-	relayReady := flag.String("relay-ready", "/run/gcs-relay.ready", "Readiness file for -sibling-relay.")
+	siblingTimeRelay := flag.Bool("sibling-timesync-relay", false, "Relay native timesync through the sibling provider.")
+	relayReady := flag.String("relay-ready", "/run/gcs-relay.ready", "Readiness file for a sibling relay.")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "\nUsage of %s:\n", os.Args[0])
@@ -313,6 +315,17 @@ func main() {
 
 	flag.Parse()
 
+	if *siblingTimeRelay {
+		if *siblingRelay || *siblingLogRelay || *useInOutErr {
+			logrus.Fatal("-sibling-timesync-relay cannot be combined with other relay modes")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+		if err := timesyncrelay.Run(ctx, *relayReady); err != nil {
+			logrus.WithError(err).Fatal("sibling timesync relay stopped")
+		}
+		return
+	}
 	if *siblingLogRelay && !*siblingRelay {
 		logrus.Fatal("-sibling-log-relay requires -sibling-relay")
 	}
