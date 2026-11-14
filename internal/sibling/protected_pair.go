@@ -60,6 +60,7 @@ type protectedPair struct {
 	workload      protectedVMAttempt
 	uplinkAttempt bool
 	services      []*protectedService
+	timesync      *pairTimesync
 	log           *os.File
 	startupDone   chan struct{}
 	startupParent context.Context // Checked at seal commitment, never used as a service lifetime.
@@ -77,8 +78,10 @@ type protectedPair struct {
 
 // startProtectedPair implements the owned Bootstrap-before-Import sequence.
 // It preflights without backing, validates diode native startup before workload
-// creation, creates independent foreground AHV and root/GCS services before
-// workload Start, then checks mediation and seals before sandbox creation.
+// creation, creates independent foreground AHV, root/GCS and timesync services
+// before workload Start, then checks mediation and seals before sandbox creation.
+// Only the cloned workload receives a fresh pair-owned native timesync route;
+// pipe/device acquisition overlaps boot, with no sample/convergence handoff gate.
 //
 // After owner allocation,
 // even an error returns the Pair: the caller must retain it, never ordinary-close
@@ -119,6 +122,7 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 	if err := preflightProtectedPair(parent, config, workload, diode); err != nil {
 		return nil, err
 	}
+	workload.TimesyncRelayID = &group
 
 	ctx, cancel := context.WithCancelCause(context.Background())
 	watch, stopWatch := context.WithCancel(context.Background())
@@ -215,8 +219,9 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 			options.PreferredRootFSType != uvm.PreferredRootFSTypeNA ||
 			options.CPUGroupID != "" || options.ResourcePartitionID != nil ||
 			options.ProcessorLimit != 0 || options.ProcessorWeight != 0 ||
-			len(options.ProtectedSharedResources) != 0 || options.NetworkConfigProxy != "" {
-			return errors.New("protected owned pair requires unchanged direct SNP Linux dm-verity boot without CPU-group/tuning or appliance options")
+			len(options.ProtectedSharedResources) != 0 || options.NetworkConfigProxy != "" ||
+			options.DisableTimeSyncService {
+			return errors.New("protected owned pair requires unchanged direct SNP Linux dm-verity boot with timesync enabled, without CPU-group/tuning or appliance options")
 		}
 		if err := uvm.VerifyOptions(ctx, options); err != nil {
 			return err
@@ -265,7 +270,7 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 // services. The optional diode output directory is not a staged tool input.
 // The workload client stays in its root.
 func protectedPairInputs() []string {
-	return []string{"sibling_bus.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "ahv-guest-ctl"}
+	return []string{"sibling_bus.ko", "diode_timesyncvsp.ko", "diode_storvsp.ko", "diode_netvsp.ko", "diode_iptables", "ahv-guest-ctl"}
 }
 
 // stop cancels forward work without waiting for guest cooperation. Native
@@ -357,13 +362,22 @@ func (p *protectedPair) bootstrap(group string) error {
 	}
 	provider := `trap 'exit 1' TERM INT; ` +
 		BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
-		protectedDiodeLinkCommand() + resolve +
+		protectedDiodeLinkCommand() +
+		`insmod /run/sibling/diode_timesyncvsp.ko/diode_timesyncvsp.ko; ` + resolve +
 		`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true; ` +
 		`exec /bin/gcs -sibling-relay -sibling-log-relay -relay-ready /run/sibling-exec/gcs-relay.ready`
 	if err := p.startService(setup, &p.diode, provider); err != nil {
 		return err
 	}
+	// The time process never loads the bus itself. Its device wait and the
+	// asynchronous native bridge must exist before workload Start dispatch.
+	if err := p.startTimesync(setup); err != nil {
+		return err
+	}
 	if err := p.start(setup, &p.workload); err != nil {
+		return err
+	}
+	if err := p.timesync.waitReady(setup); err != nil {
 		return err
 	}
 	if _, err := p.guest(setup, &p.diode,
@@ -638,7 +652,10 @@ func (p *protectedPair) checkServices() error {
 		default:
 		}
 	}
-	return nil
+	if p.timesync == nil {
+		return errors.New("protected timesync service is missing")
+	}
+	return p.timesync.check()
 }
 
 // seal retains the native operation through return and excludes final reclaim.
@@ -773,16 +790,13 @@ func PrepareProtectedShutdown() error {
 // close makes one native decision, excluding new acquisition and joining actual
 // native dispatch. Ordinary processes, disks and output cannot veto its attempt.
 func (p *protectedPair) close() error {
-	p.forwardMu.Lock()
-	shells := p.pair.interactiveCloser
-	p.forwardMu.Unlock()
-	if shells != nil {
-		if err := shells.Close(); err != nil {
-			log.G(context.Background()).WithError(err).Warn("protected attach endpoints could not be closed")
-		}
-	}
 	p.nativeMu.Lock()
-	defer p.nativeMu.Unlock()
+	nativeLocked := true
+	defer func() {
+		if nativeLocked {
+			p.nativeMu.Unlock()
+		}
+	}()
 	p.stopWatch()
 	// Each participant gets an independent allowance. A failed workload stop
 	// must not prevent a diode termination attempt.
@@ -814,6 +828,10 @@ func (p *protectedPair) close() error {
 	protectedOwners.Lock()
 	delete(protectedOwners.pairs, p)
 	protectedOwners.Unlock()
+	// Native authority is finished. Release its lock before publication or any
+	// ordinary cleanup can start waiting for guest/process/output borrowers.
+	p.nativeMu.Unlock()
+	nativeLocked = false
 	receiptErr := p.publishReceipt()
 	// Startup may still publish GCS/listener/output state or await a guest RPC.
 	// Defer ordinary closure until those publishers return, without delaying
@@ -834,6 +852,14 @@ func (p *protectedPair) cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
 	defer cancel()
 	var result error
+	// Ordinary attach and time I/O can wait for drainage only after both native
+	// participants and backing are decided, with nativeMu no longer held.
+	if p.pair.interactiveCloser != nil {
+		result = errors.Join(result, p.pair.interactiveCloser.Close())
+	}
+	if p.timesync != nil {
+		result = errors.Join(result, p.timesync.join())
+	}
 	for _, v := range []*protectedVMAttempt{&p.workload, &p.diode} {
 		if v.vm != nil {
 			result = errors.Join(result, v.vm.CloseAfterNativeExit(ctx))
