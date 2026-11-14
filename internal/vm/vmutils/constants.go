@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Microsoft/hcsshim/internal/memory"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/osversion"
 )
 
@@ -55,7 +56,7 @@ const (
 	LinuxEntropyVsockPort = 1
 	// LinuxLogVsockPort is the vsock port used by the GCS (Guest Compute Service)
 	// to forward stdout/stderr log data from the guest to the host.
-	LinuxLogVsockPort = 109
+	LinuxLogVsockPort = guestresource.LinuxLogVsockPort
 	// LinuxEntropyBytes is the number of bytes of random data to send to a Linux UVM
 	// during boot to seed the CRNG. There is not much point in making this too
 	// large since the random data collected from the host is likely computed from a

@@ -113,6 +113,9 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 		// Preserve the caller's and workload's inherited restrictions.
 		diode.NoWritableFileShares = false
 	}
+	// Only the protected Linux provider owns the root-facing log service.
+	// commonPairOptions may retain inherited slice storage; do not mutate it.
+	diode.ExtraVSockPorts = append(append([]uint32(nil), diode.ExtraVSockPorts...), guestresource.GCSRelayLogPort)
 	if err := preflightProtectedPair(parent, config, workload, diode); err != nil {
 		return nil, err
 	}
@@ -356,7 +359,7 @@ func (p *protectedPair) bootstrap(group string) error {
 		BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
 		protectedDiodeLinkCommand() + resolve +
 		`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true; ` +
-		`exec /bin/gcs -sibling-relay -relay-ready /run/sibling-exec/gcs-relay.ready`
+		`exec /bin/gcs -sibling-relay -sibling-log-relay -relay-ready /run/sibling-exec/gcs-relay.ready`
 	if err := p.startService(setup, &p.diode, provider); err != nil {
 		return err
 	}
@@ -455,7 +458,10 @@ func (p *protectedPair) configureGCSRelay(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return p.workload.vm.ConfigureGCSRelay(p.diode.vm)
+	if err := p.workload.vm.ConfigureGCSRelay(p.diode.vm); err != nil {
+		return err
+	}
+	return p.workload.vm.ConfigureGCSLogRelay(p.diode.vm)
 }
 
 // start retains native dispatch through its actual return and receipt observation,

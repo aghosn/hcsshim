@@ -300,6 +300,7 @@ func main() {
 		"allow",
 		"Stance: allow, deny.")
 	siblingRelay := flag.Bool("sibling-relay", false, "Relay workload GCS and stdio through the diode's native sibling vsock.")
+	siblingLogRelay := flag.Bool("sibling-log-relay", false, "Also relay workload logs; requires -sibling-relay.")
 	relayReady := flag.String("relay-ready", "/run/gcs-relay.ready", "Readiness file for -sibling-relay.")
 
 	flag.Usage = func() {
@@ -312,10 +313,17 @@ func main() {
 
 	flag.Parse()
 
+	if *siblingLogRelay && !*siblingRelay {
+		logrus.Fatal("-sibling-log-relay requires -sibling-relay")
+	}
 	if *siblingRelay {
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer cancel()
-		if err := gcsrelay.Run(ctx, *relayReady); err != nil {
+		run := gcsrelay.Run
+		if *siblingLogRelay {
+			run = gcsrelay.RunWithLogging
+		}
+		if err := run(ctx, *relayReady); err != nil {
 			logrus.WithError(err).Fatal("sibling GCS relay stopped")
 		}
 		return
