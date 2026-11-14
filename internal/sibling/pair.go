@@ -32,6 +32,8 @@ import (
 // RunID and CleanupReceiptPath identify the one final S3 cleanup result; early/late
 // AHV selection is already encoded in prepared boot inputs, not another shim flag.
 // The protected profile requires interactive endpoint acquisition before sealing.
+// PageMetadataOutputPath optionally exports an existing local directory writable
+// only to the protected diode; preflight validates the filesystem destination.
 type Config struct {
 	Version                   int     `json:"version"`
 	ModuleDirectory           string  `json:"module_directory"`
@@ -45,6 +47,7 @@ type Config struct {
 	WorkloadPartitionSealMask *uint64 `json:"workload_partition_seal_mask,omitempty,string"`
 	RunID                     string  `json:"run_id,omitempty"`
 	CleanupReceiptPath        string  `json:"cleanup_receipt_path,omitempty"`
+	PageMetadataOutputPath    string  `json:"page_metadata_output_path,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -105,6 +108,15 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	} else if config.DiodePartitionSealMask != nil || config.WorkloadPartitionSealMask != nil ||
 		config.RunID != "" || config.CleanupReceiptPath != "" {
 		return nil, errors.New("partition masks and cleanup receipt identity require protected_shared")
+	}
+	if config.PageMetadataOutputPath != "" {
+		volume := filepath.VolumeName(config.PageMetadataOutputPath)
+		if !config.ProtectedShared || !filepath.IsAbs(config.PageMetadataOutputPath) ||
+			len(volume) != 2 || volume[1] != ':' ||
+			!strings.ContainsAny(volume[:1], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") ||
+			strings.ContainsAny(config.PageMetadataOutputPath[2:], ":\x00") {
+			return nil, errors.New("page metadata output requires the protected owned Linux profile and an absolute local drive directory path")
+		}
 	}
 	return &config, nil
 }
