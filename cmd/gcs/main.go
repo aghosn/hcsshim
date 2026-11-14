@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -192,60 +191,6 @@ func runWithRestartMonitor(arg0 string, args ...string) {
 		// since backoffSettings.MaxElapsedTime is set to 0 we will never receive backoff.Stop.
 		time.Sleep(backOffTime)
 	}
-}
-
-// startTimeSyncService starts the `chronyd` deamon to keep the UVM time synchronized.  We
-// use a PTP device provided by the hypervisor as a source of correct time (instead of
-// using a network server). We need to create a configuration file that configures chronyd
-// to use the PTP device.  The system can have multiple PTP devices so we identify the
-// correct PTP device by verifying that the `clock_name` of that device is `hyperv`.
-func startTimeSyncService() error {
-	ptpClassDir, err := os.Open("/sys/class/ptp")
-	if err != nil {
-		return errors.Wrap(err, "failed to open PTP class directory")
-	}
-
-	ptpDirList, err := ptpClassDir.Readdirnames(-1)
-	if err != nil {
-		return errors.Wrap(err, "failed to list PTP class directory")
-	}
-
-	var ptpDirPath string
-	found := false
-	// The file ends with a new line
-	expectedClockName := "hyperv\n"
-	for _, ptpDirPath = range ptpDirList {
-		clockNameFilePath := filepath.Join(ptpClassDir.Name(), ptpDirPath, "clock_name")
-		buf, err := os.ReadFile(clockNameFilePath)
-		if err != nil && !os.IsNotExist(err) {
-			return errors.Wrapf(err, "failed to read clock name file at %s", clockNameFilePath)
-		}
-
-		if string(buf) == expectedClockName {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return errors.Errorf("no PTP device found with name \"%s\"", expectedClockName)
-	}
-
-	// create chronyd config file
-	ptpDevPath := filepath.Join("/dev", filepath.Base(ptpDirPath))
-	// chronyd config file take from: https://docs.microsoft.com/en-us/azure/virtual-machines/linux/time-sync
-	chronydConfigString := fmt.Sprintf("refclock PHC %s poll 3 dpoll -2 offset 0 stratum 2\nmakestep 0.1 -1\n", ptpDevPath)
-	chronydConfPath := "/tmp/chronyd.conf"
-	err = os.WriteFile(chronydConfPath, []byte(chronydConfigString), 0644)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create chronyd conf file %s", chronydConfPath)
-	}
-
-	// start chronyd. Do NOT start chronyd as daemon because creating a daemon
-	// involves double forking the restart monitor will attempt to restart chornyd
-	// after the first fork child exits.
-	go runWithRestartMonitor("chronyd", "-n", "-f", chronydConfPath)
-	return nil
 }
 
 func initOtelTracer() (func(context.Context) error, error) {
@@ -499,6 +444,10 @@ func main() {
 	if err != nil {
 		logrus.WithError(err).Fatal("invalid GCS vsock peer selection")
 	}
+	waitForTimesync, err := timesyncWaitFromCommandLine(string(commandLine))
+	if err != nil {
+		logrus.WithError(err).Fatal("invalid GCS timesync wait selection")
+	}
 	tport := &transport.VsockTransport{PeerCID: peerCID, PeerPortStart: prot.LinuxGcsVsockPort}
 	logrus.WithField("peer_cid", peerCID).Info("GCS control and stdio peer selected; Plan9 retains root route")
 	rtime, err := runc.NewRuntime()
@@ -535,7 +484,7 @@ func main() {
 
 	// time synchronization service
 	if !(*disableTimeSync) {
-		if err = startTimeSyncService(); err != nil {
+		if err = startTimeSyncService(waitForTimesync); err != nil {
 			logrus.WithError(err).Fatal("failed to start time synchronization service")
 		}
 	}

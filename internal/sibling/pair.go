@@ -196,8 +196,9 @@ func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uv
 		base.SiblingRoot || strings.EqualFold(base.GuestStateFilePath, config.WorkloadGuestStateFile) {
 		return nil, nil, errors.New("sibling pair requires GCS, SNP dm-verity boot, a bundle directory and SCSI")
 	}
-	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 || len(base.AssignedDevices) != 0 {
-		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership or assigned devices")
+	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 ||
+		len(base.AssignedDevices) != 0 || base.TimesyncRelayID != nil {
+		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership, assigned devices or a timesync route")
 	}
 	// Each guest owns independent mutable option structs; policy bytes are unchanged.
 	clone := func(role Role, id, bundle string) (*uvm.OptionsLCOW, error) {

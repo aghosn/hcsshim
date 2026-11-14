@@ -13,7 +13,8 @@ package hcsschema
 
 // Configuration of a virtual machine, used during its creation to set up and/or use resources.
 type VirtualMachine struct {
-	Version *Version `json:"Version,omitempty"`
+	Version  *Version                `json:"Version,omitempty"`
+	Services *VirtualMachineServices `json:"Services,omitempty"`
 	// When set to true, the virtual machine will treat a reset as a stop, releasing resources and cleaning up state.
 	StopOnReset      bool              `json:"StopOnReset,omitempty"`
 	Chipset          *Chipset          `json:"Chipset,omitempty"`
