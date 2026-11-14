@@ -335,7 +335,7 @@ func (p *protectedPair) bootstrap(group string) error {
 	if root == nil {
 		return errors.New("protected root attachment returned no mount")
 	}
-	if err := p.stage(setup, &p.diode); err != nil {
+	if err := p.stageDiode(setup); err != nil {
 		return err
 	}
 	resolve, err := RPDeviceCommand(root.Controller(), root.LUN())
@@ -554,30 +554,22 @@ func (p *protectedPair) guest(ctx context.Context, v *protectedVMAttempt, script
 	return output, err
 }
 
-// stage mounts executable storage once, before diode services start. The
-// collector is /run/sibling-exec/ahv-guest-ctl only on the diode; no workload copy
-// replaces /usr/bin/ahv-guest-ctl from the verified root.
-// An optional writable output share is mounted only on the diode before services
-// and sealing; the VM owns cleanup and existing host captures are left untouched.
-func (p *protectedPair) stage(ctx context.Context, v *protectedVMAttempt) error {
-	names := []string{"sibling_bus.ko"}
-	if v == &p.diode {
-		names = protectedPairInputs()
-		if p.config.PageMetadataOutputPath != "" {
-			if err := v.vm.Share(ctx, p.config.PageMetadataOutputPath, "/run/page-metadata-results", false); err != nil {
-				return fmt.Errorf("share diode page metadata output: %w", err)
-			}
+// stageDiode provisions modules and tools only on the diode before its services
+// start. The workload uses its built-in adapter and verified-root tools.
+// The optional writable output share precedes services and sealing; the VM owns
+// cleanup and existing host captures are left untouched.
+func (p *protectedPair) stageDiode(ctx context.Context) error {
+	if p.config.PageMetadataOutputPath != "" {
+		if err := p.diode.vm.Share(ctx, p.config.PageMetadataOutputPath, "/run/page-metadata-results", false); err != nil {
+			return fmt.Errorf("share diode page metadata output: %w", err)
 		}
 	}
-	for _, name := range names {
-		if err := v.vm.Share(ctx, filepath.Join(p.config.ModuleDirectory, name), "/run/sibling/"+name, true); err != nil {
+	for _, name := range protectedPairInputs() {
+		if err := p.diode.vm.Share(ctx, filepath.Join(p.config.ModuleDirectory, name), "/run/sibling/"+name, true); err != nil {
 			return err
 		}
 	}
-	if v == &p.workload {
-		return nil
-	}
-	_, err := p.guest(ctx, v,
+	_, err := p.guest(ctx, &p.diode,
 		`mkdir /run/sibling-exec; mount -t tmpfs -o exec,size=16m tmpfs /run/sibling-exec; `+
 			`for tool in diode_iptables ahv-guest-ctl; do `+
 			`cp /run/sibling/$tool/$tool /run/sibling-exec/$tool; chmod 755 /run/sibling-exec/$tool; done`)
@@ -695,9 +687,6 @@ func (p *protectedPair) configure(ctx context.Context) error {
 	uplink, cleanup, err := AttachUplink(ctx, p.diode.vm)
 	p.pair.uplinkCleanup = cleanup
 	if err != nil {
-		return err
-	}
-	if err := p.stage(ctx, &p.workload); err != nil {
 		return err
 	}
 	device, err := p.configureNetwork(ctx, uplink, dns)
@@ -936,7 +925,9 @@ func (p *protectedPair) configureNetwork(ctx context.Context, uplink *Uplink, dn
 	})
 	// The workload can discover its NIC only after the provider starts.
 	group.Go(func() error {
-		output, err := p.guest(ctx, &p.workload, workloadNICCommand())
+		command := `[ -d /sys/bus/vmbus/drivers/sibling_bus ] || { echo 'protected workload requires the built-in sibling adapter' >&2; exit 1; }; ` +
+			workloadNICDiscoveryCommandForMAC("")
+		output, err := p.guest(ctx, &p.workload, command)
 		if err != nil {
 			return err
 		}

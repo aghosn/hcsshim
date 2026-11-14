@@ -109,8 +109,9 @@ func TestApplianceStorageRejectsAmbiguousBootSlots(t *testing.T) {
 }
 
 // TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment keeps diode Bootstrap roots
-// direct/read-only and Import workload roots mediated, just like ordinary sibling
-// routing. Document fixtures dispatch no model capability and allocate no VM.
+// direct/read-only and sibling roots mediated. Only the protected workload omits
+// RP controllers; its logical capacity remains available for sibling storage.
+// Document fixtures dispatch no model capability and allocate no VM.
 func TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -146,6 +147,14 @@ func TestVMGSSiblingRootOmitsOnlyWorkloadRPAttachment(t *testing.T) {
 			if test.protected && (doc.VirtualMachine.Devices.SharedMemory == nil ||
 				doc.VirtualMachine.Devices.SharedMemory.Regions[0] != opts.SharedMemoryRegions[0]) {
 				t.Fatal("document lost the protected startup region")
+			}
+			wantControllers := 1
+			if test.protected && siblingRoot {
+				wantControllers = 0
+			}
+			if len(doc.VirtualMachine.Devices.Scsi) != wantControllers || vm.scsiControllerCount != 1 {
+				t.Fatalf("RP controllers=%d, want %d; logical capacity=%d, want 1",
+					len(doc.VirtualMachine.Devices.Scsi), wantControllers, vm.scsiControllerCount)
 			}
 			controller := doc.VirtualMachine.Devices.Scsi[guestrequest.ScsiControllerGuids[0]]
 			attachment, attached := controller.Attachments["0"]
