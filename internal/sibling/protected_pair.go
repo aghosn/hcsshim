@@ -108,6 +108,11 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 	if err != nil {
 		return nil, err
 	}
+	if config.PageMetadataOutputPath != "" {
+		// The explicit export opts only the cloned diode into writable shares.
+		// Preserve the caller's and workload's inherited restrictions.
+		diode.NoWritableFileShares = false
+	}
 	if err := preflightProtectedPair(parent, config, workload, diode); err != nil {
 		return nil, err
 	}
