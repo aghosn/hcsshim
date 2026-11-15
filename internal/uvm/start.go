@@ -65,6 +65,35 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	return uvm.start(ctx, timeout.GCSConnectionTimeout)
 }
 
+// DisableBootEntropy closes the selected protected workload's boot entropy
+// listener before Start. The caller must serialize access to the unstarted VM.
+func (uvm *UtilityVM) DisableBootEntropy(ctx context.Context) error {
+	if uvm == nil {
+		return errors.New("utility VM is required")
+	}
+	if uvm.startInvoked.Load() {
+		return errors.New("boot entropy cannot be disabled after Start")
+	}
+	opts, ok := uvm.createOpts.(*OptionsLCOW)
+	if !ok || uvm.operatingSystem != "linux" || opts.ConfidentialLCOWOptions == nil || !opts.SiblingRoot ||
+		len(opts.SharedMemoryRegions) != 1 ||
+		ValidateProtectedSharedRegion(opts.SharedMemoryRegions[0]) != nil ||
+		opts.SharedMemoryRegions[0].ProtectedSharedBackingMode != hcsschema.ProtectedSharedBackingImport ||
+		len(opts.SiblingCommunicationEndpoints) != 1 ||
+		opts.SiblingCommunicationEndpoints[0].Role != hcsschema.SiblingCommunicationEndpointRoleWorkload {
+		return errors.New("boot entropy disablement requires a protected sibling-root workload")
+	}
+	if uvm.entropyListener == nil {
+		return errors.New("boot entropy listener is missing or already disabled")
+	}
+	if err := uvm.entropyListener.Close(); err != nil {
+		return fmt.Errorf("close boot entropy listener: %w", err)
+	}
+	uvm.entropyListener = nil
+	log.G(ctx).WithField(logfields.UVMID, uvm.id).Info("intentionally disabled protected workload boot entropy")
+	return nil
+}
+
 // StartWithGCSConnectionTimeout starts through the same core as Start with a
 // positive per-call connection budget. It never changes the process default;
 // an earlier parent deadline or cancellation still wins.

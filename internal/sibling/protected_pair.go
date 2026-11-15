@@ -475,7 +475,10 @@ func (p *protectedPair) configureGCSRelay(ctx context.Context) error {
 	if err := p.workload.vm.ConfigureGCSRelay(p.diode.vm); err != nil {
 		return err
 	}
-	return p.workload.vm.ConfigureGCSLogRelay(p.diode.vm)
+	if err := p.workload.vm.ConfigureGCSLogRelay(p.diode.vm); err != nil {
+		return err
+	}
+	return p.workload.vm.DisableBootEntropy(ctx)
 }
 
 // start retains native dispatch through its actual return and receipt observation,
