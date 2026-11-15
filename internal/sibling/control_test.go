@@ -13,6 +13,37 @@ import (
 	"time"
 )
 
+func TestStorageProviderDirectIOStartup(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell unavailable")
+	}
+	for _, test := range []struct {
+		name     string
+		directIO bool
+		reported string
+		status   int
+	}{
+		{"unchanged-default", false, "N", 0},
+		{"direct-enabled", true, "Y", 0},
+		{"buffered-rejected", true, "N", 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			script := `storage_dev=/dev/fixture; insmod() { printf '%s\n' "$*"; }; cat() { printf '%s\n' ` +
+				Quote(test.reported) + `; }; ` + storageProviderCommand(test.directIO)
+			command := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec", script)
+			output, err := command.CombinedOutput()
+			if command.ProcessState == nil || command.ProcessState.ExitCode() != test.status ||
+				strings.Contains(string(output), "direct_io=1") != test.directIO ||
+				!strings.Contains(string(output), "backends=/dev/fixture luns=0 read_only=true") {
+				t.Fatalf("provider startup: %v; output=%s", err, output)
+			}
+		})
+	}
+}
+
 func TestBootstrapCommandPreservesStatusOutputAndFailureDiagnostics(t *testing.T) {
 	shell, err := exec.LookPath("wsl.exe")
 	if err != nil {

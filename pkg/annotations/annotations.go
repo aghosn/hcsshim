@@ -142,6 +142,10 @@ const (
 	//
 	// 	/var/logs/containers/dir/a.logs
 	LCOWTeeLogDirMount = "io.microsoft.container.lcow.tee-log-dir-mount"
+
+	// LCOWVirtualDiskMounts is a JSON array of existing CRI mount destinations
+	// whose host sources are VHD/VHDX files, rather than Plan 9 shares.
+	LCOWVirtualDiskMounts = "io.microsoft.container.lcow.virtual-disk-mounts"
 )
 
 // LCOW multipod annotations enables multipod and warmpooling.

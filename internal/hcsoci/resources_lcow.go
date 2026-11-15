@@ -24,6 +24,9 @@ import (
 )
 
 func allocateLinuxResources(ctx context.Context, coi *createOptionsInternal, r *resources.Resources, isSandbox bool) error {
+	if err := applyLCOWVirtualDiskMounts(coi.Spec); err != nil {
+		return err
+	}
 	if coi.Spec.Root == nil {
 		coi.Spec.Root = &specs.Root{}
 	}
@@ -125,11 +128,7 @@ func allocateLinuxResources(ctx context.Context, coi *createOptionsInternal, r *
 
 				uvmPathForFile = scsiMount.GuestPath()
 				r.Add(scsiMount)
-				mt := "none"
-				if isBlockDev {
-					mt = "bind"
-				}
-				coi.Spec.Mounts[i].Type = mt
+				coi.Spec.Mounts[i] = lcowVirtualDiskContainerMount(mount, uvmPathForFile)
 			} else if mount.Type == MountTypeExtensibleVirtualDisk {
 				l.Debug("hcsshim::allocateLinuxResources Hot-adding ExtensbleVirtualDisk")
 				scsiMount, err := coi.HostingSystem.SCSIManager.AddExtensibleVirtualDisk(

@@ -19,6 +19,31 @@ import (
 	"github.com/urfave/cli"
 )
 
+func TestOwnedRuntimeAllowsVirtualDiskContainerAnnotation(t *testing.T) {
+	input := `[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runhcs-lcow]
+runtime_type='io.containerd.runhcs.v1'
+snapshotter='windows-lcow'
+container_annotations=['existing.*']
+`
+	root := t.TempDir()
+	output, err := isolatedRuntimeConfig([]byte(input), root, root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := toml.LoadBytes(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patterns := config.GetPath([]string{"plugins", "io.containerd.cri.v1.runtime", "containerd", "runtimes", "runhcs-sibling", "container_annotations"})
+	if fmt.Sprint(patterns) != "[io.microsoft.container.lcow.virtual-disk-mounts existing.*]" {
+		t.Fatalf("owned runtime lost virtual-disk opt-in or original annotations: %v", patterns)
+	}
+	if _, err := isolatedRuntimeConfig([]byte(strings.ReplaceAll(input,
+		"container_annotations=['existing.*']", "container_annotations=42")), root, root, ""); err == nil {
+		t.Fatal("accepted malformed original container annotations")
+	}
+}
+
 func TestBenchmarkClientRuntimeUsesOwnedUplinkCNI(t *testing.T) {
 	for _, plugin := range []string{"io.containerd.cri.v1.runtime", "io.containerd.grpc.v1.cri"} {
 		t.Run(plugin, func(t *testing.T) {

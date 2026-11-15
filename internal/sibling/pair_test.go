@@ -145,6 +145,34 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 	}
 }
 
+func TestPairStorageDirectIOOptIn(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		config := testConfig()
+		config.StorageDirectIO = enabled
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := decodeConfig(strings.NewReader(string(data)))
+		if err != nil || decoded.StorageDirectIO != enabled {
+			t.Fatalf("direct I/O opt-in did not survive decoding: %+v %v", decoded, err)
+		}
+	}
+	for _, config := range []*Config{
+		{Version: 1, Standalone: true, StorageDirectIO: true},
+		{Version: 1, ModuleDirectory: `C:\modules`, SharedMemoryBytes: 32 << 20,
+			WorkloadGuestStateFile: "sibling-root.vmgs", UnikraftPackage: `C:\unikraft`, StorageDirectIO: true},
+	} {
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeConfig(strings.NewReader(string(data))); err == nil {
+			t.Fatalf("accepted Linux provider setting for another backend: %s", data)
+		}
+	}
+}
+
 func TestPairBootstrapOverlapsWorkloadRootAndDiodeStartup(t *testing.T) {
 	waitingForRoot := make(chan struct{})
 	rootReady := make(chan struct{})

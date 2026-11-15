@@ -14,6 +14,7 @@ import (
 	runhcsopts "github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
 	"github.com/Microsoft/hcsshim/internal/hns"
 	"github.com/Microsoft/hcsshim/internal/sibling"
+	hcsannotations "github.com/Microsoft/hcsshim/pkg/annotations"
 	"github.com/pelletier/go-toml"
 	"github.com/urfave/cli"
 )
@@ -324,6 +325,24 @@ func isolatedRuntimeConfig(data []byte, root, runtimeDirectory, imageCacheRoot s
 		}
 	}
 	runtime.Set("pod_annotations", annotations)
+	containerAnnotations := []string{hcsannotations.LCOWVirtualDiskMounts}
+	if value := original.Get("container_annotations"); value != nil {
+		switch values := value.(type) {
+		case []interface{}:
+			for _, value := range values {
+				name, ok := value.(string)
+				if !ok {
+					return nil, errors.New("LCOW container_annotations must contain strings")
+				}
+				containerAnnotations = append(containerAnnotations, name)
+			}
+		case []string:
+			containerAnnotations = append(containerAnnotations, values...)
+		default:
+			return nil, errors.New("LCOW container_annotations must be an array")
+		}
+	}
+	runtime.Set("container_annotations", containerAnnotations)
 	target := append(append([]string(nil), selected[:len(selected)-1]...), "runhcs-sibling")
 	config.SetPath(target, runtime)
 	config.SetPath(append(append([]string(nil), selected[:3]...), "default_runtime_name"), "runhcs-sibling")

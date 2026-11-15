@@ -37,6 +37,7 @@ type Config struct {
 	WorkloadGuestStateFile string        `json:"workload_guest_state_file,omitempty"`
 	Interactive            bool          `json:"interactive,omitempty"`
 	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
+	StorageDirectIO        bool          `json:"storage_direct_io,omitempty"`
 	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
 	VMResources            []VMResources `json:"vm_resources,omitempty"`
 	PublishedTCPPorts      []uint16      `json:"published_tcp_ports,omitempty"`
@@ -83,7 +84,7 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	}
 	if config.Standalone {
 		if config.ModuleDirectory != "" || config.SharedMemoryBytes != 0 ||
-			config.MediateGCS || config.UnikraftPackage != "" || len(config.PublishedTCPPorts) != 0 {
+			config.MediateGCS || config.StorageDirectIO || config.UnikraftPackage != "" || len(config.PublishedTCPPorts) != 0 {
 			return nil, errors.New("standalone cannot configure a diode, shared memory, modules or GCS mediation")
 		}
 	} else if !filepath.IsAbs(config.ModuleDirectory) ||
@@ -99,6 +100,9 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	if config.UnikraftPackage != "" && (!filepath.IsAbs(config.UnikraftPackage) ||
 		config.SharedMemoryBytes != 32<<20) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
+	}
+	if config.StorageDirectIO && config.UnikraftPackage != "" {
+		return nil, errors.New("storage direct I/O requires a Linux diode")
 	}
 	if err := config.validateResources(); err != nil {
 		return nil, err
@@ -326,7 +330,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return err
 		}
 		if _, err := runBootstrapGuest(bootCtx, pair.Diode, "diode root provider", BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko")+
-			resolve+`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true`); err != nil {
+			resolve+storageProviderCommand(config.StorageDirectIO)); err != nil {
 			return fmt.Errorf("bootstrap permanent sibling root provider: %w", err)
 		}
 		uplink, cleanup, err := AttachUplink(bootCtx, pair.Diode)

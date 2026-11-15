@@ -19,6 +19,14 @@ import (
 
 const exportParameters = "/sys/module/diode_storvsp/parameters/"
 
+func storageProviderCommand(directIO bool) string {
+	command := `insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true`
+	if directIO {
+		command += ` direct_io=1; test "$(cat ` + exportParameters + `direct_io)" = Y`
+	}
+	return command
+}
+
 type commandRunner func(context.Context, string) (string, error)
 
 // ExportControl is the live diode_storvsp control plane. No failure, including a
