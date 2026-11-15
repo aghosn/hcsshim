@@ -296,10 +296,12 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 		{"stale-v3", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			command := strings.Replace(siblingInstanceDiscoveryCommand(),
-				"set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance;",
-				`fixture=$(mktemp); trap 'rm -f "$fixture"' EXIT; printf '%s\n' `+
-					shellSingleQuote(test.instance)+` >"$fixture"; set -- "$fixture";`, 1)
+			setup := `fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; printf '%s\n' ` +
+				shellSingleQuote(test.instance) + ` >"$fixture/sibling_instance"; `
+			command := strings.ReplaceAll(siblingInstanceDiscoveryCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture/sibling_instance"`)
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/missing-mode"`)
+			command = setup + command
 			command += `echo "INSTANCE_ACCEPTED bus=$sb_bus local=$sb_local peer=$sb_peer"`
 			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
 			if (err != nil) != test.wantFail {
@@ -329,6 +331,7 @@ func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
 	for _, test := range []struct {
 		name, instance, failure string
 		multiple                bool
+		acpi                    bool
 	}{
 		{name: "delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1"},
 		{name: "delayed-multiple", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1",
@@ -339,6 +342,13 @@ func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
 			failure: "protocol version mismatch expected=4"},
 		{name: "delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
 			failure: "local CID mismatch"},
+		{name: "ACPI-delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1", acpi: true},
+		{name: "ACPI-delayed-unready", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=0",
+			failure: "common peer instance timed out", acpi: true},
+		{name: "ACPI-delayed-old-version", instance: "bus_id=1 local_cid=4 peer_cid=3 version=3 ready=1",
+			failure: "protocol version mismatch expected=4", acpi: true},
+		{name: "ACPI-delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
+			failure: "local CID mismatch", acpi: true},
 	} {
 		// Each fixture publishes sysfs-shaped files only from the polling
 		// sleep callback; no VM, transport or native receipt is simulated.
@@ -348,15 +358,25 @@ func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
 			if test.multiple {
 				publish += `mkdir -p "$fixture/link-2"; cp "$fixture/link-1/sibling_instance" "$fixture/link-2/sibling_instance"; `
 			}
+			if test.acpi {
+				publish = strings.ReplaceAll(publish, "/link-1", "/acpi")
+			}
 			// The fixture sleep publishes once, after discovery has already
 			// seen an unmatched glob, and makes timeout cases deterministic.
 			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; polls=0; ` +
 				`sleep() { polls=$((polls+1)); if [ "$polls" -eq 1 ]; then ` + publish + `fi; }; `
+			mode := "N"
+			if test.acpi {
+				mode = "Y"
+			}
+			setup += `echo ` + mode + ` >"$fixture/mode"; `
 			command := siblingInstanceDiscoveryCommand() + siblingVsockReadyCommand(diodeRole)
 			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
 			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance",
 				`"$fixture"/*-*/sibling_instance`)
 			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/hv_sock", `"$fixture"`)
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+			command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi/sibling_instance", `"$fixture/acpi/sibling_instance"`)
 			command = setup + command + `echo "INSTANCE_ACCEPTED polls=$polls bus=$sb_bus local=$sb_local peer=$sb_peer"`
 			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
 			if test.failure == "" {
@@ -474,8 +494,8 @@ func TestSiblingGuestDiscoversInstanceOnce(t *testing.T) {
 	for _, role := range []string{diodeRole, workloadRole} {
 		command := siblingBusGuestModuleCommand("/run/sibling_bus.ko",
 			"", role, siblingNetConfig{ifName: "dvsc0"}, nil)
-		if strings.Count(command, "sb_instance=$1;") != 1 {
-			t.Fatal("guest setup must discover its bus exactly once")
+		if strings.Count(command, sibling.OwnerReadyCommand(false)) != 1 {
+			t.Fatal("guest setup must use shared owner discovery exactly once")
 		}
 		for _, expected := range []string{"/sibling_instance", `grep -q 'ready=1'`,
 			"sibling_vmbus: protocol version mismatch"} {
@@ -486,6 +506,118 @@ func TestSiblingGuestDiscoversInstanceOnce(t *testing.T) {
 		if role == workloadRole && strings.Index(command, "sb_bus=${1#*=}") >
 			strings.Index(command, "bus${sb_bus}-relid*") {
 			t.Fatal("bus discovery must precede NIC selection")
+		}
+	}
+}
+
+// TestSiblingStatisticsOwnerIsolation executes the production benchmark helper
+// with both owners present. Statistics must match mode and must not overwrite
+// the caller's discovered bus/owner while nested benchmark functions run.
+// Ordinary non-sibling guests retain empty, successful statistics; unready
+// owners remain diagnosable, while malformed mode is a hard failure.
+func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for sibling statistics fixtures")
+	}
+	for _, mode := range []string{"Y", "N", "missing", "invalid", "unreadable", "unready"} {
+		t.Run(mode, func(t *testing.T) {
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+				`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
+				`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/rp/link-1/sibling_instance"; ` +
+				`echo 'bus_id=2 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/acpi/sibling_instance"; ` +
+				`echo RP_STATS >"$fixture/rp/link-1/sibling_stats"; echo ACPI_STATS >"$fixture/acpi/sibling_stats"; `
+			if mode == "missing" {
+				setup += `rm "$fixture/mode"; rm -rf "$fixture/rp" "$fixture/acpi"; `
+			} else if mode == "unready" {
+				setup += `echo Y >"$fixture/mode"; sed -i 's/ready=1/ready=0/' "$fixture/acpi/sibling_instance"; `
+			} else if mode == "unreadable" {
+				setup += `rm "$fixture/mode"; mkdir "$fixture/mode"; `
+			}
+			start := strings.Index(iperfStage, sibling.DiscoveryShell)
+			end := strings.Index(iperfStage, "bdelta()")
+			command := iperfStage[start:end] + `sb_bus=caller_bus; sb_owner=caller_owner; ` +
+				`stats=$(bstat); printf '%s bus=%s owner=%s\n' "$stats" "$sb_bus" "$sb_owner"`
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+			command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+			output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c", setup+command).CombinedOutput()
+			want := "RP_STATS"
+			if mode == "Y" || mode == "unready" {
+				want = "ACPI_STATS"
+			} else if mode == "missing" {
+				want = ""
+			} else if mode == "invalid" || mode == "unreadable" {
+				if err == nil || !strings.Contains(string(output), mode+" mode") {
+					t.Fatalf("statistics accepted an explicitly invalid mode: %v\n%s", err, output)
+				}
+				return
+			}
+			if err != nil || !strings.Contains(string(output), want+" bus=caller_bus owner=caller_owner") {
+				t.Fatalf("statistics corrupted caller identity or read wrong owner: %v\n%s", err, output)
+			}
+		})
+	}
+	// Execute each production consumer under its real set +eu policy. The
+	// shell iperf interception changes mode after each completed traffic phase
+	// so all three ipbench assignments must independently propagate failure.
+	diode := siblingBusGuestModuleCommand("/bus.ko", "/net.ko", diodeRole,
+		siblingNetConfig{ifName: "dvsp0"}, &diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
+	for _, consumer := range []string{"ipbench-before", "ipbench-bulk", "ipbench-rr", "snap", "diode-s1", "diode-s2"} {
+		for _, mode := range []string{"missing", "unready", "invalid", "unreadable"} {
+			t.Run(consumer+"/"+mode, func(t *testing.T) {
+				setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+					`mkdir -p "$fixture/acpi"; echo Y >"$fixture/mode"; ` +
+					`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=0' >"$fixture/acpi/sibling_instance"; ` +
+					`echo 'doorbells=1 guest=2 messages=3' >"$fixture/acpi/sibling_stats"; `
+				mutate := `echo invalid >"$fixture/mode"; `
+				if mode == "unreadable" {
+					mutate = `rm -f "$fixture/mode"; mkdir "$fixture/mode"; `
+				} else if mode == "missing" {
+					mutate = `rm -f "$fixture/mode"; rm -rf "$fixture/acpi"; `
+				} else if mode == "unready" {
+					mutate = ":; "
+				}
+				start := strings.Index(iperfStage, sibling.DiscoveryShell)
+				command := iperfStage[start:]
+				setup += `traffic=0; ipf=fixture_iperf; ` +
+					`fixture_iperf() { traffic=$((traffic+1)); `
+				if consumer == "ipbench-bulk" {
+					setup += mutate
+				} else if consumer == "ipbench-rr" {
+					setup += `if [ "$traffic" -eq 2 ]; then ` + mutate + `fi; `
+				}
+				setup += `echo '1 Mbits/sec'; }; `
+				if consumer != "ipbench-bulk" && consumer != "ipbench-rr" {
+					setup += mutate
+				}
+				switch consumer {
+				case "snap":
+					i := strings.Index(siblingWorkloadStage, "snap()")
+					command += siblingWorkloadStage[i:] + `snap; `
+				case "diode-s1", "diode-s2":
+					name := strings.TrimPrefix(consumer, "diode-")
+					i := strings.Index(diode, name+"=$(bstat)")
+					if i < 0 {
+						t.Fatalf("production diode consumer %s missing", name)
+					}
+					// Include its actual explicit propagation, not a fixture guard.
+					j := strings.Index(diode[i:], ";")
+					command += diode[i : i+j+1]
+				default:
+					command += `ipbench fixture 192.0.2.1 5201 1; `
+				}
+				command = strings.ReplaceAll(command, "/tmp/ipf-$1", `"$fixture/ipf-$1"`)
+				command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+				command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+				command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+				output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+					setup+`set +eu; `+command+`echo CONSUMER_FINISHED`).CombinedOutput()
+				fail := mode == "invalid" || mode == "unreadable"
+				if (err != nil) != fail || strings.Contains(string(output), "CONSUMER_FINISHED") == fail {
+					t.Fatalf("consumer masked failure or rejected legacy success: %v\n%s", err, output)
+				}
+			})
 		}
 	}
 }
@@ -553,6 +685,38 @@ func TestSiblingFailuresIncludeDeviceStateAndUnfilteredKernelLog(t *testing.T) {
 		}
 		if strings.Contains(command, "dmesg | grep") {
 			t.Fatal("failure diagnostics must not hide stock-driver probe errors")
+		}
+	}
+	// An unready owner still has useful identity/counters. Invalid mode must
+	// not read either owner or prevent the remaining kernel diagnostics.
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for selected-owner failure diagnostics")
+	}
+	for _, mode := range []string{"Y", "N", "invalid"} {
+		setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+			`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
+			`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=0' >"$fixture/acpi/sibling_instance"; ` +
+			`cp "$fixture/acpi/sibling_instance" "$fixture/rp/link-1/sibling_instance"; ` +
+			`echo ACPI_STATS >"$fixture/acpi/sibling_stats"; echo RP_STATS >"$fixture/rp/link-1/sibling_stats"; `
+		command := siblingFailureDiagnosticsCommand()
+		command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+		command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+		command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+		command = strings.ReplaceAll(command, "/sys/class/net/*", `"$fixture/no-net"/*`)
+		command = strings.ReplaceAll(command, "/sys/bus/vmbus/devices/bus*-relid*", `"$fixture/no-devices"/*`)
+		output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+			setup+command+`echo DIAGNOSTICS_FINISHED`).CombinedOutput()
+		want, forbidden := "RP_STATS", "ACPI_STATS"
+		if mode == "Y" {
+			want, forbidden = forbidden, want
+		} else if mode == "invalid" {
+			want = "invalid mode"
+		}
+		if err != nil || !strings.Contains(string(output), want) ||
+			strings.Contains(string(output), forbidden) || !strings.Contains(string(output), "DIAGNOSTICS_FINISHED") ||
+			(mode == "invalid" && strings.Contains(string(output), "RP_STATS")) {
+			t.Fatalf("failure diagnostics lost or mixed selected owner %s: %v\n%s", mode, err, output)
 		}
 	}
 }

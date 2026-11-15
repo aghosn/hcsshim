@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -306,6 +307,53 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 		run := strings.Index(command, "/bin/sh /run/dtb-exec/network-benchmark.sh")
 		if stage < 0 || stage >= run {
 			t.Fatal("diagnostic helper must be staged before the workload or baseline benchmark starts")
+		}
+	}
+	// Execute the real literal-integration tail in a fresh shell. A parent
+	// definition alone cannot select the standalone script's statistics owner.
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for fresh-shell discovery integration")
+	}
+	for _, mode := range []string{"Y", "N", "baseline-missing-plan", "baseline-write-failure"} {
+		command := networkBenchmarkClient(c, "workload")
+		if strings.HasPrefix(mode, "baseline-") {
+			command = networkBenchmarkClient(c, "baseline")
+		}
+		command = command[strings.Index(command, `{ printf '%s\n'`):]
+		setup := `set -eu; fixture=$(mktemp -d); export fixture; trap 'rm -rf "$fixture"' EXIT; ` +
+			`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
+			`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/acpi/sibling_instance"; ` +
+			`cp "$fixture/acpi/sibling_instance" "$fixture/rp/link-1/sibling_instance"; ` +
+			`echo ACPI_STATS >"$fixture/acpi/sibling_stats"; echo RP_STATS >"$fixture/rp/link-1/sibling_stats"; ` +
+			`printf '%s\n' 'set -eu; sibling_owner 0; cat "$sb_owner/sibling_stats"' >"$fixture/plan"; `
+		command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+		command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+		command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+		command = strings.ReplaceAll(command, shellSingleQuote("/run/network-benchmark/"+filepath.Base(c.String(networkBenchmarkScriptArgName))), `"$fixture/plan"`)
+		command = strings.ReplaceAll(command, "/run/dtb-exec/network-benchmark.sh", `"$fixture/run.sh"`)
+		if mode == "baseline-missing-plan" {
+			setup += `rm "$fixture/plan"; `
+		} else if mode == "baseline-write-failure" {
+			setup += `mkdir "$fixture/run.sh"; `
+		}
+		// baselineNICUp deliberately disables errexit/nounset; staging must
+		// fail explicitly rather than executing a successful prefix-only file.
+		output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+			setup+`set +eu; `+command+`echo LAUNCH_FINISHED`).CombinedOutput()
+		if strings.HasPrefix(mode, "baseline-") {
+			if err == nil || !strings.Contains(string(output), "script staging failed") ||
+				strings.Contains(string(output), "LAUNCH_FINISHED") {
+				t.Fatalf("baseline staging failure was masked %s: %v\n%s", mode, err, output)
+			}
+			continue
+		}
+		want := "RP_STATS"
+		if mode == "Y" {
+			want = "ACPI_STATS"
+		}
+		if err != nil || strings.TrimSpace(string(output)) != want+"\nLAUNCH_FINISHED" {
+			t.Fatalf("fresh shell failed to use shared mode policy %s: %v\n%s", mode, err, output)
 		}
 	}
 }

@@ -1808,7 +1808,7 @@ const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + siblingVsockSta
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
 	`for p in /sys/bus/vmbus/devices/*; do case ${p##*/} in bus*-relid*) continue;; esac; ` +
 	`for f in "$p"/channels/*/interrupts; do [ -r "$f" ] && c=$((c+$(cat "$f"))); done; done; ` +
-	`set -- $(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
+	`sb_snapshot_stats=$(bstat) || exit $?; set -- $sb_snapshot_stats; d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
 	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
 	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; `
 
@@ -1938,8 +1938,9 @@ func siblingFailureDiagnosticsCommand() string {
 		`echo "sibling_vmbus: device=${p##*/} driver=$(readlink "$p/driver" 2>/dev/null)" >&2; ` +
 		`for a in state in_read_index in_write_index out_read_index out_write_index; do ` +
 		`[ ! -r "$p/$a" ] || { echo "sibling_vmbus: $a=$(cat "$p/$a")" >&2; }; done; done; ` +
-		`for p in /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats; do ` +
-		`[ ! -r "$p" ] || { echo "$p" >&2; cat "$p" >&2; }; done; ` +
+		`( ` + sibling.DiscoveryShell + `if sibling_owner 0 || [ "$?" -eq 1 ]; then ` +
+		`for p in "$sb_owner/sibling_instance" "$sb_owner/sibling_stats"; do ` +
+		`[ ! -r "$p" ] || { echo "$p" >&2; cat "$p" >&2; }; done; fi; ); ` +
 		`dmesg >&2 || true; `
 }
 
@@ -1963,10 +1964,7 @@ const siblingTransportVersion = sibling.TransportVersion
 // re-expands the glob because the peer's native Start may not have offered a
 // link when early diode bootstrap begins.
 func siblingInstanceDiscoveryCommand() string {
-	return guestWaitFor(`set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; `+
-		`[ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; exit 1; }; `+
-		`sb_instance=$1; `+
-		`[ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance"`, "common peer instance") +
+	return sibling.DiscoveryShell + guestWaitFor(sibling.OwnerReadyCommand(false), "common peer instance") +
 		`set -- $(cat "$sb_instance"); sb_bus=${1#*=}; sb_local=${2#*=}; sb_peer=${3#*=}; ` +
 		fmt.Sprintf(`[ "${4#*=}" = %d ] || { echo "sibling_vmbus: protocol version mismatch expected=%d actual=${4#*=}" >&2; `+
 			`%sexit 1; }; `, siblingTransportVersion, siblingTransportVersion, siblingFailureDiagnosticsCommand())
@@ -2083,11 +2081,11 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 				"(\"$dtb\" sink 5004 >/tmp/dn-go 2>&1 &); " +
 				fmt.Sprintf("i=0; until grep -q sink /tmp/dn-go 2>/dev/null; do i=$((i+1)); [ $i -le %d ] || break; sleep 1; done; ",
 					2*benchSeconds+180) +
-				"s1=$(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); " +
+				"s1=$(bstat) || exit $?; " +
 				siblingDiodeNATCommand(uplink) +
 				"(\"$dtb\" sink 5002 >/tmp/dn-tcp2 2>&1 &); " +
 				"i=0; until grep -q sink /tmp/dn-tcp2 2>/dev/null; do i=$((i+1)); [ $i -le 120 ] || break; sleep 1; done; " +
-				"s2=$(cat /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_stats); "
+				"s2=$(bstat) || exit $?; "
 		}
 		// The workload benchmarks the host endpoint before closing. Each
 		// second, report memory, swiotlb use, forwarding counters and new

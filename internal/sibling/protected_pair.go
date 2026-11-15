@@ -475,7 +475,10 @@ func (p *protectedPair) configureGCSRelay(ctx context.Context) error {
 	if err := p.workload.vm.ConfigureGCSRelay(p.diode.vm); err != nil {
 		return err
 	}
-	return p.workload.vm.ConfigureGCSLogRelay(p.diode.vm)
+	if err := p.workload.vm.ConfigureGCSLogRelay(p.diode.vm); err != nil {
+		return err
+	}
+	return p.workload.vm.DisableBootEntropy(ctx)
 }
 
 // start retains native dispatch through its actual return and receipt observation,
@@ -962,8 +965,7 @@ func (p *protectedPair) configureNetwork(ctx context.Context, uplink *Uplink, dn
 	})
 	// The workload can discover its NIC only after the provider starts.
 	group.Go(func() error {
-		command := `[ -d /sys/bus/vmbus/drivers/sibling_bus ] || { echo 'protected workload requires the built-in sibling adapter' >&2; exit 1; }; ` +
-			workloadNICDiscoveryCommandForMAC("")
+		command := workloadNICDiscoveryCommand("", true)
 		output, err := p.guest(ctx, &p.workload, command)
 		if err != nil {
 			return err
