@@ -250,6 +250,62 @@ func hostProcessorTopology(ctx context.Context) (*hcsschema.ProcessorTopology, e
 	return &topology, nil
 }
 
+func validateBenchmarkCPUPlacement(c *cli.Context, topology *hcsschema.ProcessorTopology, groups [][]uint32) error {
+	if !c.Bool(networkBenchmarkSMTOffPlacementArgName) {
+		return validateBenchmarkCPUs(topology, groups, c.Bool(networkBenchmarkNoSMTArgName), requestedVMProcessors(c, "uvmboot-0"))
+	}
+	if !c.Bool(networkBenchmarkNoSMTArgName) || c.String(networkBenchmarkScriptArgName) == "" ||
+		c.String(storageBenchmarkScriptArgName) != "" {
+		return errors.New("SMT-off debugging placement requires a network-only benchmark with --network-benchmark-no-smt")
+	}
+	resources, err := resolvedVMResources(c)
+	if err != nil {
+		return err
+	}
+	if topology == nil || len(groups) < 1 || len(groups) > 2 || len(groups) != len(resources) {
+		return errors.New("SMT-off debugging requires host topology and one affinity per VM")
+	}
+	byLP := map[uint32]hcsschema.LogicalProcessor{}
+	rootCores := map[string]bool{}
+	for _, lp := range topology.LogicalProcessors {
+		if _, exists := byLP[lp.LpIndex]; exists || lp.RootVpIndex < -1 {
+			return fmt.Errorf("invalid or duplicate LP %d in host topology", lp.LpIndex)
+		}
+		byLP[lp.LpIndex] = lp
+		if lp.RootVpIndex >= 0 {
+			rootCores[fmt.Sprintf("%d:%d", lp.PackageId, lp.CoreId)] = true
+		}
+	}
+	selectedCores := map[string]uint32{}
+	var node uint8
+	for i, group := range groups {
+		if _, _, err := canonicalLPs(group); err != nil || len(group) > 2 ||
+			resources[i].ProcessorCount < 1 || resources[i].ProcessorCount > 2 ||
+			int(resources[i].ProcessorCount) > len(group) {
+			return fmt.Errorf("SMT-off benchmark VM %d requires one or two distinct LPs covering its requested VPs", i)
+		}
+		for j, index := range group {
+			lp, exists := byLP[index]
+			if !exists {
+				return fmt.Errorf("SMT-off benchmark affinity includes nonexistent LP %d", index)
+			}
+			core := fmt.Sprintf("%d:%d", lp.PackageId, lp.CoreId)
+			if rootCores[core] {
+				return fmt.Errorf("SMT-off benchmark LP %d belongs to a root-partition physical core", index)
+			}
+			if previous, exists := selectedCores[core]; exists && previous != index {
+				return errors.New("SMT-off debugging requires one selected LP per physical core")
+			}
+			selectedCores[core] = index
+			if (i != 0 || j != 0) && node != lp.NodeNumber {
+				return errors.New("SMT-off benchmark physical cores must be in the same NUMA node")
+			}
+			node = lp.NodeNumber
+		}
+	}
+	return nil
+}
+
 func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uint32, noSMT bool, processors uint64) error {
 	if topology == nil || len(groups) < 1 || len(groups) > 2 || (processors != 1 && processors != 2) {
 		return errors.New("benchmark requires host topology, one or two VM affinities, and one or two VPs per VM")

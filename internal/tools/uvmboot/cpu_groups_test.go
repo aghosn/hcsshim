@@ -579,3 +579,101 @@ func TestBenchmarkSingleVPRequiresCompleteCore(t *testing.T) {
 		}
 	}
 }
+
+func TestBenchmarkSMTOffDebugPlacement(t *testing.T) {
+	tests := []struct {
+		name       string
+		processors string
+		groups     [][]uint32
+	}{
+		{"linux-shared-one-core", "1,1", [][]uint32{{8}, {8}}},
+		{"linux-shared-two-cores", "1,2", [][]uint32{{8, 9}, {8, 9}}},
+		{"linux-shared-one-core-overlap", "1,2", [][]uint32{{8}, {8, 9}}},
+		{"unikraft-shared-one-core", "1,1", [][]uint32{{8}, {8}}},
+		{"unikraft-shared-two-cores", "1,2", [][]uint32{{8, 9}, {8, 9}}},
+		{"unikraft-shared-one-core-overlap", "1,2", [][]uint32{{8}, {8, 9}}},
+		{"linux-separate-1vp", "1,2", [][]uint32{{10}, {8, 9}}},
+		{"linux-separate-2vp", "2,2", [][]uint32{{10, 11}, {8, 9}}},
+		{"unikraft-separate-1vp", "1,2", [][]uint32{{10}, {8, 9}}},
+		{"baseline", "2", [][]uint32{{8, 9}}},
+	}
+	for _, siblingTopology := range []bool{false, true} {
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("%s/siblingTopology=%v", test.name, siblingTopology), func(t *testing.T) {
+				topology := &hcsschema.ProcessorTopology{LogicalProcessors: []hcsschema.LogicalProcessor{
+					{LpIndex: 0, CoreId: 0, RootVpIndex: 0},
+				}}
+				for index := uint32(8); index < 12; index++ {
+					topology.LogicalProcessors = append(topology.LogicalProcessors,
+						hcsschema.LogicalProcessor{LpIndex: index, CoreId: index, RootVpIndex: -1})
+					if siblingTopology {
+						topology.LogicalProcessors = append(topology.LogicalProcessors,
+							hcsschema.LogicalProcessor{LpIndex: index + 16, CoreId: index, RootVpIndex: -1})
+					}
+				}
+				c := benchmarkTestContext(t, "--network-benchmark-script", "fixture.sh",
+					"--network-benchmark-no-smt", "--network-benchmark-smt-off-placement")
+				for key, value := range map[string]string{
+					countArgName: strconv.Itoa(len(test.groups)), vmCPUsArgName: test.processors,
+				} {
+					if err := c.GlobalSet(key, value); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := validateBenchmarkCPUPlacement(c, topology, test.groups); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestBenchmarkSMTOffDebugRejectsInvalidPlacement(t *testing.T) {
+	topology := &hcsschema.ProcessorTopology{LogicalProcessors: []hcsschema.LogicalProcessor{
+		{LpIndex: 0, CoreId: 0, RootVpIndex: 0},
+		{LpIndex: 8, CoreId: 8, RootVpIndex: -1},
+		{LpIndex: 24, CoreId: 8, RootVpIndex: 1},
+		{LpIndex: 9, CoreId: 9, RootVpIndex: -1},
+		{LpIndex: 25, CoreId: 9, RootVpIndex: -1},
+		{LpIndex: 10, CoreId: 10, RootVpIndex: -1},
+		{LpIndex: 11, CoreId: 11, RootVpIndex: -1},
+		{LpIndex: 12, CoreId: 12, NodeNumber: 1, RootVpIndex: -1},
+	}}
+	for _, test := range []struct {
+		name       string
+		processors string
+		groups     [][]uint32
+	}{
+		{"missing LP", "1", [][]uint32{{99}}},
+		{"root LP", "1", [][]uint32{{0}}},
+		{"root-owned sibling", "1", [][]uint32{{8}}},
+		{"duplicate LP", "2", [][]uint32{{9, 9}}},
+		{"too few LPs for workload", "1,2", [][]uint32{{10}, {9}}},
+		{"siblings within group", "2", [][]uint32{{9, 25}}},
+		{"siblings across groups", "1,1", [][]uint32{{9}, {25}}},
+		{"cross NUMA", "1,1", [][]uint32{{9}, {12}}},
+		{"too many LPs", "2", [][]uint32{{9, 10, 11}}},
+		{"empty group", "1", [][]uint32{{}}},
+		{"invalid VP count", "3", [][]uint32{{9, 10}}},
+		{"missing group", "1,2", [][]uint32{{9}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := benchmarkTestContext(t, "--network-benchmark-script", "fixture.sh",
+				"--network-benchmark-no-smt", "--network-benchmark-smt-off-placement")
+			for key, value := range map[string]string{
+				countArgName: strconv.Itoa(strings.Count(test.processors, ",") + 1), vmCPUsArgName: test.processors,
+			} {
+				if err := c.GlobalSet(key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := validateBenchmarkCPUPlacement(c, topology, test.groups); err == nil {
+				t.Fatal("invalid debugging placement accepted")
+			}
+		})
+	}
+	c := benchmarkTestContext(t, "--network-benchmark-script", "fixture.sh", "--network-benchmark-no-smt")
+	if err := validateBenchmarkCPUPlacement(c, topology, [][]uint32{{9}}); err == nil {
+		t.Fatal("ordinary benchmark implicitly opted into debugging placement")
+	}
+}

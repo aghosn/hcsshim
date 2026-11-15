@@ -417,3 +417,14 @@ func TestNetworkBenchmarkNoSMTRecordsTopologyAndPreservesPreflight(t *testing.T)
 		t.Fatal("SMT-off flag accepted outside a benchmark")
 	}
 }
+
+func TestNetworkBenchmarkSMTOffPlacementRequiresExplicitNetworkMode(t *testing.T) {
+	for _, args := range [][]string{
+		{"--network-benchmark-smt-off-placement"},
+		{"--network-benchmark-script", "fixture.sh", "--network-benchmark-smt-off-placement"},
+	} {
+		if err := validateNetworkBenchmark(benchmarkTestContext(t, args...), nil); err == nil {
+			t.Fatalf("accepted SMT-off placement without script or no-SMT policy: %v", args)
+		}
+	}
+}

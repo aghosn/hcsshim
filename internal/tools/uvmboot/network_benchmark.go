@@ -23,14 +23,15 @@ import (
 )
 
 const (
-	networkBenchmarkScriptArgName    = "network-benchmark-script"
-	networkBenchmarkServerArgName    = "network-benchmark-server"
-	networkBenchmarkPortArgName      = "network-benchmark-port"
-	networkBenchmarkTimeoutArgName   = "network-benchmark-timeout"
-	networkBenchmarkNoSMTArgName     = "network-benchmark-no-smt"
-	networkBenchmarkIdleArgName      = "network-benchmark-idle"
-	networkBenchmarkDiodeIdleArgName = "network-benchmark-diode-idle"
-	networkBenchmarkWorkloadVMGS     = "network-workload.vmgs"
+	networkBenchmarkScriptArgName          = "network-benchmark-script"
+	networkBenchmarkServerArgName          = "network-benchmark-server"
+	networkBenchmarkPortArgName            = "network-benchmark-port"
+	networkBenchmarkTimeoutArgName         = "network-benchmark-timeout"
+	networkBenchmarkNoSMTArgName           = "network-benchmark-no-smt"
+	networkBenchmarkSMTOffPlacementArgName = "network-benchmark-smt-off-placement"
+	networkBenchmarkIdleArgName            = "network-benchmark-idle"
+	networkBenchmarkDiodeIdleArgName       = "network-benchmark-diode-idle"
+	networkBenchmarkWorkloadVMGS           = "network-workload.vmgs"
 )
 
 func networkBenchmarkDiodeIdlePolicy(c *cli.Context) string {
@@ -93,10 +94,14 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
 			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
-			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkDiodeIdleArgName) {
+			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkDiodeIdleArgName) ||
+			c.IsSet(networkBenchmarkSMTOffPlacementArgName) {
 			return errors.New("network benchmark server, port and timeout require --network-benchmark-script")
 		}
 		return nil
+	}
+	if c.Bool(networkBenchmarkSMTOffPlacementArgName) && !c.Bool(networkBenchmarkNoSMTArgName) {
+		return errors.New("SMT-off debugging placement requires --network-benchmark-no-smt")
 	}
 	if idle := c.String(networkBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
 		return errors.New("network benchmark idle policy must be poll or halt")

@@ -314,6 +314,10 @@ var lcowCommand = cli.Command{
 			Name:  networkBenchmarkNoSMTArgName,
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
+		cli.BoolFlag{
+			Name:  networkBenchmarkSMTOffPlacementArgName,
+			Usage: "Use caller-verified SMT-off debugging placement with one LP per physical core and per-VM VP counts.",
+		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
 			Value: "poll",
@@ -406,7 +410,7 @@ var lcowCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			if err := validateBenchmarkCPUs(topology, cpuGroupLPs, c.Bool(networkBenchmarkNoSMTArgName), requestedVMProcessors(c, "uvmboot-0")); err != nil {
+			if err := validateBenchmarkCPUPlacement(c, topology, cpuGroupLPs); err != nil {
 				return err
 			}
 			siblingTests = map[string]bool{}
