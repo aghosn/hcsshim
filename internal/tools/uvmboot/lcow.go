@@ -1808,7 +1808,7 @@ const siblingWorkloadStage = `set +eu; ` + siblingTCPBulkStage + siblingVsockSta
 	`for v; do case $v in *[!0-9]*) break;; esac; h=$((h+v)); done; c=0; ` +
 	`for p in /sys/bus/vmbus/devices/*; do case ${p##*/} in bus*-relid*) continue;; esac; ` +
 	`for f in "$p"/channels/*/interrupts; do [ -r "$f" ] && c=$((c+$(cat "$f"))); done; done; ` +
-	`set -- $(bstat); d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
+	`sb_snapshot_stats=$(bstat) || exit $?; set -- $sb_snapshot_stats; d=${1#*=}; g=${2#*=}; m=${3#*=}; ` +
 	`read u _ < /proc/uptime; t=${u%.*}${u#*.}; ` +
 	`b=$(cat /sys/class/net/dvsc0/statistics/tx_bytes); r=$(cat /sys/class/net/dvsc0/statistics/rx_bytes); }; `
 
@@ -2081,11 +2081,11 @@ func siblingBusGuestModuleCommand(modulePath, netModulePath, role string,
 				"(\"$dtb\" sink 5004 >/tmp/dn-go 2>&1 &); " +
 				fmt.Sprintf("i=0; until grep -q sink /tmp/dn-go 2>/dev/null; do i=$((i+1)); [ $i -le %d ] || break; sleep 1; done; ",
 					2*benchSeconds+180) +
-				"s1=$(bstat); " +
+				"s1=$(bstat) || exit $?; " +
 				siblingDiodeNATCommand(uplink) +
 				"(\"$dtb\" sink 5002 >/tmp/dn-tcp2 2>&1 &); " +
 				"i=0; until grep -q sink /tmp/dn-tcp2 2>/dev/null; do i=$((i+1)); [ $i -le 120 ] || break; sleep 1; done; " +
-				"s2=$(bstat); "
+				"s2=$(bstat) || exit $?; "
 		}
 		// The workload benchmarks the host endpoint before closing. Each
 		// second, report memory, swiotlb use, forwarding counters and new

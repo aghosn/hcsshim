@@ -315,8 +315,11 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 	if err != nil {
 		t.Fatal("WSL is required for fresh-shell discovery integration")
 	}
-	for _, mode := range []string{"Y", "N"} {
+	for _, mode := range []string{"Y", "N", "baseline-missing-plan", "baseline-write-failure"} {
 		command := networkBenchmarkClient(c, "workload")
+		if strings.HasPrefix(mode, "baseline-") {
+			command = networkBenchmarkClient(c, "baseline")
+		}
 		command = command[strings.Index(command, `{ printf '%s\n'`):]
 		setup := `set -eu; fixture=$(mktemp -d); export fixture; trap 'rm -rf "$fixture"' EXIT; ` +
 			`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
@@ -329,12 +332,27 @@ func TestNetworkBenchmarkCommandsEnforceModeAndDoNotStartLegacyTests(t *testing.
 		command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
 		command = strings.ReplaceAll(command, shellSingleQuote("/run/network-benchmark/"+filepath.Base(c.String(networkBenchmarkScriptArgName))), `"$fixture/plan"`)
 		command = strings.ReplaceAll(command, "/run/dtb-exec/network-benchmark.sh", `"$fixture/run.sh"`)
-		output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c", setup+command).CombinedOutput()
+		if mode == "baseline-missing-plan" {
+			setup += `rm "$fixture/plan"; `
+		} else if mode == "baseline-write-failure" {
+			setup += `mkdir "$fixture/run.sh"; `
+		}
+		// baselineNICUp deliberately disables errexit/nounset; staging must
+		// fail explicitly rather than executing a successful prefix-only file.
+		output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+			setup+`set +eu; `+command+`echo LAUNCH_FINISHED`).CombinedOutput()
+		if strings.HasPrefix(mode, "baseline-") {
+			if err == nil || !strings.Contains(string(output), "script staging failed") ||
+				strings.Contains(string(output), "LAUNCH_FINISHED") {
+				t.Fatalf("baseline staging failure was masked %s: %v\n%s", mode, err, output)
+			}
+			continue
+		}
 		want := "RP_STATS"
 		if mode == "Y" {
 			want = "ACPI_STATS"
 		}
-		if err != nil || strings.TrimSpace(string(output)) != want {
+		if err != nil || strings.TrimSpace(string(output)) != want+"\nLAUNCH_FINISHED" {
 			t.Fatalf("fresh shell failed to use shared mode policy %s: %v\n%s", mode, err, output)
 		}
 	}

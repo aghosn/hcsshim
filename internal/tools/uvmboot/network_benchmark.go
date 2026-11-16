@@ -218,8 +218,8 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		networkBenchmarkDiagnosticStage(script) +
-		`{ printf '%s\n' ` + shellSingleQuote(discovery) + `; cat ` + shellSingleQuote(script) +
-		`; } >/run/dtb-exec/network-benchmark.sh; ` +
+		`{ printf '%s\n' ` + shellSingleQuote(discovery) + ` && cat ` + shellSingleQuote(script) +
+		`; } >/run/dtb-exec/network-benchmark.sh || { echo 'network_benchmark: FAIL script staging failed' >&2; exit 1; }; ` +
 		`/bin/sh /run/dtb-exec/network-benchmark.sh ` + server + ` ` +
 		fmt.Sprint(c.Int(networkBenchmarkPortArgName)) + `; `
 }

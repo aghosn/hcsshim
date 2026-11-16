@@ -520,7 +520,7 @@ func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal("WSL is required for sibling statistics fixtures")
 	}
-	for _, mode := range []string{"Y", "N", "missing", "invalid", "unready"} {
+	for _, mode := range []string{"Y", "N", "missing", "invalid", "unreadable", "unready"} {
 		t.Run(mode, func(t *testing.T) {
 			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
 				`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
@@ -531,6 +531,8 @@ func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
 				setup += `rm "$fixture/mode"; rm -rf "$fixture/rp" "$fixture/acpi"; `
 			} else if mode == "unready" {
 				setup += `echo Y >"$fixture/mode"; sed -i 's/ready=1/ready=0/' "$fixture/acpi/sibling_instance"; `
+			} else if mode == "unreadable" {
+				setup += `rm "$fixture/mode"; mkdir "$fixture/mode"; `
 			}
 			start := strings.Index(iperfStage, sibling.DiscoveryShell)
 			end := strings.Index(iperfStage, "bdelta()")
@@ -545,8 +547,8 @@ func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
 				want = "ACPI_STATS"
 			} else if mode == "missing" {
 				want = ""
-			} else if mode == "invalid" {
-				if err == nil || !strings.Contains(string(output), "invalid mode") {
+			} else if mode == "invalid" || mode == "unreadable" {
+				if err == nil || !strings.Contains(string(output), mode+" mode") {
 					t.Fatalf("statistics accepted an explicitly invalid mode: %v\n%s", err, output)
 				}
 				return
@@ -555,6 +557,68 @@ func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
 				t.Fatalf("statistics corrupted caller identity or read wrong owner: %v\n%s", err, output)
 			}
 		})
+	}
+	// Execute each production consumer under its real set +eu policy. The
+	// shell iperf interception changes mode after each completed traffic phase
+	// so all three ipbench assignments must independently propagate failure.
+	diode := siblingBusGuestModuleCommand("/bus.ko", "/net.ko", diodeRole,
+		siblingNetConfig{ifName: "dvsp0"}, &diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
+	for _, consumer := range []string{"ipbench-before", "ipbench-bulk", "ipbench-rr", "snap", "diode-s1", "diode-s2"} {
+		for _, mode := range []string{"missing", "unready", "invalid", "unreadable"} {
+			t.Run(consumer+"/"+mode, func(t *testing.T) {
+				setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+					`mkdir -p "$fixture/acpi"; echo Y >"$fixture/mode"; ` +
+					`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=0' >"$fixture/acpi/sibling_instance"; ` +
+					`echo 'doorbells=1 guest=2 messages=3' >"$fixture/acpi/sibling_stats"; `
+				mutate := `echo invalid >"$fixture/mode"; `
+				if mode == "unreadable" {
+					mutate = `rm -f "$fixture/mode"; mkdir "$fixture/mode"; `
+				} else if mode == "missing" {
+					mutate = `rm -f "$fixture/mode"; rm -rf "$fixture/acpi"; `
+				} else if mode == "unready" {
+					mutate = ":; "
+				}
+				start := strings.Index(iperfStage, sibling.DiscoveryShell)
+				command := iperfStage[start:]
+				setup += `traffic=0; ipf=fixture_iperf; ` +
+					`fixture_iperf() { traffic=$((traffic+1)); `
+				if consumer == "ipbench-bulk" {
+					setup += mutate
+				} else if consumer == "ipbench-rr" {
+					setup += `if [ "$traffic" -eq 2 ]; then ` + mutate + `fi; `
+				}
+				setup += `echo '1 Mbits/sec'; }; `
+				if consumer != "ipbench-bulk" && consumer != "ipbench-rr" {
+					setup += mutate
+				}
+				switch consumer {
+				case "snap":
+					i := strings.Index(siblingWorkloadStage, "snap()")
+					command += siblingWorkloadStage[i:] + `snap; `
+				case "diode-s1", "diode-s2":
+					name := strings.TrimPrefix(consumer, "diode-")
+					i := strings.Index(diode, name+"=$(bstat)")
+					if i < 0 {
+						t.Fatalf("production diode consumer %s missing", name)
+					}
+					// Include its actual explicit propagation, not a fixture guard.
+					j := strings.Index(diode[i:], ";")
+					command += diode[i : i+j+1]
+				default:
+					command += `ipbench fixture 192.0.2.1 5201 1; `
+				}
+				command = strings.ReplaceAll(command, "/tmp/ipf-$1", `"$fixture/ipf-$1"`)
+				command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+				command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+				command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+				output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+					setup+`set +eu; `+command+`echo CONSUMER_FINISHED`).CombinedOutput()
+				fail := mode == "invalid" || mode == "unreadable"
+				if (err != nil) != fail || strings.Contains(string(output), "CONSUMER_FINISHED") == fail {
+					t.Fatalf("consumer masked failure or rejected legacy success: %v\n%s", err, output)
+				}
+			})
+		}
 	}
 }
 
