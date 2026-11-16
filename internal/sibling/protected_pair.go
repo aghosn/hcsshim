@@ -691,6 +691,34 @@ func (p *protectedPair) seal(ctx context.Context, index int, mask uint64) error 
 	return v.vm.SealPartition(ctx, mask)
 }
 
+// sealPartition uses live owner cancellation and nativeMu, not the detached
+// startup caller or one-attempt startup guards. Startup completion is observed
+// nonblockingly so a request cannot hold the lock needed to finish startup.
+// The VM/backing remain owned through actual native return even on disconnect.
+func (p *protectedPair) sealPartition(role string, mask uint64) (string, error) {
+	v := &p.workload
+	if role == "diode" {
+		v = &p.diode
+	}
+	id := v.options.ID
+	select {
+	case <-p.startupDone:
+	default:
+		return id, &uvm.PartitionSealError{Err: errors.New("protected owner startup is not complete")}
+	}
+	p.nativeMu.Lock()
+	defer p.nativeMu.Unlock()
+	p.forwardMu.Lock()
+	ready := !p.closing && p.ctx.Err() == nil
+	p.forwardMu.Unlock()
+	if !ready || v.vm == nil {
+		return id, &uvm.PartitionSealError{Err: errors.New("protected owner is shutting down or has no live VM")}
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, protectedPartitionBudget)
+	defer cancel()
+	return v.vm.ID(), v.vm.SealPartition(ctx, mask)
+}
+
 // protectedDiodeLinkCommand waits inside the foreground dependency process.
 // Re-expansion permits workload offers after process creation; exact transport
 // version and diode/workload CIDs are checked before provider/relay startup.

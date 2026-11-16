@@ -67,27 +67,29 @@ type protectedSiblingService struct {
 }
 
 // protectedSiblingPair is the sole serial owner of the two attempts, backing,
-// boot copies and host network releases. Only cancellation/watchers and GCS
-// commands run concurrently; they never mutate lifecycle progress. forwardMu
+// boot copies and host network releases. Cancellation/watchers, GCS commands and
+// runtime controls run concurrently without mutating lifecycle progress. forwardMu
 // serializes cancellation with seal-attempt commitment, not native execution.
 // cleanup has its own independent budget and joins shell/command borrowers.
 type protectedSiblingPair struct {
-	profile     protectedSiblingProfile
-	memory      *sibling.ProtectedBacking
-	workers     []*protectedSiblingVM
-	cpuGroups   *cpuGroupAssignments
-	uplinkClose func() error
-	ctx         context.Context
-	cancel      context.CancelCauseFunc
-	watchCtx    context.Context
-	stopWatch   context.CancelFunc
-	watchers    sync.WaitGroup
-	services    []*protectedSiblingService
-	shells      *protectedSiblingShellServer
-	parent      context.Context
-	forwardMu   sync.Mutex
-	run         string
-	seals       [2]protectedPartitionSeal
+	profile      protectedSiblingProfile
+	memory       *sibling.ProtectedBacking
+	workers      []*protectedSiblingVM
+	cpuGroups    *cpuGroupAssignments
+	uplinkClose  func() error
+	ctx          context.Context
+	cancel       context.CancelCauseFunc
+	watchCtx     context.Context
+	stopWatch    context.CancelFunc
+	watchers     sync.WaitGroup
+	services     []*protectedSiblingService
+	shells       *protectedSiblingShellServer
+	parent       context.Context
+	forwardMu    sync.Mutex
+	nativeMu     sync.Mutex // Runtime controls exclude native cleanup, not guest drainage.
+	controlReady bool       // Published under forwardMu after all selected startup seals.
+	run          string
+	seals        [2]protectedPartitionSeal
 	// stop cancels forward work only; mediated dependencies drain separately.
 	mediated *protectedSiblingDependencies
 }
@@ -159,6 +161,32 @@ func (p *protectedSiblingPair) stop(cause error) {
 	p.forwardMu.Lock()
 	p.cancel(cause)
 	p.forwardMu.Unlock()
+}
+
+// sealPartition borrows the live role VM for one runtime request, independently
+// of startup attempt evidence. nativeMu serializes repeats with each other and
+// cleanup; forwardMu protects only the readiness/cancellation commitment.
+func (p *protectedSiblingPair) sealPartition(role string, mask uint64) (string, error) {
+	p.nativeMu.Lock()
+	defer p.nativeMu.Unlock()
+	var vm *uvm.UtilityVM
+	for _, worker := range p.workers {
+		if siblingRoleName(worker.role) == role {
+			vm = worker.vm
+		}
+	}
+	if vm == nil {
+		return "", &uvm.PartitionSealError{Err: errors.New("protected role has no live VM")}
+	}
+	p.forwardMu.Lock()
+	ready := p.controlReady && p.ctx.Err() == nil
+	p.forwardMu.Unlock()
+	if !ready {
+		return vm.ID(), &uvm.PartitionSealError{Err: errors.New("protected owner is not ready or is shutting down")}
+	}
+	ctx, cancel := context.WithTimeout(p.ctx, protectedSetupBudget)
+	defer cancel()
+	return vm.ID(), vm.SealPartition(ctx, mask)
 }
 
 // reportSeal emits an observation with exact decimal/hex mask and run/VM role
@@ -634,7 +662,7 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	// Acquire all listeners before publishing readiness or closing admission.
 	// A competing pipe owner fails before these irreversible controls. Stop
 	// and accept errors immediately cancel setup/pause through the same gate.
-	p.shells, err = newProtectedSiblingShellServer(p.ctx, p.workers, p.stop)
+	p.shells, err = newProtectedSiblingShellServer(p.ctx, p.workers, p.stop, p.sealPartition)
 	if err != nil {
 		return err
 	}
@@ -652,6 +680,9 @@ func runProtectedSibling(c *cli.Context) (resultErr error) {
 	if err := p.sealPartitions(); err != nil {
 		return err
 	}
+	p.forwardMu.Lock()
+	p.controlReady = p.ctx.Err() == nil
+	p.forwardMu.Unlock()
 	fmt.Println("protected sibling: backing admission sealed; independent partition outcomes recorded; attach diode|workload or stop")
 	return p.interactive()
 }
@@ -1112,9 +1143,14 @@ func (p *protectedSiblingPair) interactive() error {
 // every known participant after other failures. In-process retention does not
 // promise resources survive process exit or native fallback cleanup.
 func (p *protectedSiblingPair) cleanup() error {
+	p.stop(nil)
+	// A handler's bounded join can fail while native completion still runs.
+	// Drain committed controls before the cleanup budget. Sticky cancellation
+	// prevents later dispatch; do not hold this fence while joining handlers.
+	p.nativeMu.Lock()
+	p.nativeMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
 	defer cancel()
-	p.stop(nil)
 	p.stopWatch()
 	p.watchers.Wait()
 	var result error

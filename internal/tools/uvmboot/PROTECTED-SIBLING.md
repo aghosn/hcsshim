@@ -565,6 +565,50 @@ run to observe a full-width workload mask independently. Malformed/overflow
 values fail CLI parsing. No mask bits are locally filtered; the exact `uint64`
 goes to `hcs:/VirtualMachine/SealPartition` as numeric `SealFlags`.
 
+### User-timed runtime control
+
+To defer optional partition calls, omit their startup flags. Mandatory backing
+admission sealing still runs. After starting the protected standalone or
+containerd-owned Linux pair, wait/attach as desired and choose when to invoke:
+
+```powershell
+.\run.ps1 seal workload -PartitionSealMask 0x20
+.\run.ps1 seal diode -PartitionSealMask 0
+# Equivalent packaged host client (elevated):
+.\uvmboot-shmem.exe seal --mask 32 workload
+```
+
+An explicit uint64 mask and exactly one role are required, including zero and
+future bits. The single-instance role pipe binds to its live owner's actual VM;
+no HCS ID, owner/state file selection, guest shell or restart is used. Protected
+pipes explicitly admit SYSTEM/Administrators. Ordinary/old owners, incomplete
+startup and shutdown fail explicitly without another target or automatic retry.
+Pipe availability, GCS and attach do not establish that all desired Linux
+overlays are installed. Startup masks, their diode/workload order, and the
+standalone startup-only pause below are unchanged.
+
+The versioned type-4 frame carries an exact uint64 and returns bounded role/VM,
+mask, outcome and submission-attempt evidence after real HCS completion. Both
+owners retain native VM/backing lifetime through return despite disconnect or
+cancellation. Standalone control handlers participate in the accepted-handler
+join and a separate native cleanup fence; owned controls use `nativeMu` and the
+live owner context, not the expired startup caller or startup one-attempt guard.
+Native cleanup is not gated on arbitrary owned guest-terminal/output drainage.
+A late failure alone does not stop a healthy pair; explicit repeats call native
+sealing again rather than returning cached success.
+
+With the matched OS, request bit `0x20` freezes overlay installations/drains
+admitted work before sweeping ordinary backing under existing overlays. Every
+request containing that bit sweeps again; zero/other-bit-only calls do not.
+Failure retains published bits and completed unmaps. Successful completion
+acknowledges that pass, not lasting absence of backing while ordinary mapping
+remains open, even before reply delivery. Use subsequent mapped-memory reporting
+for the security decision; seal-flag readback is not sweep certification.
+Lost/invalid responses, disconnect, cancellation and dispatched errors leave
+effects uncertain, not proof of unsealed state. Submission-attempt evidence
+alone is neither native-entry nor completion proof. Deploy the complete matched
+runtime with both updated endpoints, not just the client.
+
 For a debugging pause, create a fresh evidence directory on an actual local
 drive, then select at least one mask:
 
@@ -661,7 +705,7 @@ fails the pause; preserve it as evidence, stop the run, use a fresh prefix.
 
 Attach, protocol stop, Ctrl-C of the launcher, VM exit and service failure
 remain live during pause. Stop/exit/cancellation prevents later uncommitted
-calls; no hidden persistent seal-command server exists. Each selected seal has
+startup calls; runtime seal requests reject while paused. Each selected seal has
 a fresh five-minute budget **after** resume; pause time is excluded. Cleanup
 has an independent two-minute budget. Deadlines cannot abandon already
 executing synchronous native/GCS calls or release their borrowed owners.
