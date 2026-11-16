@@ -25,6 +25,7 @@ type pairShells struct {
 	conns     map[net.Conn]struct{}
 	closed    bool
 	protected bool
+	pair      *Pair
 }
 
 type shellGuest struct {
@@ -42,7 +43,7 @@ func pairShellGuests(pair *Pair) []shellGuest {
 
 func startPairShells(pair *Pair) (*pairShells, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &pairShells{ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}), protected: pair.IsProtected()}
+	server := &pairShells{ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}), protected: pair.IsProtected(), pair: pair}
 	for _, peer := range pairShellGuests(pair) {
 		listener, err := winio.ListenPipe(`\\.\pipe\sibling-`+peer.name, &winio.PipeConfig{
 			SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
@@ -79,7 +80,9 @@ func (s *pairShells) accept(listener net.Listener, vm *uvm.UtilityVM, name strin
 				delete(s.conns, conn)
 				s.mu.Unlock()
 			}()
-			servePairShell(s.ctx, vm, name, conn, s.protected)
+			servePairShellControl(s.ctx, vm, name, conn, s.protected, func(mask uint64) (string, error) {
+				return s.pair.SealPartition(name, mask)
+			})
 		}()
 	}
 }
@@ -123,8 +126,21 @@ func readShellFrame(reader io.Reader) (byte, []byte, error) {
 // servePairShell reuses the attach framing for a guest shell. Protected sessions
 // return only after the guest command and the connection's input producer join.
 func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, protected ...bool) {
+	servePairShellControl(ctx, vm, name, conn, len(protected) != 0 && protected[0], nil)
+}
+
+// servePairShellControl dispatches the fixed host control before any guest shell
+// work. Native ownership is fenced by Pair, not by ordinary terminal drainage.
+func servePairShellControl(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, protected bool, seal PartitionSealCallback) {
 	kind, payload, err := readShellFrame(conn)
 	if err != nil {
+		return
+	}
+	if kind == PartitionSealFrame {
+		if !protected {
+			seal = nil
+		}
+		_ = ServePartitionSeal(conn, name, kind, payload, seal)
 		return
 	}
 	if kind != 1 || len(payload) != 4 {
@@ -134,7 +150,7 @@ func servePairShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn ne
 	shellCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	command := cmd.CommandContext(shellCtx, vm, "sh")
-	joined := len(protected) != 0 && protected[0]
+	joined := protected
 	if joined {
 		command = NewJoinedGuestCommand(shellCtx, vm, "sh")
 	}

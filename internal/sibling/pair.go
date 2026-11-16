@@ -186,6 +186,15 @@ type Pair struct {
 	interactiveCloser io.Closer
 }
 
+// SealPartition binds a runtime request to this protected owner, never a saved
+// HCS ID. Ordinary pairs reject without dispatch; explicit repeats are not cached.
+func (p *Pair) SealPartition(role string, mask uint64) (string, error) {
+	if !validSealRole(role) || !p.IsProtected() {
+		return "", &uvm.PartitionSealError{Err: errors.New("partition seal requires a protected live diode/workload owner")}
+	}
+	return p.protected.sealPartition(role, mask)
+}
+
 // commonPairOptions clones security and role settings without acquiring backing.
 // Callers assign either an ordinary section or a real protected capability later.
 func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {

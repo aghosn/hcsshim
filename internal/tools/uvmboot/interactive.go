@@ -21,6 +21,7 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/cmd"
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
@@ -138,9 +139,19 @@ func siblingShell(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.
 // existing client diagnostics and no backing access. Protected stream drainage
 // has a five-second post-wait budget, but executing native/GCS calls cannot be
 // abandoned; the pair retains VM ownership until the handler actually returns.
-func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, allowContainers, joinInput bool) {
+// The optional protected control callback bypasses guest work and remains joined
+// through native completion, even if cancellation has already closed conn.
+func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, conn net.Conn, allowContainers, joinInput bool, seal ...sibling.PartitionSealCallback) {
 	defer conn.Close()
 	typ, payload, err := readFrame(conn)
+	if err == nil && typ == sibling.PartitionSealFrame {
+		var control sibling.PartitionSealCallback
+		if joinInput && len(seal) == 1 {
+			control = seal[0]
+		}
+		_ = sibling.ServePartitionSeal(conn, name, typ, payload, control)
+		return
+	}
 	if err == nil && (typ == frameHello || typ == frameImageHello) {
 		if !allowContainers {
 			message := "Unikraft supports workload attach and stop only; container commands require the containerd-owned Linux pair"
@@ -240,6 +251,7 @@ func siblingShellSession(ctx context.Context, vm *uvm.UtilityVM, name string, co
 // state. mu serializes acceptance with cancellation; wg includes accept loops
 // until they can no longer publish handlers. The pair retains this owner through
 // close's bounded join, and retains VM/backing ownership if that join fails.
+// Runtime controls also have a separate native cleanup fence in the pair.
 type protectedSiblingShellServer struct {
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
@@ -252,6 +264,7 @@ type protectedSiblingShellServer struct {
 	stopped   chan struct{}
 	closeErr  error
 	pairStop  func(error)
+	seal      func(string, uint64) (string, error)
 }
 
 // newProtectedSiblingShellServer exclusively acquires the existing stop and
@@ -262,7 +275,9 @@ type protectedSiblingShellServer struct {
 // pair's forward-cancellation transition without joining this server. Accept
 // failures/stop notify it immediately, so pause cannot strand a private canceled
 // server while the pair keeps waiting. No guest work/readiness is implied.
-func newProtectedSiblingShellServer(parent context.Context, workers []*protectedSiblingVM, pairStop func(error)) (*protectedSiblingShellServer, error) {
+// The optional seal callback is bound before acceptance and owns runtime-control
+// readiness and native lifetime independently of the shell server context.
+func newProtectedSiblingShellServer(parent context.Context, workers []*protectedSiblingVM, pairStop func(error), seal ...func(string, uint64) (string, error)) (*protectedSiblingShellServer, error) {
 	if len(workers) != 2 || workers[0].vm == nil || workers[1].vm == nil ||
 		workers[0].role != diodeRole || workers[1].role != workloadRole || pairStop == nil {
 		return nil, errors.New("protected shell server requires the owned diode/workload pair")
@@ -272,8 +287,13 @@ func newProtectedSiblingShellServer(parent context.Context, workers []*protected
 		ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{}),
 		done: make(chan struct{}), stopped: make(chan struct{}), pairStop: pairStop,
 	}
+	if len(seal) == 1 {
+		s.seal = seal[0]
+	}
 	for _, path := range []string{siblingStopPipe, siblingPipePrefix + "diode", siblingPipePrefix + "workload"} {
-		listener, err := winio.ListenPipe(path, nil)
+		listener, err := winio.ListenPipe(path, &winio.PipeConfig{
+			SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)",
+		})
 		if err != nil {
 			cancel(nil)
 			for _, owned := range s.listeners {
@@ -371,7 +391,13 @@ func (s *protectedSiblingShellServer) acceptShells(listener net.Listener, v *pro
 		// the connection before publishing completion to the pair's join.
 		go func(conn net.Conn) {
 			defer s.wg.Done()
-			siblingShellSession(s.ctx, v.vm, siblingRoleName(v.role), conn, false, true)
+			siblingShellSession(s.ctx, v.vm, siblingRoleName(v.role), conn, false, true,
+				func(mask uint64) (string, error) {
+					if s.seal == nil {
+						return v.vm.ID(), &uvm.PartitionSealError{Err: errors.New("protected owner is not ready")}
+					}
+					return s.seal(siblingRoleName(v.role), mask)
+				})
 			s.mu.Lock()
 			delete(s.conns, conn)
 			s.mu.Unlock()
