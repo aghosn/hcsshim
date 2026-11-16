@@ -691,10 +691,11 @@ func (p *protectedPair) seal(ctx context.Context, index int, mask uint64) error 
 	return v.vm.SealPartition(ctx, mask)
 }
 
-// sealPartition uses live owner cancellation and nativeMu, not the detached
-// startup caller or one-attempt startup guards. Startup completion is observed
+// sealPartition checks live owner cancellation before commitment under forwardMu,
+// not the detached startup caller or one-attempt guards. Startup completion is observed
 // nonblockingly so a request cannot hold the lock needed to finish startup.
-// The VM/backing remain owned through actual native return even on disconnect.
+// Committed execution has no cancellation or deadline: nativeMu retains the
+// VM/backing until the HCS wait observes actual completion, even on disconnect.
 func (p *protectedPair) sealPartition(role string, mask uint64) (string, error) {
 	v := &p.workload
 	if role == "diode" {
@@ -710,12 +711,11 @@ func (p *protectedPair) sealPartition(role string, mask uint64) (string, error) 
 	defer p.nativeMu.Unlock()
 	p.forwardMu.Lock()
 	ready := !p.closing && p.ctx.Err() == nil
+	ctx := context.WithoutCancel(p.ctx)
 	p.forwardMu.Unlock()
 	if !ready || v.vm == nil {
 		return id, &uvm.PartitionSealError{Err: errors.New("protected owner is shutting down or has no live VM")}
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, protectedPartitionBudget)
-	defer cancel()
 	return v.vm.ID(), v.vm.SealPartition(ctx, mask)
 }
 

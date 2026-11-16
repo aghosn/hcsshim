@@ -166,6 +166,8 @@ func (p *protectedSiblingPair) stop(cause error) {
 // sealPartition borrows the live role VM for one runtime request, independently
 // of startup attempt evidence. nativeMu serializes repeats with each other and
 // cleanup; forwardMu protects only the readiness/cancellation commitment.
+// Once committed, execution has no cancellation or deadline: the HCS wait must
+// observe actual completion before nativeMu and the handler release ownership.
 func (p *protectedSiblingPair) sealPartition(role string, mask uint64) (string, error) {
 	p.nativeMu.Lock()
 	defer p.nativeMu.Unlock()
@@ -180,12 +182,11 @@ func (p *protectedSiblingPair) sealPartition(role string, mask uint64) (string, 
 	}
 	p.forwardMu.Lock()
 	ready := p.controlReady && p.ctx.Err() == nil
+	ctx := context.WithoutCancel(p.ctx)
 	p.forwardMu.Unlock()
 	if !ready {
 		return vm.ID(), &uvm.PartitionSealError{Err: errors.New("protected owner is not ready or is shutting down")}
 	}
-	ctx, cancel := context.WithTimeout(p.ctx, protectedSetupBudget)
-	defer cancel()
 	return vm.ID(), vm.SealPartition(ctx, mask)
 }
 
