@@ -335,23 +335,36 @@ func TestPairBootstrapShellSyntax(t *testing.T) {
 			driver   string
 			nics     string
 			wantErr  bool
+			mode     string
 		}{
-			{"stock-peer", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", false},
-			{"direct-RP", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "root-rp-guid", "hv_netvsc", "peer", true},
-			{"other-bus", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus2-relid2", "hv_netvsc", "peer", true},
-			{"custom-driver", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "diode_netvsc", "peer", true},
-			{"multiple-NICs", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer extra", true},
-			{"old-transport", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", "bus1-relid2", "hv_netvsc", "peer", true},
-			{"wrong-role", "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true},
+			{"stock-peer", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", false, ""},
+			{"direct-RP", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "root-rp-guid", "hv_netvsc", "peer", true, ""},
+			{"other-bus", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus2-relid2", "hv_netvsc", "peer", true, ""},
+			{"custom-driver", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "diode_netvsc", "peer", true, ""},
+			{"multiple-NICs", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer extra", true, ""},
+			{"old-transport", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, ""},
+			{"wrong-role", "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, ""},
+			{"ACPI-stock-peer", "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", false, "Y"},
+			{"ACPI-old-transport", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, "Y"},
+			{"ACPI-wrong-local", "bus_id=1 local_cid=4 peer_cid=4 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, "Y"},
+			{"ACPI-wrong-peer", "bus_id=1 local_cid=3 peer_cid=3 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, "Y"},
+			{"RP-wrong-peer", "bus_id=1 local_cid=3 peer_cid=3 version=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, "N"},
+			{"RP-short-instance", "bus_id=1 local_cid=3 peer_cid=4 ready=1", "bus1-relid2", "hv_netvsc", "peer", true, "N"},
 		} {
 			t.Run(test.name, func(t *testing.T) {
-				script := strings.Replace(workloadNICCommand(),
-					BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko"), "", 1)
+				script := workloadNICDiscoveryCommand("", test.mode != "")
 				script = strings.ReplaceAll(script, "/sys/class/net/*", test.nics)
 				script = strings.ReplaceAll(script, `[ -e "$p/device" ]`, "true")
-				fixture := `grep() { return 0; }; cat() { printf '%s\n' ` + Quote(test.instance) + `; }; ` +
+				script = strings.ReplaceAll(script, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/missing-mode"`)
+				script = strings.ReplaceAll(script, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture/link-1/sibling_instance"`)
+				script = strings.ReplaceAll(script, "/sys/devices/sibling_bus_acpi/sibling_instance", `"$fixture/link-1/sibling_instance"`)
+				fixture := `fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; mkdir -p "$fixture/link-1"; ` +
+					`printf '%s\n' ` + Quote(test.instance) + ` >"$fixture/link-1/sibling_instance"; ` +
 					`readlink() { case "$*" in *driver) printf '%s\n' /drivers/` + test.driver + `;; ` +
 					`*) printf '%s\n' /devices/` + test.device + `;; esac; }; `
+				if test.mode != "" {
+					fixture += `echo ` + Quote(test.mode) + ` >"$fixture/missing-mode"; `
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec", fixture+script).CombinedOutput()
@@ -364,4 +377,103 @@ func TestPairBootstrapShellSyntax(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestSiblingModeOwnerAndLoading runs the production shell against both owners.
+// It protects strict mode selection, legacy compatibility, readiness, consistent
+// identity/statistics ownership and the prohibition on no-RP module loading.
+func TestSiblingModeOwnerAndLoading(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for mode-aware discovery fixtures")
+	}
+	for _, test := range []struct {
+		name, mode, owner                                          string
+		strict, missingACPI, unreadable, delayed, loadRP, multiple bool
+		wantFail                                                   bool
+	}{
+		{name: "Y-both-owners", mode: "Y", owner: "acpi"},
+		{name: "N-both-owners", mode: "N", owner: "rp/link-1"},
+		{name: "Y-no-fallback", mode: "Y", missingACPI: true, wantFail: true},
+		{name: "invalid", mode: "invalid", wantFail: true},
+		{name: "empty", mode: "empty", wantFail: true},
+		{name: "unreadable", mode: "Y", unreadable: true, wantFail: true},
+		{name: "legacy", owner: "rp/link-1"},
+		{name: "protected-missing", strict: true, wantFail: true},
+		{name: "protected-Y", mode: "Y", owner: "acpi", strict: true},
+		{name: "protected-N", mode: "N", owner: "rp/link-1", strict: true},
+		{name: "Y-delayed-ready", mode: "Y", owner: "acpi", delayed: true},
+		{name: "N-delayed-ready", mode: "N", owner: "rp/link-1", delayed: true},
+		{name: "legacy-load", owner: "rp/link-1", loadRP: true},
+		{name: "N-load", mode: "N", owner: "rp/link-1", loadRP: true},
+		{name: "N-multiple", mode: "N", multiple: true, wantFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+				`mkdir -p "$fixture/rp/link-1" "$fixture/acpi"; ` +
+				`printf '%s\n' 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/rp/link-1/sibling_instance"; ` +
+				`printf '%s\n' 'bus_id=2 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/acpi/sibling_instance"; ` +
+				`echo rp >"$fixture/rp/link-1/sibling_stats"; echo acpi >"$fixture/acpi/sibling_stats"; loaded=0; polls=0; ` +
+				`insmod() { loaded=$((loaded+1)); mkdir -p "$fixture/rp/link-1"; ` +
+				`printf '%s\n' 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/rp/link-1/sibling_instance"; ` +
+				`echo rp >"$fixture/rp/link-1/sibling_stats"; }; ` +
+				`sleep() { polls=$((polls+1)); [ "$polls" -le 2 ] || exit 1; ` +
+				`sed -i 's/ready=0/ready=1/' "$fixture/acpi/sibling_instance" "$fixture/rp/link-1/sibling_instance"; }; `
+			if test.mode != "" {
+				mode := test.mode
+				if mode == "empty" {
+					mode = ""
+				}
+				setup += `printf '%s\n' ` + Quote(mode) + ` >"$fixture/mode"; `
+			}
+			if test.unreadable {
+				// A directory exists and is readable but cannot be read as a
+				// parameter; cat must fail instead of selecting legacy RP.
+				setup += `rm "$fixture/mode"; mkdir "$fixture/mode"; `
+			}
+			if test.missingACPI {
+				setup += `rm -rf "$fixture/acpi"; `
+			}
+			if test.loadRP {
+				setup += `rm -rf "$fixture/rp"; `
+			}
+			if test.multiple {
+				setup += `cp -r "$fixture/rp/link-1" "$fixture/rp/link-2"; `
+			}
+			if test.delayed {
+				setup += `sed -i 's/ready=1/ready=0/' "$fixture/acpi/sibling_instance" "$fixture/rp/link-1/sibling_instance"; `
+			}
+			command := BusLoadCommand("/bus.ko") + `until ` + OwnerReadyCommand(test.strict) + `; do sleep 0.1; done; ` +
+				`printf 'OWNER=%s STATS=%s LOADED=%s POLLS=%s\n' "${sb_owner#"$fixture/"}" "$(cat "$sb_owner/sibling_stats")" "$loaded" "$polls"`
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+			command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			output, err := exec.CommandContext(ctx, shell, "--distribution", "Ubuntu", "--exec", "/bin/sh", "-c", setup+command).CombinedOutput()
+			if (err != nil) != test.wantFail {
+				t.Fatalf("discovery failure=%v want=%v:\n%s", err, test.wantFail, output)
+			}
+			if test.wantFail {
+				if strings.Contains(string(output), "OWNER=") {
+					t.Fatalf("failed mode published an owner:\n%s", output)
+				}
+				return
+			}
+			stats, loaded, polls := "rp", 0, 0
+			if test.mode == "Y" {
+				stats = "acpi"
+			}
+			if test.loadRP {
+				loaded = 1
+			}
+			if test.delayed {
+				polls = 1
+			}
+			want := fmt.Sprintf("OWNER=%s STATS=%s LOADED=%d POLLS=%d", test.owner, stats, loaded, polls)
+			if !strings.Contains(string(output), want) {
+				t.Fatalf("mode selected wrong owner/loading/readiness: want %q:\n%s", want, output)
+			}
+		})
+	}
 }

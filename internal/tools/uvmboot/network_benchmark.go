@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 
+	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
 )
 
@@ -207,18 +208,25 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 			`echo 'network_benchmark: transport=host-hvsock-relay interface=tun0 cid=2 mtu=1500'; `
 	}
 	script := "/run/network-benchmark/" + filepath.Base(c.String(networkBenchmarkScriptArgName))
+	// The benchmark runs in a fresh shell, so embed the same literal helper
+	// rather than relying on parent-shell functions or duplicating mode policy.
+	discovery := sibling.DiscoveryShell + "sibling_benchmark=1\n"
+	if role == "baseline" || role == "vsock" {
+		discovery = "sibling_benchmark=0\n"
+	}
 	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		networkBenchmarkDiagnosticStage(script) +
-		`cp ` + shellSingleQuote(script) + ` /run/dtb-exec/network-benchmark.sh; ` +
+		`{ printf '%s\n' ` + shellSingleQuote(discovery) + `; cat ` + shellSingleQuote(script) +
+		`; } >/run/dtb-exec/network-benchmark.sh; ` +
 		`/bin/sh /run/dtb-exec/network-benchmark.sh ` + server + ` ` +
 		fmt.Sprint(c.Int(networkBenchmarkPortArgName)) + `; `
 }
 
 func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role string,
 	cfg siblingNetConfig, uplink *diodeUplink) string {
-	command := "set -eu; insmod " + shellSingleQuote(module) + "; "
+	command := "set -eu; " + siblingBusLoadCommand(module)
 	if netModule != "" {
 		command += "insmod " + shellSingleQuote(netModule) + "; "
 	}

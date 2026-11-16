@@ -542,13 +542,18 @@ func workloadNICCommandForMAC(mac string) string {
 // workloadNICDiscoveryCommandForMAC selects the peer NIC without provisioning
 // modules. Callers must first load or require the registered sibling adapter.
 func workloadNICDiscoveryCommandForMAC(mac string) string {
+	return workloadNICDiscoveryCommand(mac, false)
+}
+
+// workloadNICDiscoveryCommand shares peer NIC discovery with protected setup,
+// which requires an explicit kernel mode on every context-owned readiness poll.
+func workloadNICDiscoveryCommand(mac string, requireMode bool) string {
 	checkMAC := ""
 	if mac != "" {
 		checkMAC = `[ "$(cat "$p/address")" = ` + Quote(mac) + ` ] || { echo 'workload peer MAC differs from Unikraft manifest' >&2; exit 1; }; `
 	}
-	return `set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance; [ "$#" -eq 1 ]; ` +
-		`until grep -q 'ready=1' "$1"; do sleep 0.1; done; ` +
-		`set -- $(cat "$1"); [ "$#" -eq 5 ]; sb_bus=${1#*=}; [ "${2#*=}" = 3 ]; [ "${3#*=}" = 4 ]; [ "${4#*=}" = 4 ]; [ "${5#*=}" = 1 ]; ` +
+	return DiscoveryShell + `until ` + OwnerReadyCommand(requireMode) + `; do sleep 0.1; done; ` +
+		`set -- $(cat "$sb_instance"); [ "$#" -eq 5 ]; sb_bus=${1#*=}; [ "${2#*=}" = 3 ]; [ "${3#*=}" = 4 ]; [ "${4#*=}" = 4 ]; [ "${5#*=}" = 1 ]; ` +
 		`until count=0; dev=; for p in /sys/class/net/*; do [ -e "$p/device" ] || continue; ` +
 		`d=$(readlink -f "$p/device"); case ${d##*/} in bus${sb_bus}-relid*) ` +
 		`[ "$(basename "$(readlink "$p/device/driver")")" = hv_netvsc ] || exit 1; ` + checkMAC + `dev=${d##*/}; count=$((count+1));; ` +
