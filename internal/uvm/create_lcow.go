@@ -129,6 +129,10 @@ type OptionsLCOW struct {
 	// TimesyncRelayID selects native IPC only for the protected-owned workload.
 	// The pair supplies a fresh, immutable nonzero GUID before Create.
 	TimesyncRelayID *guid.GUID
+
+	// WorkloadVmbusNoRp requests inert native RP message endpoints only for the
+	// protected-owned no-RP Linux workload. False preserves ordinary transport.
+	WorkloadVmbusNoRp bool
 }
 
 // NewDefaultOptionsLCOW creates the default options for a bootable version of
@@ -371,6 +375,9 @@ func makeLCOWVMGSDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ 
 
 func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
 	processor *hcsschema.VirtualMachineProcessor) (_ *hcsschema.ComputeSystem, err error) {
+	if err := validateWorkloadVmbusNoRpOptions(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := validateTimesyncRelayOptions(opts); err != nil {
 		return nil, err
 	}
@@ -429,6 +436,7 @@ func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
 				Processor: processor,
 			},
 			Devices: &hcsschema.Devices{
+				WorkloadVmbusNoRp: opts.WorkloadVmbusNoRp,
 				HvSocket: &hcsschema.HvSocket2{
 					HvSocketConfig: &hcsschema.HvSocketSystemConfig{
 						// Allow administrators and SYSTEM to bind to vsock sockets
@@ -509,6 +517,33 @@ func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
 	}
 
 	return doc, nil
+}
+
+// validateWorkloadVmbusNoRpOptions checks the final selected workload and its
+// actual Import/controller association before CreateLCOW or boot-file copies.
+// General VerifyOptions remains usable before the pair acquires those resources.
+// Capability shape is validated, not the underlying handles or measured image.
+func validateWorkloadVmbusNoRpOptions(ctx context.Context, opts *OptionsLCOW) error {
+	if !opts.WorkloadVmbusNoRp {
+		return nil
+	}
+	if opts.Options == nil || opts.ConfidentialLCOWOptions == nil ||
+		opts.ConfidentialCommonOptions == nil || opts.TimesyncRelayID == nil ||
+		opts.SCSIControllerCount == 0 || len(opts.AssignedDevices) != 0 {
+		return errors.New("WorkloadVmbusNoRp requires the protected-owned mediated SNP VMGS workload")
+	}
+	if err := validateTimesyncRelayOptions(opts); err != nil {
+		return fmt.Errorf("WorkloadVmbusNoRp: %w", err)
+	}
+	if err := VerifyOptions(ctx, opts); err != nil {
+		return fmt.Errorf("WorkloadVmbusNoRp: %w", err)
+	}
+	region := opts.SharedMemoryRegions[0]
+	if !region.ProtectedShared ||
+		opts.SiblingCommunicationEndpoints[0].SharedMemorySectionName != region.SectionName {
+		return errors.New("WorkloadVmbusNoRp requires the workload endpoint's matching protected Import region")
+	}
+	return nil
 }
 
 // validateTimesyncRelayOptions rejects explicit routes outside the protected
@@ -677,6 +712,9 @@ Example JSON document produced once the hcsschema.ComputeSytem returned by makeL
 
 // Make the ComputeSystem document object that will be serialized to json to be presented to the HCS api.
 func MakeLCOWDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM) (_ *hcsschema.ComputeSystem, err error) {
+	if opts.WorkloadVmbusNoRp {
+		return nil, errors.New("WorkloadVmbusNoRp is unsupported for ordinary LCOW boot")
+	}
 	if opts.TimesyncRelayID != nil {
 		return nil, errors.New("timesync relay is unsupported for ordinary LCOW boot")
 	}
@@ -1042,6 +1080,9 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 	defer span.End()
 	defer func() { ot.SetSpanStatus(span, err) }()
 
+	if err := validateWorkloadVmbusNoRpOptions(ctx, opts); err != nil {
+		return nil, err
+	}
 	if err := validateTimesyncRelayOptions(opts); err != nil {
 		return nil, err
 	}

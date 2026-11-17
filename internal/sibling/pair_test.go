@@ -33,6 +33,118 @@ func testOptions() *uvm.OptionsLCOW {
 	return opts
 }
 
+// workloadVmbusNoRpConfigFixture selects the protected owned Linux profile
+// without acquiring backing or starting either participant.
+func workloadVmbusNoRpConfigFixture() *Config {
+	config := testConfig()
+	config.ProtectedShared, config.MediateGCS, config.Interactive = true, true, true
+	config.WorkloadVmbusNoRp = true
+	config.SharedMemoryBytes = 32 << 20
+	config.RunID = "no-rp-fixture"
+	config.CleanupReceiptPath = `C:\session\protected-cleanup-result.json`
+	return config
+}
+
+// TestWorkloadVmbusNoRpRoleIsolation proves only an explicit workload request
+// reaches its clone, without leaking into base/diode or breaking pre-acquisition
+// VerifyOptions. Image names do not select the mode.
+func TestWorkloadVmbusNoRpRoleIsolation(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		base := testOptions()
+		config := workloadVmbusNoRpConfigFixture()
+		config.WorkloadVmbusNoRp = selected
+		config.WorkloadGuestStateFile = "unrelated-name.vmgs"
+		workload, diode, err := commonPairOptions(base, config, "group")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if workload.WorkloadVmbusNoRp != selected || diode.WorkloadVmbusNoRp || base.WorkloadVmbusNoRp {
+			t.Fatal("native opt-in escaped the selected workload clone")
+		}
+		for _, options := range []*uvm.OptionsLCOW{workload, diode} {
+			if err := uvm.VerifyOptions(context.Background(), options); err != nil {
+				t.Fatalf("pre-acquisition validation demanded final resources: %v", err)
+			}
+			if len(options.SharedMemoryRegions) != 0 || len(options.ProtectedSharedResources) != 0 {
+				t.Fatal("role selection acquired backing")
+			}
+		}
+		workload.WorkloadVmbusNoRp = !selected
+		workload.SiblingCommunicationEndpoints[0].SharedMemorySectionName = "changed"
+		workload.SecurityPolicy = "changed"
+		if diode.WorkloadVmbusNoRp || base.WorkloadVmbusNoRp ||
+			diode.SiblingCommunicationEndpoints[0].SharedMemorySectionName != "" ||
+			len(base.SiblingCommunicationEndpoints) != 0 ||
+			diode.SecurityPolicy != base.SecurityPolicy {
+			t.Fatal("workload mutation changed base/diode options")
+		}
+	}
+}
+
+// TestWorkloadVmbusNoRpConfig checks strict optional boolean decoding and rejects
+// incompatible true selections through both JSON and direct Config construction.
+// Invalid requests must fail before pair backing or native VM acquisition.
+func TestWorkloadVmbusNoRpConfig(t *testing.T) {
+	for _, fields := range []string{"", `,"workload_vmbus_no_rp":false`} {
+		data, _ := json.Marshal(testConfig())
+		text := strings.TrimSuffix(string(data), "}") + fields + "}"
+		config, err := decodeConfig(strings.NewReader(text))
+		if err != nil || config.WorkloadVmbusNoRp {
+			t.Fatalf("omitted/false mode changed: %+v %v", config, err)
+		}
+	}
+	data, _ := json.Marshal(workloadVmbusNoRpConfigFixture())
+	if config, err := decodeConfig(strings.NewReader(string(data))); err != nil || !config.WorkloadVmbusNoRp {
+		t.Fatalf("selected config rejected: %+v %v", config, err)
+	}
+	for _, fields := range []string{
+		`,"workload_vmbus_no_rp":false`, `,"WORKLOAD_VMBUS_NO_RP":true`,
+	} {
+		if _, err := decodeConfig(strings.NewReader(strings.TrimSuffix(string(data), "}") + fields + "}")); err == nil {
+			t.Fatal("accepted duplicate native selection")
+		}
+	}
+	for _, value := range []string{`null`, `"true"`, `1`, `{}`, `[]`} {
+		text := strings.Replace(string(data), `"workload_vmbus_no_rp":true`, `"workload_vmbus_no_rp":`+value, 1)
+		if _, err := decodeConfig(strings.NewReader(text)); err == nil {
+			t.Fatalf("accepted non-boolean %s", value)
+		}
+	}
+	for name, change := range map[string]func(*Config){
+		"ordinary":   func(c *Config) { c.ProtectedShared = false },
+		"direct-gcs": func(c *Config) { c.MediateGCS = false },
+		"unowned":    func(c *Config) { c.Interactive = false },
+		"unikraft":   func(c *Config) { c.UnikraftPackage = `C:\unikraft` },
+		"size":       func(c *Config) { c.SharedMemoryBytes = 16 << 20 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := workloadVmbusNoRpConfigFixture()
+			change(config)
+			data, _ := json.Marshal(config)
+			if _, err := decodeConfig(strings.NewReader(string(data))); err == nil {
+				t.Fatal("decoded incompatible true selection")
+			}
+			if _, _, err := commonPairOptions(testOptions(), config, "group"); err == nil {
+				t.Fatal("direct Config bypassed selection scope")
+			}
+		})
+	}
+}
+
+// TestWorkloadVmbusNoRpRejectsInherited rejects native selection in base options
+// even when pair selection is off, preventing accidental diode/global activation.
+func TestWorkloadVmbusNoRpRejectsInherited(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		base := testOptions()
+		base.WorkloadVmbusNoRp = true
+		config := workloadVmbusNoRpConfigFixture()
+		config.WorkloadVmbusNoRp = selected
+		if _, _, err := commonPairOptions(base, config, "group"); err == nil {
+			t.Fatal("inherited native opt-in accepted")
+		}
+	}
+}
+
 func TestPairOptionsKeepSecurityAndSeparateOwnership(t *testing.T) {
 	base := testOptions()
 	section := &Section{HCSName: `\Sessions\0\BaseNamedObjects\test`, Size: 16 << 20}
