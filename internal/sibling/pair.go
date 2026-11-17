@@ -34,6 +34,7 @@ import (
 // The protected profile requires interactive endpoint acquisition before sealing.
 // PageMetadataOutputPath optionally exports an existing local directory writable
 // only to the protected diode; preflight validates the filesystem destination.
+// WorkloadVmbusNoRp is an optional, default-off native workload-only request.
 type Config struct {
 	Version                   int     `json:"version"`
 	ModuleDirectory           string  `json:"module_directory"`
@@ -41,6 +42,7 @@ type Config struct {
 	WorkloadGuestStateFile    string  `json:"workload_guest_state_file"`
 	Interactive               bool    `json:"interactive,omitempty"`
 	MediateGCS                bool    `json:"mediate_gcs,omitempty"`
+	WorkloadVmbusNoRp         bool    `json:"workload_vmbus_no_rp,omitempty"`
 	UnikraftPackage           string  `json:"unikraft_package,omitempty"`
 	ProtectedShared           bool    `json:"protected_shared,omitempty"`
 	DiodePartitionSealMask    *uint64 `json:"diode_partition_seal_mask,omitempty,string"`
@@ -118,11 +120,14 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 			return nil, errors.New("page metadata output requires the protected owned Linux profile and an absolute local drive directory path")
 		}
 	}
+	if err := validateWorkloadVmbusNoRpConfig(&config); err != nil {
+		return nil, err
+	}
 	return &config, nil
 }
 
-// validateConfigMasks rejects ambiguous selection before normal strict decoding.
-// Only unsigned decimal JSON strings are accepted; omission is not selected zero.
+// validateConfigMasks rejects ambiguous mask and native no-RP selection before
+// normal strict decoding. Masks require decimal strings; no-RP requires a bool.
 func validateConfigMasks(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	token, err := decoder.Token()
@@ -141,6 +146,13 @@ func validateConfigMasks(raw []byte) error {
 			return err
 		}
 		switch {
+		case strings.EqualFold(name, "workload_vmbus_no_rp"):
+			name = "workload_vmbus_no_rp"
+			if seen[name] || (!bytes.Equal(value, []byte("true")) && !bytes.Equal(value, []byte("false"))) {
+				return errors.New("workload_vmbus_no_rp must be a single JSON boolean")
+			}
+			seen[name] = true
+			continue
 		case strings.EqualFold(name, "diode_partition_seal_mask"):
 			name = "diode_partition_seal_mask"
 		case strings.EqualFold(name, "workload_partition_seal_mask"):
@@ -160,6 +172,16 @@ func validateConfigMasks(raw []byte) error {
 		if _, err := strconv.ParseUint(text, 10, 64); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
+	}
+	return nil
+}
+
+// validateWorkloadVmbusNoRpConfig restricts explicit native suppression to the
+// protected mediated owned Linux profile, including directly constructed Configs.
+func validateWorkloadVmbusNoRpConfig(config *Config) error {
+	if config.WorkloadVmbusNoRp && (!config.ProtectedShared || !config.MediateGCS ||
+		!config.Interactive || config.UnikraftPackage != "" || config.SharedMemoryBytes != 32<<20) {
+		return errors.New("workload_vmbus_no_rp requires the protected mediated interactive owned Linux profile")
 	}
 	return nil
 }
@@ -198,6 +220,9 @@ func (p *Pair) SealPartition(role string, mask uint64) (string, error) {
 // commonPairOptions clones security and role settings without acquiring backing.
 // Callers assign either an ordinary section or a real protected capability later.
 func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	if err := validateWorkloadVmbusNoRpConfig(config); err != nil {
+		return nil, nil, err
+	}
 	if base == nil || base.Options == nil || base.ConfidentialLCOWOptions == nil ||
 		base.ConfidentialCommonOptions == nil || !base.UseGuestConnection ||
 		!base.SecurityPolicyEnabled || !base.DmVerityMode || base.GuestStateFilePath == "" ||
@@ -206,8 +231,8 @@ func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uv
 		return nil, nil, errors.New("sibling pair requires GCS, SNP dm-verity boot, a bundle directory and SCSI")
 	}
 	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 ||
-		len(base.AssignedDevices) != 0 || base.TimesyncRelayID != nil {
-		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership, assigned devices or a timesync route")
+		len(base.AssignedDevices) != 0 || base.TimesyncRelayID != nil || base.WorkloadVmbusNoRp {
+		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership, assigned devices, a timesync route or WorkloadVmbusNoRp")
 	}
 	// Each guest owns independent mutable option structs; policy bytes are unchanged.
 	clone := func(role Role, id, bundle string) (*uvm.OptionsLCOW, error) {
@@ -226,6 +251,7 @@ func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uv
 		options.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{endpoint}
 		if role == Workload {
 			options.SiblingRoot = true
+			options.WorkloadVmbusNoRp = config.WorkloadVmbusNoRp
 			options.GuestStateFilePath = config.WorkloadGuestStateFile
 			options.VPMemDeviceCount = 0
 		} else {

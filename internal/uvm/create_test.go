@@ -4,16 +4,197 @@ package uvm
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Microsoft/go-winio"
+	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/internal/computecore"
 	"github.com/Microsoft/hcsshim/internal/diodecontrol"
+	"github.com/Microsoft/hcsshim/internal/gcs/prot"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
+
+// workloadVmbusNoRpOptionsFixture models the final Import workload after pair
+// acquisition. Its borrowed handle is shape-only: no capability is dispatched
+// and it proves neither authorization nor the measured VMGS contents.
+func workloadVmbusNoRpOptionsFixture(t *testing.T) *OptionsLCOW {
+	t.Helper()
+	opts := protectedSharedOptionsFixture(t, true, hcsschema.ProtectedSharedBackingImport)
+	opts.WorkloadVmbusNoRp = true
+	opts.SecurityPolicyEnabled, opts.DmVerityMode = true, true
+	opts.PreferredRootFSType, opts.VPMemDeviceCount = PreferredRootFSTypeNA, 0
+	opts.AllowOvercommit, opts.EnableDeferredCommit = false, false
+	hcl := false
+	opts.HclEnabled = &hcl
+	relay, err := guid.NewV4()
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.TimesyncRelayID = &relay
+	opts.GuestStateFilePath, opts.DmVerityRootFsVhd = "fixture.vmgs", "fixture.vhd"
+	opts.BootFilesPath, opts.BundleDirectory = t.TempDir(), t.TempDir()
+	opts.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{{
+		GroupID: "fixture-group", Role: hcsschema.SiblingCommunicationEndpointRoleWorkload,
+		SharedMemorySectionName: opts.SharedMemoryRegions[0].SectionName,
+	}}
+	return opts
+}
+
+// TestWorkloadVmbusNoRpDocument serializes the production VMGS document to prove
+// exact schema-2.5 selection/omission, preserving sockets, relay and protected
+// sibling configuration. Temporary boot bytes are not real executable images.
+func TestWorkloadVmbusNoRpDocument(t *testing.T) {
+	for _, mode := range []string{"selected", "rollback", "diode", "ordinary"} {
+		t.Run(mode, func(t *testing.T) {
+			opts := workloadVmbusNoRpOptionsFixture(t)
+			opts.WorkloadVmbusNoRp = mode == "selected"
+			switch mode {
+			case "diode":
+				opts.SiblingRoot, opts.TimesyncRelayID = false, nil
+				opts.SiblingCommunicationEndpoints[0].Role = hcsschema.SiblingCommunicationEndpointRoleBackend
+				opts.SharedMemoryRegions[0].ProtectedSharedBackingMode = hcsschema.ProtectedSharedBackingBootstrap
+				opts.SharedMemoryRegions[0].ProtectedSharedLeaseId = 0
+			case "ordinary":
+				opts.SiblingRoot, opts.TimesyncRelayID = false, nil
+				opts.SharedMemoryRegions, opts.ProtectedSharedResources, opts.SiblingCommunicationEndpoints = nil, nil, nil
+			}
+			for _, name := range []string{opts.GuestStateFilePath, opts.DmVerityRootFsVhd} {
+				if err := os.WriteFile(filepath.Join(opts.BootFilesPath, name), []byte("fixture"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			vm := &UtilityVM{id: opts.ID, scsiControllerCount: 1}
+			doc, err := makeLCOWVMGSBootDoc(context.Background(), opts, vm, &hcsschema.VirtualMachineProcessor{Count: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+			applyLCOWSiblingCommunication(doc, opts.SiblingCommunicationEndpoints)
+			data, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire struct {
+				SchemaVersion  struct{ Major, Minor int }
+				VirtualMachine struct{ Devices map[string]json.RawMessage }
+			}
+			if err := json.Unmarshal(data, &wire); err != nil {
+				t.Fatal(err)
+			}
+			bit, present := wire.VirtualMachine.Devices["WorkloadVmbusNoRp"]
+			wantCount := 0
+			if opts.WorkloadVmbusNoRp {
+				wantCount = 1
+			}
+			if present != opts.WorkloadVmbusNoRp || (present && string(bit) != "true") ||
+				strings.Count(string(data), `"WorkloadVmbusNoRp"`) != wantCount ||
+				wire.SchemaVersion.Major != 2 || wire.SchemaVersion.Minor != 5 {
+				t.Fatalf("wrong native bit or schema: %s", data)
+			}
+			if _, present := wire.VirtualMachine.Devices["VMBus"]; present {
+				t.Fatal("introduced public schema-2.7 VMBus object")
+			}
+			devices := doc.VirtualMachine.Devices
+			for _, port := range []uint32{vmutils.LinuxEntropyVsockPort, vmutils.LinuxLogVsockPort, prot.LinuxGcsVsockPort, prot.LinuxGcsVsockPort + 1} {
+				if _, ok := devices.HvSocket.HvSocketConfig.ServiceTable[winio.VsockServiceID(port).String()]; !ok {
+					t.Fatalf("lost existing socket %d", port)
+				}
+			}
+			if devices.Plan9 == nil || !reflect.DeepEqual(devices.SiblingCommunicationEndpoints, opts.SiblingCommunicationEndpoints) {
+				t.Fatal("changed existing Plan9/sibling configuration")
+			}
+			if len(opts.SharedMemoryRegions) != 0 && !reflect.DeepEqual(devices.SharedMemory.Regions, opts.SharedMemoryRegions) {
+				t.Fatal("changed protected region configuration")
+			}
+			if opts.TimesyncRelayID != nil &&
+				doc.VirtualMachine.Services.Timesync.RelayId != strings.ToLower(opts.TimesyncRelayID.String()) {
+				t.Fatal("changed timesync relay selection")
+			}
+		})
+	}
+}
+
+// TestWorkloadVmbusNoRpRejectsMalformed checks final selected shape/association
+// before any native creation or boot-file copy, including direct boot-doc calls.
+// Generic VerifyOptions must not become a post-acquisition-only entrypoint.
+func TestWorkloadVmbusNoRpRejectsMalformed(t *testing.T) {
+	for name, change := range map[string]func(*OptionsLCOW){
+		"no-common":       func(o *OptionsLCOW) { o.Options = nil },
+		"no-confidential": func(o *OptionsLCOW) { o.ConfidentialLCOWOptions = nil },
+		"no-security":     func(o *OptionsLCOW) { o.ConfidentialCommonOptions = nil },
+		"ordinary":        func(o *OptionsLCOW) { o.GuestStateFilePath = "" },
+		"not-snp":         func(o *OptionsLCOW) { o.SecurityPolicyEnabled = false },
+		"not-verity":      func(o *OptionsLCOW) { o.DmVerityMode = false },
+		"direct-root":     func(o *OptionsLCOW) { o.SiblingRoot = false },
+		"no-gcs":          func(o *OptionsLCOW) { o.UseGuestConnection = false },
+		"appliance":       func(o *OptionsLCOW) { o.Appliance = &LCOWApplianceOptions{} },
+		"hcl-default":     func(o *OptionsLCOW) { o.HclEnabled = nil },
+		"hcl-enabled":     func(o *OptionsLCOW) { *o.HclEnabled = true },
+		"no-relay":        func(o *OptionsLCOW) { o.TimesyncRelayID = nil },
+		"zero-relay":      func(o *OptionsLCOW) { *o.TimesyncRelayID = guid.GUID{} },
+		"time-disabled":   func(o *OptionsLCOW) { o.DisableTimeSyncService = true },
+		"overcommit":      func(o *OptionsLCOW) { o.AllowOvercommit = true },
+		"deferred":        func(o *OptionsLCOW) { o.EnableDeferredCommit = true },
+		"root-type":       func(o *OptionsLCOW) { o.PreferredRootFSType = PreferredRootFSTypeVHD },
+		"no-scsi":         func(o *OptionsLCOW) { o.SCSIControllerCount = 0 },
+		"assigned":        func(o *OptionsLCOW) { o.AssignedDevices = []VPCIDeviceID{{}} },
+		"no-endpoint":     func(o *OptionsLCOW) { o.SiblingCommunicationEndpoints = nil },
+		"extra-endpoint": func(o *OptionsLCOW) {
+			o.SiblingCommunicationEndpoints = append(o.SiblingCommunicationEndpoints, o.SiblingCommunicationEndpoints[0])
+		},
+		"backend": func(o *OptionsLCOW) {
+			o.SiblingCommunicationEndpoints[0].Role = hcsschema.SiblingCommunicationEndpointRoleBackend
+		},
+		"empty-group":      func(o *OptionsLCOW) { o.SiblingCommunicationEndpoints[0].GroupID = "" },
+		"section-mismatch": func(o *OptionsLCOW) { o.SiblingCommunicationEndpoints[0].SharedMemorySectionName = "other" },
+		"empty-section":    func(o *OptionsLCOW) { o.SiblingCommunicationEndpoints[0].SharedMemorySectionName = "" },
+		"no-region":        func(o *OptionsLCOW) { o.SharedMemoryRegions = nil },
+		"extra-region":     func(o *OptionsLCOW) { o.SharedMemoryRegions = append(o.SharedMemoryRegions, o.SharedMemoryRegions[0]) },
+		"ordinary-region":  func(o *OptionsLCOW) { o.SharedMemoryRegions[0].ProtectedShared = false },
+		"hidden":           func(o *OptionsLCOW) { o.SharedMemoryRegions[0].HiddenFromGuest = true },
+		"bootstrap": func(o *OptionsLCOW) {
+			o.SharedMemoryRegions[0].ProtectedSharedBackingMode = hcsschema.ProtectedSharedBackingBootstrap
+		},
+		"no-lease":       func(o *OptionsLCOW) { o.SharedMemoryRegions[0].ProtectedSharedLeaseId = 0 },
+		"unaligned":      func(o *OptionsLCOW) { o.SharedMemoryRegions[0].StartOffset = 1 },
+		"no-resource":    func(o *OptionsLCOW) { o.ProtectedSharedResources = nil },
+		"wrong-uri":      func(o *OptionsLCOW) { o.ProtectedSharedResources[0].URI = "other" },
+		"wrong-type":     func(o *OptionsLCOW) { o.ProtectedSharedResources[0].Type = computecore.HcsResourceTypeJob },
+		"zero-handle":    func(o *OptionsLCOW) { o.ProtectedSharedResources[0].Handle = 0 },
+		"invalid-handle": func(o *OptionsLCOW) { o.ProtectedSharedResources[0].Handle = syscall.InvalidHandle },
+		"extra-resource": func(o *OptionsLCOW) {
+			o.ProtectedSharedResources = append(o.ProtectedSharedResources, o.ProtectedSharedResources[0])
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opts := workloadVmbusNoRpOptionsFixture(t)
+			bundle := opts.BundleDirectory
+			change(opts)
+			if _, err := CreateLCOW(context.Background(), opts); err == nil || !strings.Contains(err.Error(), "WorkloadVmbusNoRp") {
+				t.Fatalf("CreateLCOW did not reject selected shape: %v", err)
+			}
+			if _, err := makeLCOWVMGSBootDoc(context.Background(), opts, nil, nil); err == nil || !strings.Contains(err.Error(), "WorkloadVmbusNoRp") {
+				t.Fatalf("boot doc did not reject before file copies: %v", err)
+			}
+			files, err := os.ReadDir(bundle)
+			if err != nil || len(files) != 0 {
+				t.Fatalf("invalid request wrote boot files: %v %v", files, err)
+			}
+		})
+	}
+	opts := workloadVmbusNoRpOptionsFixture(t)
+	if _, err := MakeLCOWDoc(context.Background(), opts, nil); err == nil || !strings.Contains(err.Error(), "WorkloadVmbusNoRp") {
+		t.Fatalf("ordinary document accepted native selection: %v", err)
+	}
+}
 
 func TestVMGSApplianceBootDocument(t *testing.T) {
 	opts := NewDefaultOptionsLCOW("appliance-test", "")
