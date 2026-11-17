@@ -24,10 +24,22 @@ import (
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/status"
 )
+
+// siblingStartupError preserves the gRPC code and diagnostic message without
+// Any details that legacy containerd cannot decode on sibling startup failure.
+func siblingStartupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	st := status.Convert(errgrpc.ToGRPC(err))
+	return status.Error(st.Code(), st.Message())
+}
 
 // initializeWCOWBootFiles handles the initialization of boot files for WCOW VMs
 func initializeWCOWBootFiles(ctx context.Context, wopts *uvm.OptionsWCOW, rootfs []*types.Mount, s *specs.Spec) error {
@@ -194,9 +206,10 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 					return nil, configErr
 				}
 				pair, err = sibling.Start(ctx, lopts, config)
-				if err == nil {
-					parent = pair.Workload
+				if err != nil {
+					return nil, siblingStartupError(err)
 				}
+				parent = pair.Workload
 			} else {
 				parent, err = uvm.CreateLCOW(ctx, lopts)
 			}
@@ -435,6 +448,9 @@ func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *sp
 
 	st, err := newHcsTask(ctx, p.events, p.host, false, req, s)
 	if err != nil {
+		if p.spec.Annotations[annotations.LCOWSiblingPair] != "" {
+			return nil, siblingStartupError(err)
+		}
 		return nil, err
 	}
 
