@@ -22,6 +22,10 @@ const maxJournal = 8 << 20
 // native no-effect proof. It can be released but never qualifies an after probe.
 var errControlDenied = errors.New("before mapping denied without effects; cleanup may release its backing")
 
+// errConnectAttribution marks a valid after denial without a new connection.
+// The receiving fixture remains recorded for explicit cleanup.
+var errConnectAttribution = errors.New("after connect denied, but seal attribution is incomplete: the seal gate precedes receiving-port lookup and the recorded port's continued existence was not verified")
+
 const (
 	mapContiguous     = "map-contiguous"
 	mapSparse         = "map-sparse"
@@ -520,7 +524,7 @@ func (j *journal) stop(reason error) error {
 
 // mutate commits intent before a single synchronous mutation, then separately
 // commits the observation and ownership changes. Uncertain outcomes taint
-// the whole session; a proven no-effect denial is still a failed control.
+// the whole session; a known no-effect denial can still fail the diagnostic.
 func (j *journal) mutate(s selection, phase, operation string, page *uint32, run func(*attempt) (string, error)) error {
 	id := uint64(1)
 	if j.Last != nil {
@@ -552,7 +556,7 @@ func (j *journal) mutate(s selection, phase, operation string, page *uint32, run
 	if err != nil {
 		a.Failure = err.Error()
 	}
-	if err == nil || errors.Is(err, errControlDenied) {
+	if err == nil || errors.Is(err, errControlDenied) || errors.Is(err, errConnectAttribution) {
 		j.Tainted = false
 	}
 	saveErr := j.commit()

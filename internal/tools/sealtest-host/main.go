@@ -43,8 +43,11 @@ on a quiet disposable host, not attested identity.
 
 Run the before control and clean up its owned mapping/alias/port/connection
 before sealing. The receiving fixture for a connect case is kept until its
-after probe. Select a GHCB VP from live inventory; an existing parent alias
-is not a control. Record the seal command's successful native completion separately.
+after probe. An after connect denial is recorded as inconclusive: the seal
+check precedes receiving-port lookup, so the denial does not prove that the
+recorded port still exists. The denial does not prevent explicit cleanup.
+Select a GHCB VP from live inventory; an existing parent alias is not a
+control. Record the seal command's successful native completion separately.
 An expected mask and receipt label are correlation, not an independent query.
 Release applies to safe host backing only. Guest reservations are never reclaimed.
 Do not retry uncertain calls; stop both sides. If the driver loses retained
@@ -459,6 +462,9 @@ func probe(d device, j *journal, p *prepared, i int) error {
 				return "unexpected-success", errors.New("after request accepted; no rollback attempted")
 			}
 			if *o.Status == statusDenied && (count == 0 || *o.Progress == 0) && !o.OutputValid {
+				if p.Selection.Case == connectReceiver || p.Selection.Case == connectSender {
+					return "inconclusive", errConnectAttribution
+				}
 				return "seal-denied", nil
 			}
 			return "inconclusive", errors.New("after request did not produce the required denial")
