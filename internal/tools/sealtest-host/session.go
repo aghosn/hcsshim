@@ -18,6 +18,14 @@ import (
 const schemaVersion = 2
 const maxJournal = 8 << 20
 
+// errControlDenied marks a one-shot failed control whose backing has a
+// native no-effect proof. It can be released but never qualifies an after probe.
+var errControlDenied = errors.New("before mapping denied without effects; cleanup may release its backing")
+
+// errConnectAttribution marks a valid after denial without a new connection.
+// The receiving fixture remains recorded for explicit cleanup.
+var errConnectAttribution = errors.New("after connect denied, but seal attribution is incomplete: the seal gate precedes receiving-port lookup and the recorded port's continued existence was not verified")
+
 const (
 	mapContiguous     = "map-contiguous"
 	mapSparse         = "map-sparse"
@@ -97,6 +105,9 @@ type phaseRecord struct {
 	Fixture      *guestFixture `json:"fixture,omitempty"`
 	Backing      *binding      `json:"backing,omitempty"`
 	BackingState uint32        `json:"backing_state,omitempty"`
+	Sequence     uint64        `json:"backing_sequence,omitempty"`
+	Known        uint32        `json:"known_mapped,omitempty"`
+	Maybe        uint32        `json:"maybe_mapped,omitempty"`
 	Holes        uint32        `json:"vacant_mask,omitempty"`
 	Consumed     bool          `json:"consumed"`
 	Control      bool          `json:"successful_before_control"`
@@ -117,10 +128,12 @@ type attempt struct {
 	Operation    string        `json:"operation"`
 	Selection    selection     `json:"selection"`
 	Phase        string        `json:"phase"`
+	FixtureID    string        `json:"fixture_id,omitempty"`
 	Page         *uint32       `json:"page_index,omitempty"`
 	Partition    uint64        `json:"partition_id"`
 	Generation   string        `json:"generation"`
 	HostBuild    string        `json:"host_build"`
+	NativeBuild  string        `json:"native_build"`
 	GuestBuild   string        `json:"guest_build"`
 	HostSource   string        `json:"host_source_base"`
 	NativeSource string        `json:"native_source_base"`
@@ -144,6 +157,7 @@ type sessionData struct {
 	Partition   uint64               `json:"partition_id"`
 	Generation  string               `json:"generation"`
 	HostBuild   string               `json:"host_build"`
+	NativeBuild string               `json:"native_build"`
 	GuestBuild  string               `json:"guest_build"`
 	Mask        uint32               `json:"expected_mask,omitempty"`
 	SealReceipt string               `json:"seal_receipt,omitempty"`
@@ -168,8 +182,8 @@ func label(s string) bool {
 	return true
 }
 
-// uniqueJSON rejects duplicate fields before typed decoding; encoding/json
-// otherwise accepts later fields and matches object keys case-insensitively.
+// uniqueJSON rejects duplicate or noncanonical field names before typed
+// decoding; encoding/json otherwise matches struct keys case-insensitively.
 func uniqueJSON(d *json.Decoder, depth int) error {
 	if depth > 32 {
 		return errors.New("JSON nesting exceeds limit")
@@ -187,6 +201,9 @@ func uniqueJSON(d *json.Decoder, depth int) error {
 				return err
 			}
 			name := strings.ToLower(key.(string))
+			if name != key {
+				return fmt.Errorf("noncanonical JSON field %q", key)
+			}
 			if seen[name] {
 				return fmt.Errorf("duplicate JSON field %q", name)
 			}
@@ -241,7 +258,7 @@ func fixtureValid(f guestFixture) bool {
 	}
 	for _, gpa := range f.GPAs {
 		// Architectural upper bound; native validates the partition's limit.
-		if gpa == 0 || gpa%pageSize != 0 || gpa >= 1<<52 {
+		if gpa == 0 || gpa%pageSize != 0 || gpa >= maxByteGPA {
 			return false
 		}
 	}
@@ -338,12 +355,14 @@ func (s *sessionData) bindFixture(f *guestFixture) binding {
 // any dispatcher uses the current journal snapshot.
 func (s *sessionData) validate() error {
 	if s.Schema != schemaVersion || s.Partition == 0 || s.Partition == self ||
-		!label(s.Generation) || !label(s.HostBuild) || !label(s.GuestBuild) || s.Cases == nil ||
-		(s.Mask == 0) != (s.SealReceipt == "") || s.Mask&^0x2f != 0 {
+		!label(s.Generation) || !label(s.HostBuild) || !label(s.NativeBuild) || !label(s.GuestBuild) || s.Cases == nil ||
+		(s.Mask == 0) != (s.SealReceipt == "") || (s.Mask != 0 && !label(s.SealReceipt)) || s.Mask&^0x2f != 0 {
 		return errors.New("invalid or obsolete session schema/identity")
 	}
 	if s.Last != nil && (s.Last.ID == 0 || s.Last.Generation != s.Generation ||
-		s.Last.Partition != s.Partition || (s.Last.Verdict == "pending" && !s.Tainted)) {
+		s.Last.Partition != s.Partition || s.Last.NativeBuild != s.NativeBuild ||
+		s.Last.HostBuild != s.HostBuild || s.Last.GuestBuild != s.GuestBuild ||
+		(s.Last.Verdict == "pending" && !s.Tainted)) {
 		return errors.New("invalid session attempt record")
 	}
 	pages, ids := map[uint64]bool{}, map[string]bool{}
@@ -356,8 +375,15 @@ func (s *sessionData) validate() error {
 			return errors.New("invalid session port fixture")
 		}
 		for i, ph := range p.Phase {
+			hasNativeState := ph.Sequence != 0 || ph.Known != 0 || ph.Maybe != 0
+			if ph.Sequence > 3 || ph.Known|ph.Maybe > 3 || ph.Known&ph.Maybe != 0 ||
+				((ph.BackingState == 0 || ph.BackingState == stateReady) && hasNativeState) ||
+				(ph.Clean && bits == 1) != (ph.BackingState == stateReleased) ||
+				(ph.BackingState == stateQuarantined && !s.Tainted) {
+				return errors.New("invalid backing lifetime record")
+			}
 			if bits > 2 {
-				if ph.Fixture != nil || ph.Backing != nil || ph.Holes != 0 || ph.BackingState != 0 {
+				if ph.Fixture != nil || ph.Backing != nil || ph.Holes != 0 || ph.BackingState != 0 || hasNativeState {
 					return errors.New("unexpected page fixture")
 				}
 			} else {
@@ -383,7 +409,7 @@ func (s *sessionData) validate() error {
 						(p.Complete && ph.Backing.Cookie == 0) {
 						return errors.New("changed mapping binding")
 					}
-				} else if ph.Backing != nil || ph.Holes != 0 || ph.BackingState != 0 {
+				} else if ph.Backing != nil || ph.Holes != 0 || ph.BackingState != 0 || hasNativeState {
 					return errors.New("unexpected backing state")
 				}
 			}
@@ -430,9 +456,16 @@ func openJournal(path string, create, readOnly bool) (*journal, error) {
 			f.Close()
 		}
 	}()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, errors.New("session must be a regular file")
+	var info windows.ByHandleFileInformation
+	kind, err := windows.GetFileType(h)
+	if err != nil || kind != windows.FILE_TYPE_DISK {
+		return nil, errors.New("session must be a disk file")
+	}
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return nil, err
+	}
+	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+		return nil, errors.New("session must be a regular file, not a reparse point")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxJournal+1))
 	if err != nil {
@@ -472,12 +505,26 @@ func (j *journal) commit() error {
 	if err != nil {
 		return err
 	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
 	return j.file.Sync()
 }
 
+// rememberBacking copies only a verified native reply into the phase ledger.
+func (ph *phaseRecord) rememberBacking(r backingReply) {
+	ph.BackingState, ph.Sequence, ph.Known, ph.Maybe = r.State, r.Sequence, r.Known, r.Maybe
+}
+
+// stop records an uncertain session without replacing its last attempt.
+func (j *journal) stop(reason error) error {
+	j.Tainted = true
+	return errors.Join(fmt.Errorf("stop both sides; keep evidence and triage or recreate the VM: %w", reason), j.commit())
+}
+
 // mutate commits intent before a single synchronous mutation, then separately
-// commits the observation and ownership changes. Any inconclusive result taints
-// the whole session; the callback cannot authorize an automatic retry.
+// commits the observation and ownership changes. Uncertain outcomes taint
+// the whole session; a known no-effect denial can still fail the diagnostic.
 func (j *journal) mutate(s selection, phase, operation string, page *uint32, run func(*attempt) (string, error)) error {
 	id := uint64(1)
 	if j.Last != nil {
@@ -487,21 +534,29 @@ func (j *journal) mutate(s selection, phase, operation string, page *uint32, run
 		return errors.New("interrupted or tainted session; stop both sides")
 	}
 	a := &attempt{ID: id, Operation: operation, Selection: s, Phase: phase, Page: page,
-		Partition: j.Partition, Generation: j.Generation, HostBuild: j.HostBuild, GuestBuild: j.GuestBuild,
+		Partition: j.Partition, Generation: j.Generation, HostBuild: j.HostBuild, NativeBuild: j.NativeBuild, GuestBuild: j.GuestBuild,
 		HostSource: hostSource, NativeSource: nativeSource, Mask: j.Mask, SealReceipt: j.SealReceipt, Verdict: "pending"}
+	if p := j.Cases[s.key()]; p != nil {
+		for i, ph := range p.Phase {
+			if ph.Fixture != nil && phase == phaseName(i) {
+				a.FixtureID = ph.Fixture.ID
+			}
+		}
+	}
 	j.Last, j.Tainted = a, true
 	if err := j.commit(); err != nil {
 		return fmt.Errorf("persist mutation intent: %w", err)
 	}
-	if _, err := fmt.Fprintf(os.Stderr, "dispatch attempt=%d case=%s phase=%s cpu=%d generation=%s operation=%s\n",
-		id, s.Case, phase, s.CPU, j.Generation, operation); err != nil {
+	if _, err := fmt.Fprintf(os.Stderr, "dispatch attempt=%d case=%s phase=%s cpu=%d generation=%s fixture=%q operation=%s\n",
+		id, s.Case, phase, s.CPU, j.Generation, a.FixtureID, operation); err != nil {
 		return err
 	}
 	var err error
 	a.Verdict, err = run(a)
 	if err != nil {
 		a.Failure = err.Error()
-	} else {
+	}
+	if err == nil || errors.Is(err, errControlDenied) || errors.Is(err, errConnectAttribution) {
 		j.Tainted = false
 	}
 	saveErr := j.commit()
@@ -514,5 +569,5 @@ func (j *journal) mutate(s selection, phase, operation string, page *uint32, run
 	if j.Tainted {
 		return fmt.Errorf("stop both sides; keep evidence and triage or recreate the VM: %w", err)
 	}
-	return nil
+	return err
 }
