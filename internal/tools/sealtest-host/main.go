@@ -21,7 +21,7 @@ const (
 
 const help = `sealtest-host: Windows AMD64 lab diagnostic (elevated; matching hvtest required)
   inventory [--session FILE [--case CASE ... --phase before|after]]
-  prepare --session FILE --partition-id ID --case CASE --confirm-workload --host-build ID
+  prepare --session FILE --partition-id ID --case CASE --confirm-workload --host-build ID --native-build ID
           [--fixtures V2_EXPORT | --generation ID --guest-build ID] [case options]
   probe --session FILE --case CASE --phase before|after [case selectors]
         [--expected-mask MASK --seal-receipt EVIDENCE_ID (after only)]
@@ -34,6 +34,7 @@ Cases: map-contiguous, map-sparse, parent-visibility-share,
 
 Prepare BOTH phases before the seal; phase always describes later execution.
 Map/visibility require --fixtures. Other preparations record --generation and --guest-build.
+Use --host-build and --native-build to record the actual CLI and matching driver/HV build receipts.
 Port preparation requires --port-id, --sint and --port-vp, plus --event-base
 for event. Create-port also needs --after-port-id. Connect cases instead need
 --connection-id and --after-connection-id. Use only reserved diagnostic IDs
@@ -42,7 +43,8 @@ on a quiet disposable host, not attested identity.
 
 Run the before control and clean up its owned mapping/alias/port/connection
 before sealing. The receiving fixture for a connect case is kept until its
-after probe. Record the seal command's successful native completion separately.
+after probe. Select a GHCB VP from live inventory; an existing parent alias
+is not a control. Record the seal command's successful native completion separately.
 An expected mask and receipt label are correlation, not an independent query.
 Release applies to safe host backing only. Guest reservations are never reclaimed.
 Do not retry uncertain calls; stop both sides. If the driver loses retained
@@ -50,14 +52,14 @@ uncertain state, reboot the host before another allocator run.
 `
 
 type options struct {
-	command, session, phase                     string
-	sel                                         selection
-	partition                                   uint64
-	fixtures, generation, hostBuild, guestBuild string
-	confirm                                     bool
-	mask                                        uint32
-	receipt                                     string
-	port                                        portSpec
+	command, session, phase                                  string
+	sel                                                      selection
+	partition                                                uint64
+	fixtures, generation, hostBuild, nativeBuild, guestBuild string
+	confirm                                                  bool
+	mask                                                     uint32
+	receipt                                                  string
+	port                                                     portSpec
 }
 
 // valid restricts Port/ConnectionId to unscoped diagnostic IDs and v1 bounded routes.
@@ -105,6 +107,7 @@ func parse(args []string) (options, error) {
 		f.StringVar(&o.fixtures, "fixtures", "", "guest v2 export")
 		f.StringVar(&o.generation, "generation", "", "guest generation")
 		f.StringVar(&o.hostBuild, "host-build", "", "matched host build identifier")
+		f.StringVar(&o.nativeBuild, "native-build", "", "matched native driver/HV build evidence identifier")
 		f.StringVar(&o.guestBuild, "guest-build", "", "matched guest build identifier")
 		f.BoolVar(&o.confirm, "confirm-workload", false, "confirm disposable workload association")
 		f.UintVar(&port, "port-id", 0, "reserved receiving port")
@@ -153,8 +156,8 @@ func parse(args []string) (options, error) {
 		}
 		return o, nil
 	}
-	if o.partition == 0 || o.partition == self || !label(o.hostBuild) || !o.confirm {
-		return o, errors.New("prepare requires explicit child, --host-build and --confirm-workload")
+	if o.partition == 0 || o.partition == self || !label(o.hostBuild) || !label(o.nativeBuild) || !o.confirm {
+		return o, errors.New("prepare requires explicit child, --host-build, --native-build and --confirm-workload")
 	}
 	if o.sel.bits() <= 2 {
 		if o.fixtures == "" || seen["generation"] || seen["guest-build"] {
@@ -211,7 +214,8 @@ func portTypeCode(s selection) uint32 {
 	return 1
 }
 
-// portInput creates only the reserved diagnostic port, at VTL0 on both ends.
+// portInput encodes HV_INPUT_CREATE_PORT for the reserved diagnostic port.
+// The VTL and proximity fields remain zero (VTL0 and no preference).
 func portInput(p *prepared, receiving, sending uint64, port uint32) []byte {
 	input := make([]byte, 56)
 	le.PutUint64(input, receiving)
@@ -265,7 +269,7 @@ func portCollides(a, b *prepared, partition uint64) bool {
 func rawStep(d device, j *journal, p *prepared, phase, op string, page *uint32, code uint32, input []byte, count uint32,
 	kind string, evaluate func(observation) (string, error)) error {
 	if err := d.activeChild(j.Partition); err != nil {
-		return err
+		return j.stop(fmt.Errorf("workload membership or state could not be revalidated: %w", err))
 	}
 	return j.mutate(p.Selection, phase, op, page, func(a *attempt) (string, error) {
 		o, err := d.raw(code, input, count, kind)
@@ -280,13 +284,16 @@ func rawStep(d device, j *journal, p *prepared, phase, op string, page *uint32, 
 // fullSuccess requires complete progress for REP, without manufacturing a
 // progress observation for a non-REP request.
 func fullSuccess(o observation) bool {
-	return o.Status != nil && *o.Status == 0 && (o.Requested == 0 ||
+	return o.FrameValid && o.Status != nil && *o.Status == 0 && (o.Requested == 0 ||
 		(o.Progress != nil && *o.Progress == o.Requested))
 }
 
 // requireSuccess never treats a native resource or authority failure as a control.
 func requireSuccess(o observation) error {
 	if !fullSuccess(o) {
+		if !o.FrameValid || o.Status == nil {
+			return fmt.Errorf("native prerequisite has no valid status: call=%#x", o.Call)
+		}
 		return fmt.Errorf("native prerequisite failed: call=%#x status=%#x (see result for REP progress)", o.Call, *o.Status)
 	}
 	return nil
@@ -305,7 +312,8 @@ func prepare(d device, j *journal, p *prepared) error {
 					return "inconclusive", err
 				}
 				a.Backing = &r
-				ph.Backing, ph.BackingState = &r.binding, r.State
+				ph.Backing = &r.binding
+				ph.rememberBacking(r)
 				return "allocated", nil
 			}); err != nil {
 				return err
@@ -345,15 +353,28 @@ func prepare(d device, j *journal, p *prepared) error {
 	return j.commit()
 }
 
+// queryBacking verifies the authoritative binding and state against the
+// journal before a mutation. A missing or changed record stops the session.
+func queryBacking(d device, j *journal, ph *phaseRecord) (backingReply, error) {
+	q, _, err := d.backing(opQuery, 0, *ph.Backing)
+	if err != nil {
+		return q, j.stop(fmt.Errorf("could not revalidate recorded backing: %w", err))
+	}
+	if q.State != ph.BackingState || q.Sequence != ph.Sequence || q.Known != ph.Known || q.Maybe != ph.Maybe {
+		return q, j.stop(errors.New("backing state changed outside the session"))
+	}
+	return q, nil
+}
+
 // mapProbe requires the exact still-ready driver binding, never a new allocation.
 func mapProbe(d device, j *journal, p *prepared, index int) error {
 	ph := &p.Phase[index]
-	q, _, err := d.backing(opQuery, 0, *ph.Backing)
+	q, err := queryBacking(d, j, ph)
 	if err != nil {
 		return err
 	}
-	if q.State != stateReady || ph.BackingState != stateReady {
-		return errors.New("mapping backing is no longer ready; do not retry")
+	if q.State != stateReady {
+		return j.stop(errors.New("mapping backing is no longer ready"))
 	}
 	return j.mutate(p.Selection, phaseName(index), "map", nil, func(a *attempt) (string, error) {
 		r, wire, err := d.backing(opMap, 0, *ph.Backing)
@@ -362,25 +383,27 @@ func mapProbe(d device, j *journal, p *prepared, index int) error {
 			return "inconclusive", err
 		}
 		a.Backing = &r
-		ph.Consumed, ph.BackingState = true, r.State
+		ph.Consumed = true
+		ph.rememberBacking(r)
 		if index == 0 && r.State == stateMapped {
 			ph.Control = true
 			return "expected-success", nil
 		}
-		if index == 1 && r.State == stateNoEffect {
-			return "seal-denied", nil
+		if r.State == stateNoEffect {
+			if index == 1 {
+				return "seal-denied", nil
+			}
+			return "rejection-observed", errControlDenied
 		}
 		if index == 1 && fullSuccess(r.Native) {
 			return "unexpected-success", errors.New("after mapping accepted; backing quarantined")
-		}
-		if r.Native.Status != nil && *r.Native.Status == statusDenied && *r.Native.Progress == 0 {
-			return "rejection-observed", errors.New("zero-progress denial lacks a backing release proof; backing quarantined")
 		}
 		return "inconclusive", errors.New("mapping did not establish the required control or denial; backing quarantined")
 	})
 }
 
-// ghcbInput selects explicit VTL0 without requesting a parent mapping location.
+// ghcbInput encodes the HvVpApi.h map/unmap layouts, selecting explicit VTL0
+// without supplying a parent mapping location.
 func ghcbInput(partition uint64, cpu int, mapPage bool) []byte {
 	n := 16
 	if mapPage {
@@ -443,7 +466,7 @@ func probe(d device, j *journal, p *prepared, i int) error {
 		if err := requireSuccess(o); err != nil {
 			return "inconclusive", err
 		}
-		if kind != "" && (!o.OutputValid || *o.Value == 0 || *o.Value >= 1<<(52-12)) {
+		if kind != "" && !o.OutputValid {
 			return "inconclusive", errors.New("missing or invalid parent alias location after native success")
 		}
 		ph.Control, ph.Owned, ph.Clean = true, p.Selection.bits() >= 4, p.Selection.bits() == 2
@@ -455,11 +478,11 @@ func probe(d device, j *journal, p *prepared, i int) error {
 // reclaim guest reservations, stale bindings or an uncertain mapping.
 func cleanupBacking(d device, j *journal, p *prepared, index int) error {
 	ph := &p.Phase[index]
-	r, _, err := d.backing(opQuery, 0, *ph.Backing)
+	r, err := queryBacking(d, j, ph)
 	if err != nil {
 		return err
 	}
-	if r.State != ph.BackingState || r.State == stateQuarantined {
+	if r.State == stateQuarantined {
 		return errors.New("mapping state changed or is quarantined; no cleanup authorized")
 	}
 	for page := uint32(0); page < 2; page++ {
@@ -476,7 +499,7 @@ func cleanupBacking(d device, j *journal, p *prepared, index int) error {
 				return "inconclusive", err
 			}
 			a.Backing = &next
-			ph.BackingState = next.State
+			ph.rememberBacking(next)
 			if (next.State != stateMapped && next.State != stateUnmapped) ||
 				next.Known != r.Known&^(1<<page) || next.Sequence != r.Sequence+1 {
 				return "inconclusive", errors.New("owned unmap did not prove synchronized removal")
@@ -497,7 +520,11 @@ func cleanupBacking(d device, j *journal, p *prepared, index int) error {
 			return "inconclusive", err
 		}
 		a.Backing = &released
-		ph.BackingState, ph.Clean = released.State, true
+		if released.Sequence != r.Sequence {
+			return "inconclusive", errors.New("release reply changed the recorded native attempt")
+		}
+		ph.rememberBacking(released)
+		ph.Clean = true
 		return "backing-released", nil
 	})
 }
@@ -586,6 +613,9 @@ func inventory(d device, j *journal, o options, i int) error {
 // run resolves all local prerequisites before opening hvtest. It never
 // creates, seals or silently selects a VM, and never resumes interrupted writes.
 func run(o options) error {
+	if err := requireHost(); err != nil {
+		return err
+	}
 	var j *journal
 	var p *prepared
 	i := 0
@@ -615,10 +645,10 @@ func run(o options) error {
 		case "prepare":
 			if j.Schema == 0 {
 				j.sessionData = sessionData{Schema: schemaVersion, Partition: o.partition, Generation: o.generation,
-					HostBuild: o.hostBuild, GuestBuild: o.guestBuild, Cases: map[string]*prepared{}}
+					HostBuild: o.hostBuild, NativeBuild: o.nativeBuild, GuestBuild: o.guestBuild, Cases: map[string]*prepared{}}
 			}
 			if j.Partition != o.partition || j.Generation != o.generation ||
-				j.HostBuild != o.hostBuild || j.GuestBuild != o.guestBuild || p != nil || j.Mask != 0 {
+				j.HostBuild != o.hostBuild || j.NativeBuild != o.nativeBuild || j.GuestBuild != o.guestBuild || p != nil || j.Mask != 0 {
 				return errors.New("session identity mismatch, already prepared case, or after phase started")
 			}
 			p = &prepared{Selection: o.sel, Port: o.port}
@@ -688,7 +718,7 @@ func run(o options) error {
 		return inventory(d, j, o, i)
 	}
 	if err := d.activeChild(j.Partition); err != nil {
-		return err
+		return j.stop(fmt.Errorf("workload membership or state could not be revalidated: %w", err))
 	}
 	switch o.command {
 	case "prepare":
@@ -697,7 +727,10 @@ func run(o options) error {
 			if err != nil {
 				return err
 			}
-			if caps.Used > 4 || (j.Instance != ([16]byte{}) && j.Instance != caps.Instance) {
+			if j.Instance != ([16]byte{}) && j.Instance != caps.Instance {
+				return j.stop(errors.New("backing driver instance changed"))
+			}
+			if caps.Used > 4 {
 				return errors.New("need four free host backing pages in the matching driver instance")
 			}
 			j.Instance = caps.Instance

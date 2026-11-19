@@ -14,6 +14,7 @@ import (
 
 const (
 	pageSize       = 4096
+	maxByteGPA     = 1 << 52 // HV_MAX_CHILD_PHYSICAL_ADDRESS_WIDTH, AMD64
 	self           = ^uint64(0)
 	ioctlUtil      = (1 << 2) | 1
 	oidRaw         = 4
@@ -95,14 +96,29 @@ type backingReply struct {
 	Sequence    uint64      `json:"sequence"`
 	NativeValid bool        `json:"native_valid"`
 	Dispatched  bool        `json:"dispatched"`
+	Recorded    bool        `json:"recorded_observation"`
 	Native      observation `json:"native"`
 }
 
-// openDevice accepts only the single present, installed interface, when elevated.
-func openDevice() (device, error) {
+// requireHost refuses non-AMD64 Windows hosts, including x64 emulation, and
+// requires elevation before reading or creating a diagnostic session.
+func requireHost() error {
 	if runtime.GOARCH != "amd64" || !windows.GetCurrentProcessToken().IsElevated() {
-		return 0, errors.New("requires an elevated Windows AMD64 process")
+		return errors.New("requires an elevated Windows AMD64 process")
 	}
+	const imageFileMachineAMD64 = 0x8664
+	var processMachine, nativeMachine uint16
+	if err := windows.IsWow64Process2(windows.CurrentProcess(), &processMachine, &nativeMachine); err != nil {
+		return fmt.Errorf("verify native Windows architecture: %w", err)
+	}
+	if processMachine != 0 || nativeMachine != imageFileMachineAMD64 {
+		return errors.New("requires native Windows AMD64, not emulation")
+	}
+	return nil
+}
+
+// openDevice opens only the single present, installed interface after requireHost.
+func openDevice() (device, error) {
 	guid := windows.GUID{Data1: 0x795e12bd, Data2: 0x1d51, Data3: 0x4e15, Data4: [8]byte{0x9f, 0x8a, 0x4b, 0xad, 0x23, 0xd6, 0xbb, 0x4d}}
 	paths, err := windows.CM_Get_Device_Interface_List("", &guid, windows.CM_GET_DEVICE_INTERFACE_LIST_PRESENT)
 	if err != nil {
@@ -134,8 +150,14 @@ func (d device) raw(code uint32, input []byte, count uint32, outputKind string) 
 	if outputKind != "" {
 		outputSize = 8
 	}
-	inOwner, in := aligned(pageSize + len(input))
-	outOwner, out := aligned(pageSize + outputSize)
+	// Match TfUtil::Hypercall: reserve full pages; header sizes describe the
+	// actual native payloads, not the lengths submitted to DeviceIoControl.
+	inOwner, in := aligned(2 * pageSize)
+	outLength := pageSize
+	if outputSize != 0 {
+		outLength += pageSize
+	}
+	outOwner, out := aligned(outLength)
 	le.PutUint32(in, oidRaw)
 	le.PutUint32(in[4:], objMethod)
 	le.PutUint16(in[8:], uint16(code))
@@ -153,7 +175,6 @@ func (d device) raw(code uint32, input []byte, count uint32, outputKind string) 
 	if int(o.Returned) != len(out) {
 		return o, fmt.Errorf("raw utility reply length %d, want %d", o.Returned, len(out))
 	}
-	o.FrameValid = true
 	status, progress := uint32(le.Uint16(out)), le.Uint32(out[4:])
 	o.Status = &status
 	if count != 0 {
@@ -162,9 +183,11 @@ func (d device) raw(code uint32, input []byte, count uint32, outputKind string) 
 	if progress > count {
 		return o, fmt.Errorf("invalid REP progress %d/%d", progress, count)
 	}
+	o.FrameValid = true
 	if status == 0 && outputSize != 0 {
 		value := le.Uint64(out[pageSize:])
-		o.OutputValid, o.Value = true, &value
+		o.Value = &value
+		o.OutputValid = outputKind != "parent-map-location-page" || (value != 0 && value < maxByteGPA/pageSize)
 	}
 	return o, nil
 }
@@ -272,8 +295,8 @@ func (d device) backing(op, index uint32, b binding) (r backingReply, wire obser
 		return r, wire, errors.New("backing reply changed binding or has inconsistent metadata")
 	}
 	r.NativeValid, r.Dispatched = nv == 1, dispatched == 1
-	if !r.NativeValid {
-		if code|count|status|progress != 0 || r.Sequence != 0 || r.Dispatched {
+	if r.Sequence == 0 {
+		if code|count|status|progress != 0 || r.NativeValid || r.Dispatched {
 			return r, wire, errors.New("invalid absent native observation")
 		}
 	} else {
@@ -283,19 +306,21 @@ func (d device) backing(op, index uint32, b binding) (r backingReply, wire obser
 		}
 		if !((code == mapCode && count == 2 && r.Sequence == 1) ||
 			(code == callUnmap && count == 1 && (r.Sequence == 2 || r.Sequence == 3) && b.Phase == 1)) ||
-			(op == opMap && code != mapCode) || (op == opUnmap && code != callUnmap) || status > 0xffff {
+			(op == opMap && code != mapCode) || (op == opUnmap && code != callUnmap) ||
+			status > 0xffff || progress > 0xfff || (r.NativeValid && progress > count) {
 			return r, wire, errors.New("invalid backing native observation metadata")
 		}
-		r.Native = observation{Call: code, Requested: count, Status: &status, Progress: &progress}
+		r.Recorded = !r.Dispatched
+		r.Native = observation{FrameValid: r.NativeValid, Call: code, Requested: count, Status: &status, Progress: &progress}
 	}
 	complete := r.NativeValid && status == 0 && progress == count
 	clear := r.Known|r.Maybe == 0
 	validState := false
 	switch r.State {
 	case 0:
-		validState = op == opCapabilities && !r.NativeValid && clear
+		validState = op == opCapabilities && r.Sequence == 0 && clear
 	case stateReady:
-		validState = (op == opAllocate || op == opQuery) && !r.NativeValid && clear
+		validState = (op == opAllocate || op == opQuery) && r.Sequence == 0 && clear
 	case stateMapped:
 		validState = (op == opQuery || op == opMap || op == opUnmap) &&
 			b.Phase == 1 && complete && r.Maybe == 0 &&
@@ -305,10 +330,17 @@ func (d device) backing(op, index uint32, b binding) (r backingReply, wire obser
 	case stateNoEffect:
 		validState = (op == opQuery || op == opMap) && r.NativeValid && status == statusDenied && progress == 0 && r.Sequence == 1 && clear
 	case stateQuarantined:
-		validState = (op == opQuery || op == opMap || op == opUnmap) && r.NativeValid && !clear
+		validState = (op == opQuery || op == opMap || op == opUnmap) &&
+			((r.Sequence == 1 && ((complete && b.Phase == 2 && r.Known == 3 && r.Maybe == 0) ||
+				(!complete && r.Known == 0 && r.Maybe == 3))) ||
+				(!complete && r.Sequence == 2 && r.Known|r.Maybe == 3 && (r.Maybe == 1 || r.Maybe == 2)) ||
+				(!complete && r.Sequence == 3 && r.Known == 0 && (r.Maybe == 1 || r.Maybe == 2)))
 	case stateReleased:
-		validState = op == opRelease && clear && (!r.NativeValid ||
-			(complete && r.Sequence == 3) || (status == statusDenied && progress == 0 && r.Sequence == 1))
+		validState = op == opRelease && clear && (r.Sequence == 0 ||
+			(complete && r.Sequence == 3) || (r.NativeValid && status == statusDenied && progress == 0 && r.Sequence == 1))
+	}
+	if op != opCapabilities && op != opRelease && r.Used < 2 {
+		validState = false
 	}
 	if !validState {
 		return r, wire, errors.New("invalid backing lifetime state")
