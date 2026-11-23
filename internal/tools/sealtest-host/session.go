@@ -165,6 +165,15 @@ type sessionData struct {
 	Tainted     bool                 `json:"tainted"`
 	Cases       map[string]*prepared `json:"cases"`
 	Last        *attempt             `json:"attempt,omitempty"`
+	PortPool    *portPoolRecord      `json:"port_pool,omitempty"`
+}
+
+type portPoolRecord struct {
+	Requested uint32                `json:"requested_pages"`
+	Before    winHvPoolObservation  `json:"before"`
+	Deposit   *winHvPoolObservation `json:"deposit,omitempty"`
+	After     *winHvPoolObservation `json:"after,omitempty"`
+	Complete  bool                  `json:"complete"`
 }
 
 // label bounds operator correlation strings and excludes whitespace/control
@@ -358,6 +367,15 @@ func (s *sessionData) validate() error {
 		!label(s.Generation) || !label(s.HostBuild) || !label(s.NativeBuild) || !label(s.GuestBuild) || s.Cases == nil ||
 		(s.Mask == 0) != (s.SealReceipt == "") || (s.Mask != 0 && !label(s.SealReceipt)) || s.Mask&^0x2f != 0 {
 		return errors.New("invalid or obsolete session schema/identity")
+	}
+	if p := s.PortPool; p != nil {
+		if p.Requested != portPoolPages || s.Instance == ([16]byte{}) ||
+			(!p.Complete && (!s.Tainted || len(s.Cases) != 0 || s.Mask != 0)) ||
+			(p.Complete && (p.Deposit == nil || p.Deposit.Processed == nil ||
+				!validPortPoolDeposit(p.Requested, *p.Deposit.Processed) || p.After == nil ||
+				p.After.Available == nil || p.After.InUse == nil)) {
+			return errors.New("invalid port pool funding record")
+		}
 	}
 	if s.Last != nil && (s.Last.ID == 0 || s.Last.Generation != s.Generation ||
 		s.Last.Partition != s.Partition || s.Last.NativeBuild != s.NativeBuild ||

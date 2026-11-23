@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -21,6 +22,9 @@ const (
 
 const help = `sealtest-host: Windows AMD64 lab diagnostic (elevated; matching hvtest required)
   inventory [--session FILE [--case CASE ... --phase before|after]]
+  check-port-pool --partition-id ID
+  fund-port-pool --session NEW_FILE --partition-id ID --driver-instance HEX
+          --confirm-workload --generation ID --guest-build ID --host-build ID --native-build ID
   prepare --session FILE --partition-id ID --case CASE --confirm-workload --host-build ID --native-build ID
           [--fixtures V2_EXPORT | --generation ID --guest-build ID] [case options]
   probe --session FILE --case CASE --phase before|after [case selectors]
@@ -63,6 +67,7 @@ type options struct {
 	mask                                                     uint32
 	receipt                                                  string
 	port                                                     portSpec
+	driverInstance                                           [16]byte
 }
 
 // valid restricts Port/ConnectionId to unscoped diagnostic IDs and v1 bounded routes.
@@ -98,7 +103,18 @@ func parse(args []string) (options, error) {
 	f.IntVar(&o.sel.CPU, "cpu", -1, "GHCB VP index")
 	f.StringVar(&o.sel.PortType, "port-type", "", "event or message")
 	var mask, port, afterPort, conn, afterConn, sint, vp, base uint
+	var driverInstance string
 	switch o.command {
+	case "check-port-pool":
+		f.Uint64Var(&o.partition, "partition-id", 0, "verified disposable workload partition ID")
+	case "fund-port-pool":
+		f.Uint64Var(&o.partition, "partition-id", 0, "verified disposable workload partition ID")
+		f.StringVar(&driverInstance, "driver-instance", "", "expected 16-byte driver instance in hex")
+		f.StringVar(&o.generation, "generation", "", "guest generation")
+		f.StringVar(&o.hostBuild, "host-build", "", "matched host build identifier")
+		f.StringVar(&o.nativeBuild, "native-build", "", "matched native build identifier")
+		f.StringVar(&o.guestBuild, "guest-build", "", "matched guest build identifier")
+		f.BoolVar(&o.confirm, "confirm-workload", false, "confirm disposable workload association")
 	case "inventory", "probe", "cleanup":
 		f.StringVar(&o.phase, "phase", "", "before or after")
 		if o.command == "probe" {
@@ -130,6 +146,23 @@ func parse(args []string) (options, error) {
 	f.Visit(func(f *flag.Flag) { seen[f.Name] = true })
 	if f.NArg() != 0 {
 		return o, errors.New("unexpected positional arguments")
+	}
+	if o.command == "check-port-pool" {
+		if len(seen) != 1 || !seen["partition-id"] || o.partition == 0 || o.partition == self {
+			return o, errors.New("check-port-pool requires only an explicit child --partition-id")
+		}
+		return o, nil
+	}
+	if o.command == "fund-port-pool" {
+		decoded, err := hex.DecodeString(driverInstance)
+		copy(o.driverInstance[:], decoded)
+		if err != nil || len(decoded) != len(o.driverInstance) || o.driverInstance == ([16]byte{}) ||
+			len(seen) != 8 || seen["case"] || seen["cpu"] || seen["port-type"] ||
+			o.session == "" || o.partition == 0 || o.partition == self || !o.confirm ||
+			!label(o.generation) || !label(o.hostBuild) || !label(o.nativeBuild) || !label(o.guestBuild) {
+			return o, errors.New("fund-port-pool requires a new session and verified workload, build and driver identity")
+		}
+		return o, nil
 	}
 	if o.command == "inventory" && o.sel.Case == "" {
 		if seen["case"] || seen["phase"] || seen["port-type"] || seen["cpu"] || (seen["session"] && o.session == "") {
@@ -616,6 +649,81 @@ func inventory(d device, j *journal, o options, i int) error {
 	return errors.Join(err, json.NewEncoder(os.Stdout).Encode(out))
 }
 
+// checkPortPool checks both WinHv handlers on one device without donating pages.
+func checkPortPool(d device, partition uint64) error {
+	if err := d.activeChild(partition); err != nil {
+		return err
+	}
+	caps, _, err := d.backing(opCapabilities, 0, binding{})
+	if err != nil {
+		return err
+	}
+	if caps.Instance == ([16]byte{}) {
+		return errors.New("missing hvtest driver instance")
+	}
+	report := struct {
+		Partition uint64                `json:"partition_id"`
+		Instance  [16]byte              `json:"driver_instance"`
+		Balance   winHvPoolObservation  `json:"balance"`
+		Deposit   *winHvPoolObservation `json:"zero_page_deposit,omitempty"`
+	}{Partition: partition, Instance: caps.Instance}
+	report.Balance, err = d.winHvPool(partition, callMemoryBalance, 0)
+	if err == nil {
+		var deposit winHvPoolObservation
+		deposit, err = d.winHvPool(partition, callDepositMemory, 0)
+		report.Deposit = &deposit
+	}
+	return errors.Join(err, json.NewEncoder(os.Stdout).Encode(report))
+}
+
+// fundPortPool binds and journals one fixed deposit before any fixture preparation.
+func fundPortPool(d device, o options) error {
+	if err := d.activeChild(o.partition); err != nil {
+		return err
+	}
+	caps, _, err := d.backing(opCapabilities, 0, binding{})
+	if err != nil {
+		return err
+	}
+	if caps.Instance != o.driverInstance {
+		return errors.New("pool funding driver instance changed")
+	}
+	balance, err := d.winHvPool(o.partition, callMemoryBalance, 0)
+	if err != nil {
+		return errors.Join(err, json.NewEncoder(os.Stdout).Encode(balance))
+	}
+	check, err := d.winHvPool(o.partition, callDepositMemory, 0)
+	if err != nil {
+		return errors.Join(err, json.NewEncoder(os.Stdout).Encode(check))
+	}
+	j, err := openJournal(o.session, true, false)
+	if err != nil {
+		return err
+	}
+	defer j.file.Close()
+	if j.size != 0 {
+		return errors.New("pool funding requires a new journal; do not replay")
+	}
+	record := &portPoolRecord{Requested: portPoolPages, Before: balance}
+	j.sessionData = sessionData{Schema: schemaVersion, Partition: o.partition, Generation: o.generation,
+		HostBuild: o.hostBuild, NativeBuild: o.nativeBuild, GuestBuild: o.guestBuild, Instance: caps.Instance,
+		Cases: map[string]*prepared{}, Tainted: true, PortPool: record}
+	if err := j.commit(); err != nil {
+		return err
+	}
+	deposit, err := d.winHvPool(o.partition, callDepositMemory, portPoolPages)
+	record.Deposit = &deposit
+	if err == nil {
+		var after winHvPoolObservation
+		after, err = d.winHvPool(o.partition, callMemoryBalance, 0)
+		record.After = &after
+	}
+	if err == nil {
+		record.Complete, j.Tainted = true, false
+	}
+	return errors.Join(err, j.commit(), json.NewEncoder(os.Stdout).Encode(record))
+}
+
 // run resolves all local prerequisites before opening hvtest. It never
 // creates, seals or silently selects a VM, and never resumes interrupted writes.
 func run(o options) error {
@@ -636,7 +744,7 @@ func run(o options) error {
 		}
 		o.generation, o.guestBuild, pair = x.Generation, x.GuestBuild, fixtures
 	}
-	if o.session != "" {
+	if o.session != "" && o.command != "fund-port-pool" {
 		var err error
 		j, err = openJournal(o.session, o.command == "prepare", o.command == "inventory")
 		if err != nil {
@@ -723,8 +831,23 @@ func run(o options) error {
 	if o.command == "inventory" {
 		return inventory(d, j, o, i)
 	}
+	if o.command == "check-port-pool" {
+		return checkPortPool(d, o.partition)
+	}
+	if o.command == "fund-port-pool" {
+		return fundPortPool(d, o)
+	}
 	if err := d.activeChild(j.Partition); err != nil {
 		return j.stop(fmt.Errorf("workload membership or state could not be revalidated: %w", err))
+	}
+	if j.PortPool != nil && p != nil && p.Selection.bits() == 8 {
+		caps, _, err := d.backing(opCapabilities, 0, binding{})
+		if err != nil {
+			return j.stop(err)
+		}
+		if caps.Instance != j.Instance {
+			return j.stop(errors.New("pool funding driver instance changed"))
+		}
 	}
 	switch o.command {
 	case "prepare":
