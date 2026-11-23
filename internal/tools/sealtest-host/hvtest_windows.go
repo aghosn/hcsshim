@@ -17,6 +17,7 @@ const (
 	maxByteGPA     = 1 << 52 // HV_MAX_CHILD_PHYSICAL_ADDRESS_WIDTH, AMD64
 	self           = ^uint64(0)
 	ioctlUtil      = (1 << 2) | 1
+	ioctlWinHv     = (11 << 2) | 1 // IOCTL_TFK_HYPERVISOR_ISSUE_WINHV_HYPERCALL
 	oidRaw         = 4
 	oidBacking     = 31
 	objMethod      = 2
@@ -27,6 +28,8 @@ const (
 	// Published hypercall codes and HvStatus.h, not converted NTSTATUS.
 	callWeight        = 0x0044
 	callChild         = 0x0047
+	callDepositMemory = 0x0048
+	callMemoryBalance = 0x004a
 	callMapContiguous = 0x004b
 	callUnmap         = 0x004c
 	callDeletePort    = 0x0058
@@ -62,6 +65,81 @@ const (
 var le = binary.LittleEndian
 
 type device windows.Handle
+
+type winHvPoolObservation struct {
+	Call      uint32  `json:"call_code"`
+	Transport bool    `json:"transport_ok"`
+	Returned  uint32  `json:"returned_bytes"`
+	Status    *uint16 `json:"hv_status,omitempty"`
+	Available *uint64 `json:"pages_available,omitempty"`
+	InUse     *uint64 `json:"pages_in_use,omitempty"`
+	Processed *uint32 `json:"pages_processed,omitempty"`
+}
+
+const (
+	portPoolPages = 16
+	// WinHv can round the allocation up to one 2 MiB page on AMD64.
+	portPoolLargePage = (2 * 1024 * 1024) / pageSize
+)
+
+// validPortPoolDeposit accepts the exact request or WinHv's one-large-page
+// result. The zero-page capability check must still report exactly zero.
+func validPortPoolDeposit(requested, processed uint32) bool {
+	return processed == requested || (requested == portPoolPages && processed == portPoolLargePage)
+}
+
+// winHvPool accepts only balance, zero-page capability checks, and fixed lab funding.
+func (d device) winHvPool(partition uint64, call, requested uint32) (o winHvPoolObservation, err error) {
+	o.Call = call
+	if !(call == callMemoryBalance && requested == 0 ||
+		call == callDepositMemory && (requested == 0 || requested == portPoolPages)) {
+		return o, errors.New("unsupported WinHv pool capability query")
+	}
+	// The driver requires room for the full TFHV containers, not just the
+	// selected union members. On AMD64 both unions start at byte 16.
+	const containerBuffer = 2 * pageSize
+	in, out := make([]byte, containerBuffer), make([]byte, containerBuffer)
+	le.PutUint32(in, call)
+	le.PutUint64(in[16:], partition)
+	if call == callDepositMemory && requested != 0 {
+		le.PutUint32(in[24:], 0x80000000) // WINHV_ANY_NODE_OK
+		le.PutUint32(in[28:], requested)
+	}
+	for i := range out {
+		out[i] = 0xff
+	}
+	err = windows.DeviceIoControl(windows.Handle(d), ioctlWinHv, &in[0], uint32(len(in)), &out[0], uint32(len(out)), &o.Returned, nil)
+	if err != nil {
+		return o, fmt.Errorf("WinHv pool call %#x: %w", call, err)
+	}
+	o.Transport = true
+	// METHOD_IN_DIRECT uses the caller's mapped buffer. These legacy
+	// handlers write it directly without updating BytesReturned.
+	status := le.Uint16(out)
+	if o.Returned != 0 || status == 0xffff {
+		return o, fmt.Errorf("WinHv pool call %#x: incompatible reply (returned=%d)", call, o.Returned)
+	}
+	o.Status = &status
+	if call == callDepositMemory {
+		pages := le.Uint32(out[16:])
+		if pages != ^uint32(0) {
+			o.Processed = &pages
+		}
+		if status != 0 || o.Processed == nil || !validPortPoolDeposit(requested, pages) {
+			return o, fmt.Errorf("WinHv deposit did not match the permitted result: requested=%d observed=%d HV_STATUS=%#x", requested, pages, status)
+		}
+	} else {
+		if status != 0 {
+			return o, fmt.Errorf("WinHv balance: HV_STATUS=%#x", status)
+		}
+		available, inUse := le.Uint64(out[16:]), le.Uint64(out[24:])
+		if available == ^uint64(0) || inUse == ^uint64(0) {
+			return o, errors.New("WinHv balance counters were not written")
+		}
+		o.Available, o.InUse = &available, &inUse
+	}
+	return o, nil
+}
 
 type observation struct {
 	TransportOK  bool    `json:"transport_ok"`
