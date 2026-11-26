@@ -118,6 +118,9 @@ var cwcowCommand = cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
+		if err := prepareVMResources(c); err != nil {
+			return err
+		}
 		runMany(c, func(id string) error {
 			// Resolve the boot files: either derive them from a single directory or use the
 			// individually-provided VHD/VMGS paths. The scratch VHD is always provided separately.
@@ -182,7 +185,9 @@ var cwcowCommand = cli.Command{
 					ScratchVHDPath: scratchVHD,
 				},
 			}
-			setGlobalOptions(c, options.Options)
+			if err := setGlobalOptions(c, options.Options); err != nil {
+				return err
+			}
 
 			vm, err := uvm.CreateWCOW(context.TODO(), options)
 			if err != nil {

@@ -345,13 +345,17 @@ var lcowCommand = cli.Command{
 			Usage: "Use a two-physical-core budget with host SMT disabled, for a baseline or shared-affinity pair.",
 		},
 		cli.BoolFlag{
-			Name:  networkBenchmarkSingleVPArgName,
-			Usage: "Use one VP for a matched Linux/Unikraft network comparison or its standalone reference (Linux default remains two)",
+			Name:  networkBenchmarkSMTOffPlacementArgName,
+			Usage: "Use caller-verified SMT-off debugging placement with one LP per physical core and per-VM VP counts.",
 		},
 		cli.StringFlag{
 			Name:  networkBenchmarkIdleArgName,
 			Value: "poll",
 			Usage: "Required guest boot idle policy for network benchmarks: poll or halt.",
+		},
+		cli.StringFlag{
+			Name:  networkBenchmarkDiodeIdleArgName,
+			Usage: "Diode idle policy override: poll or halt. Mixed Linux pairs require network-workload.vmgs; Unikraft pairs retain sibling-root.vmgs.",
 		},
 		cli.StringFlag{Name: storageBenchmarkScriptArgName, Usage: "Run the disposable ext4 fio experiment."},
 		cli.StringFlag{Name: storageBenchmarkDiskArgName, Usage: "New disposable benchmark VHDX copy."},
@@ -361,10 +365,12 @@ var lcowCommand = cli.Command{
 		cli.IntFlag{Name: storageBenchmarkSyncIOArgName, Value: 128},
 		cli.IntFlag{Name: storageBenchmarkSizeArgName, Value: 1024},
 		cli.BoolFlag{Name: storageBenchmarkSmokeArgName},
+		cli.BoolFlag{Name: storageBenchmarkTestArgName, Usage: "Run the reduced storage performance-validation campaign."},
 		cli.BoolFlag{Name: storageBenchmarkStatsArgName},
 		cli.BoolFlag{Name: storageBenchmarkLatencyArgName, Usage: "Run only the fixed-operation QD1 latency experiment."},
 		cli.BoolFlag{Name: storageBenchmarkThroughputArgName, Usage: "Run only the timed QD32 bulk throughput experiment."},
 		cli.StringFlag{Name: storageBenchmarkIdleArgName, Value: "halt", Usage: "Storage workload idle policy: poll or halt."},
+		cli.StringFlag{Name: storageBenchmarkDiodeIdleArgName, Usage: "Storage diode idle policy override: poll or halt."},
 	},
 	// Action validates LCOW flags, owns the shared section and worker lifetimes,
 	// and returns setup/worker/mapping failures through the existing cleanup.
@@ -376,6 +382,9 @@ var lcowCommand = cli.Command{
 	// runMany joins workers before comparison. Byte-GPA conversion errors fail
 	// the run rather than allowing wrapped addresses into success diagnostics.
 	Action: func(c *cli.Context) (resultErr error) {
+		if err := prepareVMResources(c); err != nil {
+			return err
+		}
 		if err := validateProtectedPartitionCLI(c); err != nil {
 			return err
 		}
@@ -401,9 +410,12 @@ var lcowCommand = cli.Command{
 			_, err = fmt.Printf("storage_backend_plan: %s\n", data)
 			return err
 		}
-		unikraft, err := loadUnikraftConfig(c, storagePlan)
-		if err != nil {
-			return err
+		var unikraft *unikraftConfig
+		if c.String(storageBenchmarkScriptArgName) == "" {
+			unikraft, err = loadUnikraftConfig(c, storagePlan)
+			if err != nil {
+				return err
+			}
 		}
 		benchSeconds = c.Int(benchSecondsArgName)
 		if benchSeconds < 1 {
@@ -446,7 +458,7 @@ var lcowCommand = cli.Command{
 			if err != nil {
 				return err
 			}
-			if err := validateBenchmarkCPUs(topology, cpuGroupLPs, c.Bool(networkBenchmarkNoSMTArgName)); err != nil {
+			if err := validateBenchmarkCPUPlacement(c, topology, cpuGroupLPs); err != nil {
 				return err
 			}
 			siblingTests = map[string]bool{}
@@ -458,6 +470,9 @@ var lcowCommand = cli.Command{
 			benchmarkCtx, cancel = context.WithTimeout(benchmarkCtx, timeout)
 			cancelBenchmark = cancel
 			defer cancel()
+		}
+		if c.String(storageBenchmarkScriptArgName) != "" {
+			return runProductionStorageBenchmark(benchmarkCtx, c, cpuGroupLPs, cpuGroupPriorities)
 		}
 		cpuGroups, err := prepareCPUGroups(context.Background(), cpuGroupLPs,
 			c.GlobalInt(countArgName), hostCPUGroupOperations, cpuGroupPriorities...)
@@ -552,12 +567,14 @@ var lcowCommand = cli.Command{
 				return fmt.Errorf("inspect sibling-bus guest module: %w", err)
 			}
 		}
-		if c.Bool(siblingGCSRelayArgName) && (!useGCS || !siblingInteractive ||
+		if c.Bool(siblingGCSRelayArgName) && (!useGCS ||
+			(!siblingInteractive && !(unikraft != nil && c.String(networkBenchmarkScriptArgName) != "")) ||
 			!c.Bool(sharedMemoryTwoUVMArgName) || !c.Bool(siblingStorageRootArgName) ||
 			c.String(siblingBusGuestModuleArgName) == "" ||
-			c.String(siblingOpenShellBundleArgName) != "" || c.String(networkBenchmarkScriptArgName) != "" ||
+			c.String(siblingOpenShellBundleArgName) != "" ||
+			(c.String(networkBenchmarkScriptArgName) != "" && unikraft == nil) ||
 			c.String(storageBenchmarkScriptArgName) != "") {
-			return fmt.Errorf("--%s requires an interactive sibling-root pair without other experiments", siblingGCSRelayArgName)
+			return fmt.Errorf("--%s requires an interactive sibling-root pair or a Unikraft network benchmark", siblingGCSRelayArgName)
 		}
 		for _, flag := range []struct {
 			name  string
@@ -975,7 +992,9 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		return nil, fmt.Errorf("unexpect uVM create options type: %T", opt)
 	}
 
-	setGlobalOptions(c, options.Options)
+	if err := setGlobalOptions(c, options.Options); err != nil {
+		return nil, err
+	}
 	options.ConsolePipe = fmt.Sprintf(`\\.\pipe\uvmpipe-%s`, id)
 	if !useGCS && c.Duration(sharedMemoryObserveArgName) > 0 {
 		options.ConsolePipe = ""
@@ -1086,7 +1105,7 @@ func createLCOWOptions(ctx context.Context, c *cli.Context, id string) (*uvm.Opt
 		options.SecurityPolicyEnforcer = c.String(securityPolicyEnforcerArgName)
 	}
 	if c.IsSet(securityHardwareFlag) {
-		options.GuestStateFilePath = vmutils.DefaultGuestStateFile
+		options.GuestStateFilePath = networkBenchmarkGuestStateFile(c, id)
 		hclEnabled := false
 		options.HclEnabled = &hclEnabled
 		options.SecurityPolicyEnabled = true
@@ -1253,8 +1272,8 @@ func runLCOW(
 	}
 	var stopSampling func() error
 	if c.String(networkBenchmarkScriptArgName) != "" {
-		if uint64(vm.ProcessorCount()) != networkBenchmarkProcessors(c) {
-			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", networkBenchmarkProcessors(c), vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != requestedVMProcessors(c, vm.ID()) {
+			return fmt.Errorf("network benchmark requested %d VPs, HCS assigned %d", requestedVMProcessors(c, vm.ID()), vm.ProcessorCount())
 		}
 		sampleCPU, err := networkBenchmarkCPUEnabled(c)
 		if err != nil {
@@ -1271,8 +1290,8 @@ func runLCOW(
 		}
 	}
 	if c.String(storageBenchmarkScriptArgName) != "" {
-		if vm.ProcessorCount() != int32(c.GlobalUint64(cpusArgName)) {
-			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", c.GlobalUint64(cpusArgName), vm.ProcessorCount())
+		if uint64(vm.ProcessorCount()) != requestedVMProcessors(c, vm.ID()) {
+			return fmt.Errorf("storage benchmark requested %d VPs, HCS assigned %d", requestedVMProcessors(c, vm.ID()), vm.ProcessorCount())
 		}
 	}
 

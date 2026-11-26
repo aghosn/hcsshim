@@ -23,6 +23,9 @@ import (
 func runUnikraftProvider(ctx context.Context, c *cli.Context, cfg *unikraftConfig,
 	plan *siblingStoragePlan, group, cpuGroup string, section *sharedMemorySection,
 	gcsRelay *siblingGCSRelay) (resultErr error) {
+	if err := validateUnikraftResources(c, cfg.MemoryMB); err != nil {
+		return err
+	}
 	directory, err := filepath.Abs(c.String(unikraftPackageArgName))
 	if err != nil {
 		return err

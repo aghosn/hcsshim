@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -240,6 +242,22 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 	if _, err := LoadConfig("relative"); err == nil {
 		t.Fatal("accepted relative config-file path")
 	}
+	directory := t.TempDir()
+	path := filepath.Join(directory, "sibling-pair.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.directory != directory {
+		t.Fatalf("console directory does not follow the retained config: %q", config.directory)
+	}
+	config.directory = ""
+	if !reflect.DeepEqual(config, testConfig()) {
+		t.Fatalf("loading the config changed its VM settings: %+v", config)
+	}
 
 	protected := testConfig()
 	protected.ProtectedShared, protected.MediateGCS = true, true
@@ -259,6 +277,8 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 		{`,"diode_partition_seal_mask":"0"`, &zero, nil, false},
 		{`,"workload_partition_seal_mask":"0"`, nil, &zero, false},
 		{`,"diode_partition_seal_mask":"18446744073709551615","workload_partition_seal_mask":"18446744073709551615"`, &maximum, &maximum, false},
+		{`,"storage_direct_io":true,"published_tcp_ports":[11211],"vm_resources":[{"processor_count":1,"memory_mb":512},{"processor_count":4,"memory_mb":2048}]`, nil, nil, false},
+		{`,"standalone":true`, nil, nil, true},
 		{`,"diode_partition_seal_mask":null`, nil, nil, true},
 		{`,"workload_partition_seal_mask":null`, nil, nil, true},
 		{`,"diode_partition_seal_mask":0`, nil, nil, true},
@@ -301,6 +321,34 @@ func TestPairConfigStrictOptIn(t *testing.T) {
 		data, _ := json.Marshal(testConfig())
 		if _, err := decodeConfig(strings.NewReader(strings.TrimSuffix(string(data), "}") + fields + "}")); err == nil {
 			t.Fatalf("accepted protected mask without opt-in: %s", fields)
+		}
+	}
+}
+
+func TestPairStorageDirectIOOptIn(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		config := testConfig()
+		config.StorageDirectIO = enabled
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := decodeConfig(strings.NewReader(string(data)))
+		if err != nil || decoded.StorageDirectIO != enabled {
+			t.Fatalf("direct I/O opt-in did not survive decoding: %+v %v", decoded, err)
+		}
+	}
+	for _, config := range []*Config{
+		{Version: 1, Standalone: true, StorageDirectIO: true},
+		{Version: 1, ModuleDirectory: `C:\modules`, SharedMemoryBytes: 32 << 20,
+			WorkloadGuestStateFile: "sibling-root.vmgs", UnikraftPackage: `C:\unikraft`, StorageDirectIO: true},
+	} {
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeConfig(strings.NewReader(string(data))); err == nil {
+			t.Fatalf("accepted Linux provider setting for another backend: %s", data)
 		}
 	}
 }
@@ -371,11 +419,16 @@ func TestPairGCSRelayReadiness(t *testing.T) {
 		t.Run(fmt.Sprint(ready), func(t *testing.T) {
 			mock := `echo 'synthetic relay startup failure'; return 7`
 			if ready {
-				mock = `touch "$fixture/gcs-relay.ready"`
+				mock = `touch "$fixture/gcs-relay.ready"; exec /bin/sleep 1`
 			}
-			script := `fixture=$(mktemp -d); trap 'rm -f "$fixture/gcs-relay.ready" "$fixture/gcs-relay.pid" "$fixture/gcs-relay.log"; rmdir "$fixture"' EXIT; ` +
+			command := strings.ReplaceAll(GCSRelayCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture/sibling_instance"`)
+			script := `fixture=$(mktemp -d); relay_pid=; trap 'rc=$?; trap - EXIT; ` +
+				`if [ -n "$relay_pid" ]; then kill "$relay_pid" 2>/dev/null || :; wait "$relay_pid" 2>/dev/null || :; fi; ` +
+				`rm -f "$fixture/sibling_instance" "$fixture/gcs-relay.ready" "$fixture/gcs-relay.pid" "$fixture/gcs-relay.log"; rmdir "$fixture"; exit "$rc"' EXIT; ` +
+				`printf '%s\n' 'bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1' >"$fixture/sibling_instance"; ` +
 				`mock_gcs() { ` + mock + `; }; ` +
-				strings.ReplaceAll(strings.ReplaceAll(GCSRelayCommand(), "/bin/gcs", "mock_gcs"), "/run/gcs-relay", "$fixture/gcs-relay")
+				strings.ReplaceAll(strings.ReplaceAll(command, "/bin/gcs", "mock_gcs"), "/run/gcs-relay", "$fixture/gcs-relay")
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec", script).CombinedOutput()
@@ -411,6 +464,54 @@ func TestPairCloseIsOrderedAndIdempotentAfterFailures(t *testing.T) {
 	}
 	if !reflect.DeepEqual(calls, []string{"interactive", "workload", "diode", "uplink", "section"}) {
 		t.Fatalf("invalid provider/consumer lifetime: %v", calls)
+	}
+}
+
+func TestGCSRelayWaitsForSiblingInstanceBeforeBinding(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell unavailable")
+	}
+	for _, test := range []struct {
+		name, mode, instance, wantError string
+	}{
+		{"delayed-offer-and-enumeration", "delayed", "bus_id=1 local_cid=4 peer_cid=3 version=4", ""},
+		{"missing-bus", "missing", "", "Timed out waiting for ready sibling bus"},
+		{"wrong-role", "ready", "bus_id=1 local_cid=3 peer_cid=4 version=4", "Invalid sibling bus identity"},
+		{"old-protocol", "ready", "bus_id=1 local_cid=4 peer_cid=3 version=3", "Invalid sibling bus identity"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			script := strings.ReplaceAll(GCSRelayCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture"/*/sibling_instance`)
+			script = strings.ReplaceAll(script, "/run/gcs-relay", "$fixture/relay")
+			script = strings.ReplaceAll(script, "/bin/gcs", "fixture_gcs")
+			fixture := `fixture=$(mktemp -d); relay_pid=; sleeps=0; ` +
+				`trap 'rc=$?; trap - EXIT; if [ -n "$relay_pid" ]; then kill "$relay_pid" 2>/dev/null || :; wait "$relay_pid" 2>/dev/null || :; fi; ` +
+				`if [ -f "$fixture/launched" ]; then echo RELAY_INVOKED; fi; ` +
+				`rm -f "$fixture/bus-1/sibling_instance" "$fixture/relay.ready" "$fixture/relay.log" "$fixture/relay.pid" "$fixture/launched"; ` +
+				`rmdir "$fixture/bus-1" 2>/dev/null || :; rmdir "$fixture"; exit "$rc"' EXIT; ` +
+				`mode=` + Quote(test.mode) + `; instance=` + Quote(test.instance) + `; ` +
+				`publish() { mkdir -p "$fixture/bus-1"; printf '%s ready=%s\n' "$instance" "$1" >"$fixture/bus-1/sibling_instance"; }; ` +
+				`if [ "$mode" = ready ]; then publish 1; fi; ` +
+				`sleep() { sleeps=$((sleeps+1)); if [ "$mode" = delayed ]; then ` +
+				`if [ "$sleeps" -eq 1 ]; then publish 0; elif [ "$sleeps" -eq 2 ]; then publish 1; fi; ` +
+				`if [ "$sleeps" -ge 2 ]; then /bin/sleep 0.01; fi; fi; }; ` +
+				`fixture_gcs() { grep -q 'ready=1' "$fixture/bus-1/sibling_instance" || return 99; ` +
+				`echo launched >"$fixture/launched"; touch "$fixture/relay.ready"; exec /bin/sleep 1; }; `
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			output, err := exec.CommandContext(ctx, shell, "--exec", "/bin/sh", "-ec",
+				fixture+script+`; [ "$sleeps" -ge 2 ]`).CombinedOutput()
+			if test.wantError == "" {
+				if err != nil || !strings.Contains(string(output), "GCS_RELAY_READY:") ||
+					!strings.Contains(string(output), "RELAY_INVOKED") {
+					t.Fatalf("relay did not wait for delayed readiness: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), test.wantError) ||
+				strings.Contains(string(output), "RELAY_INVOKED") {
+				t.Fatalf("unready or invalid bus reached relay bind: %v\n%s", err, output)
+			}
+		})
 	}
 }
 

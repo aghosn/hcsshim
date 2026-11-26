@@ -39,6 +39,14 @@ func loadOwnedUnikraft(config *Config) (*UnikraftConfig, error) {
 	if !cfg.LiveStorage || cfg.GCSRelay != config.MediateGCS {
 		return nil, errors.New("owned Unikraft firmware must enable live_storage=1 and match mediate_gcs; no direct-GCS fallback")
 	}
+	if err := config.validateResources(); err != nil {
+		return nil, err
+	}
+	if config.VMResources != nil {
+		if err := config.VMResources[0].ValidateUnikraft(cfg.MemoryMB); err != nil {
+			return nil, err
+		}
+	}
 	info, err := os.Stat(filepath.Join(config.UnikraftPackage, "guest.vmgs"))
 	if err != nil {
 		return nil, err
@@ -50,9 +58,17 @@ func loadOwnedUnikraft(config *Config) (*UnikraftConfig, error) {
 }
 
 func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cfg *UnikraftConfig, group string) error {
-	if workload.ProcessorCount != 1 || workload.Appliance != nil ||
+	if workload.Appliance != nil ||
 		(workload.HclEnabled != nil && *workload.HclEnabled) {
-		return errors.New("owned Unikraft requires a one-VP direct-SNP workload")
+		return errors.New("owned Unikraft requires a direct-SNP workload")
+	}
+	if err := config.validateResources(); err != nil {
+		return err
+	}
+	if config.VMResources != nil {
+		if err := config.VMResources[0].ValidateUnikraft(cfg.MemoryMB); err != nil {
+			return err
+		}
 	}
 	diode.BootFilesPath, diode.GuestStateFilePath = config.UnikraftPackage, "guest.vmgs"
 	diode.UseGuestConnection, diode.ForwardStdout, diode.ForwardStderr = false, false, false
@@ -76,7 +92,7 @@ func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cf
 	return uvm.VerifyOptions(context.Background(), diode)
 }
 
-func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig) error {
+func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig, consoleDirectory string) error {
 	root := opts.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"].Path
 	if err := security.GrantVmGroupAccessWithMask(root, security.AccessMaskAll); err != nil {
 		return fmt.Errorf("grant access to permanent Unikraft boot root: %w", err)
@@ -89,7 +105,11 @@ func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig) 
 	opts.Appliance.NetworkAdapters = map[string]hcsschema.NetworkAdapter{
 		"00000000-0000-0000-0000-000000000001": {EndpointId: endpoint.Id, MacAddress: endpoint.MacAddress},
 	}
-	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, opts.BundleDirectory, cfg.Idle)
+	if consoleDirectory == "" {
+		consoleDirectory = opts.BundleDirectory
+	}
+	// Config-file callers retain the console outside the disposable task bundle.
+	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, consoleDirectory, cfg.Idle)
 	return err
 }
 

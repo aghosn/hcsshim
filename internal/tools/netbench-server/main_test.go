@@ -43,6 +43,9 @@ func TestControllerAuthenticationAndInput(t *testing.T) {
 		{"/begin", `{"id":"../../file"}`, "test-only", http.StatusBadRequest},
 		{"/begin", `{"id":"trial-1","args":["unsafe"]}`, "test-only", http.StatusBadRequest},
 		{"/begin", `{"id":"trial-1","primary_latency":"true"}`, "test-only", http.StatusBadRequest},
+		{"/begin", `{"id":"trial-1","timeout_seconds":-1}`, "test-only", http.StatusBadRequest},
+		{"/begin", `{"id":"trial-1","timeout_seconds":14401}`, "test-only", http.StatusBadRequest},
+		{"/begin", `{"id":"trial-1","timeout_seconds":1.5}`, "test-only", http.StatusBadRequest},
 		{"/begin", `{"id":"trial-1"} {}`, "test-only", http.StatusBadRequest},
 		{"/begin", `{"id":"trial-1"}`, "test-only", http.StatusConflict},
 		{"/end", `{"id":"wrong-trial"}`, "test-only", http.StatusConflict},
@@ -62,17 +65,17 @@ func TestListenerArgsSeparateLatencyFromBulkReporting(t *testing.T) {
 	base := []string{"-s", "-B", "192.0.2.10", "-p", "5201", "-e", "-f", "m", "--utc"}
 	bulkOptions := []string{"-i", "1"}
 	if runtime.GOOS == "windows" {
-		bulkOptions = []string{"-t", "600"}
+		bulkOptions = []string{"-t", "746"}
 	}
 	for _, tc := range []struct {
 		latency bool
 		options []string
 	}{
 		{false, bulkOptions},
-		{true, []string{"-t", "600"}},
+		{true, []string{"-t", "746"}},
 	} {
 		want := append(append([]string{}, base...), tc.options...)
-		if got := listenerArgs("192.0.2.10", 5201, tc.latency); !reflect.DeepEqual(got, want) {
+		if got := listenerArgs("192.0.2.10", 5201, tc.latency, 746*time.Second); !reflect.DeepEqual(got, want) {
 			t.Fatalf("latency=%v: arguments=%v, want=%v", tc.latency, got, want)
 		}
 	}
@@ -90,7 +93,7 @@ func TestControllerHealthReportsListenerProtocol(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &health); err != nil {
 		t.Fatal(err)
 	}
-	if w.Code != http.StatusOK || health.Protocol != 3 {
+	if w.Code != http.StatusOK || health.Protocol != 4 {
 		t.Fatalf("unexpected protocol: status=%d body=%s", w.Code, w.Body)
 	}
 }
@@ -101,6 +104,59 @@ func controlRequest(c *controller, method, path, body string) *httptest.Response
 	w := httptest.NewRecorder()
 	c.ServeHTTP(w, r)
 	return w
+}
+
+func TestControllerNegotiatedDeadlineStopsListenersAndPreservesFailure(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("NETBENCH_TEST_EXIT_MARKER", filepath.Join(root, "unused"))
+	c := &controller{token: "test-only", binary: os.Args[0], bind: "192.0.2.10",
+		port: 5201, output: root, seen: map[string]bool{}}
+	t.Cleanup(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.active != "" {
+			c.finish("test cleanup")
+		}
+	})
+	w := controlRequest(c, http.MethodPost, "/begin",
+		`{"id":"deadline-trial","primary_latency":true,"timeout_seconds":1}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("begin: %d %s", w.Code, w.Body)
+	}
+	for i, server := range c.servers {
+		if i == 0 || runtime.GOOS == "windows" {
+			if !strings.HasSuffix(strings.Join(server.cmd.Args, " "), "-t 1") {
+				t.Fatalf("listener did not use negotiated deadline: %v", server.cmd.Args)
+			}
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		w = controlRequest(c, http.MethodGet, "/result?id=deadline-trial", "")
+		if w.Code == http.StatusOK {
+			break
+		}
+		if w.Code != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatalf("negotiated deadline did not finish trial: %d %s", w.Code, w.Body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "deadline-trial.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result trialResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.TimeoutSeconds != 1 || result.Failure != "trial exceeded the 1s server deadline" ||
+		result.FailureKind != "" {
+		t.Fatalf("deadline failure was lost or marked retryable: %+v", result)
+	}
+	if w := controlRequest(c, http.MethodPost, "/begin",
+		`{"id":"deadline-trial","retry":true,"timeout_seconds":1}`); w.Code != http.StatusConflict {
+		t.Fatal("deadline failure was accepted for a server-crash retry")
+	}
 }
 
 func TestControllerCompletedResultRetrieval(t *testing.T) {

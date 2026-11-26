@@ -111,6 +111,7 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 		{"--storage-benchmark-io-mib", "0"}, {"--storage-benchmark-size-mib", "1"},
 		{"--storage-benchmark-io-mib", "10241"}, {"--storage-benchmark-sync-io-mib", "3"},
 		{"--storage-benchmark-timeout", "0s"},
+		{"--storage-benchmark-test"},
 	} {
 		candidate := benchmarkTestContext(t, append(append([]string{}, args...), extra...)...)
 		if err := validateStorageBenchmark(candidate, groups, nil); err == nil {
@@ -118,9 +119,9 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 		}
 	}
 	for _, name := range []string{storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
-		storageBenchmarkStatsArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName} {
+		storageBenchmarkStatsArgName, storageBenchmarkTestArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName} {
 		value := "1"
-		if name == storageBenchmarkStatsArgName {
+		if name == storageBenchmarkStatsArgName || name == storageBenchmarkTestArgName {
 			value = "true"
 		}
 		if err := validateStorageBenchmark(benchmarkTestContext(t, "--"+name+"="+value), nil, nil); err == nil {
@@ -143,22 +144,40 @@ func TestStorageBenchmarkStandaloneAndMediatedContracts(t *testing.T) {
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatal(err)
 	}
+	if err := pair.GlobalSet(vmCPUsArgName, "1,2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
+		t.Fatalf("single-VP Linux storage pair rejected: %v", err)
+	}
+	if requestedVMProcessors(pair, "uvmboot-0") != 1 || requestedVMProcessors(pair, "uvmboot-1") != 2 {
+		t.Fatal("storage pair ignored independently requested CPU counts")
+	}
+	if err := pair.GlobalSet(vmCPUsArgName, "1,3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
+		t.Fatal("Linux storage accepted an unsupported VP count")
+	}
 	if err := pair.Set(unikraftPackageArgName, dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := pair.Parent().Set(cpusArgName, "1"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,2"); err != nil {
 		t.Fatal(err)
 	}
 	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
 		t.Fatalf("single-VP Unikraft storage pair rejected: %v", err)
 	}
-	if err := pair.Parent().Set(cpusArgName, "2"); err != nil {
+	if err := pair.GlobalSet(vmCPUsArgName, "1,1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err == nil {
-		t.Fatal("Unikraft storage accepted an unsupported two-VP appliance")
+	if err := validateStorageBenchmark(pair, [][]uint32{{9, 25}, {8, 24}}, plan); err != nil {
+		t.Fatalf("Unikraft storage rejected independently selected one-VP workload: %v", err)
 	}
 	if err := pair.Set(unikraftPackageArgName, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := pair.Parent().Set(cpusArgName, "2"); err != nil {
 		t.Fatal(err)
 	}
 	plan.Disks[0].Role = "root"
@@ -257,9 +276,11 @@ func TestStorageBenchmarkExperimentSelection(t *testing.T) {
 		mode  string
 		size  string
 		smoke bool
+		short bool
 	}{
 		{mode: "latency", size: "64"}, {mode: "latency", size: "1", smoke: true},
 		{mode: "throughput", size: "1024"}, {mode: "throughput", size: "1", smoke: true},
+		{mode: "latency", size: "1", short: true}, {mode: "throughput", size: "64", short: true},
 	} {
 		args := []string{"--storage-benchmark-script", script, "--storage-benchmark-disk", disk,
 			"--storage-benchmark-output", t.TempDir(), "--security-hardware",
@@ -267,12 +288,29 @@ func TestStorageBenchmarkExperimentSelection(t *testing.T) {
 		if test.smoke {
 			args = append(args, "--storage-benchmark-smoke")
 		}
+		if test.short {
+			args = append(args, "--storage-benchmark-test")
+		}
 		c := benchmarkTestContext(t, args...)
 		if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err != nil {
 			t.Fatal(err)
 		}
 		if command := storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{}); !strings.HasSuffix(command, " "+test.mode+"; ") {
 			t.Fatalf("experiment selection was not forwarded: %s", command)
+		}
+		if command := storageBenchmarkClient(c, `"$storage_dev"`, storageBenchmarkContent{}); strings.Contains(command, "STORAGE_TEST=1 /bin/sh") != test.short {
+			t.Fatalf("short-test guest mode was not forwarded: %s", command)
+		}
+		if test.short {
+			if err := c.Set(storageBenchmarkSmokeArgName, "true"); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateStorageBenchmark(c, [][]uint32{{8, 24}}, nil); err == nil {
+				t.Fatal("short test accepted functional smoke")
+			}
+			if err := c.Set(storageBenchmarkSmokeArgName, "false"); err != nil {
+				t.Fatal(err)
+			}
 		}
 		other := storageBenchmarkLatencyArgName
 		if test.mode == "latency" {

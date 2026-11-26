@@ -20,6 +20,14 @@ import (
 
 const exportParameters = "/sys/module/diode_storvsp/parameters/"
 
+func storageProviderCommand(directIO bool) string {
+	command := `insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true`
+	if directIO {
+		command += ` direct_io=1; test "$(cat ` + exportParameters + `direct_io)" = Y`
+	}
+	return command
+}
+
 type commandRunner func(context.Context, string) (string, error)
 
 // ExportControl is the live diode_storvsp control plane. No failure, including a
@@ -60,7 +68,8 @@ func runGuest(ctx context.Context, vm *uvm.UtilityVM, script string) (string, er
 	command.Stdout, command.Stderr = &out, &stderr
 	err := command.Run()
 	if err != nil {
-		return out.String(), fmt.Errorf("diode guest command: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return out.String(), fmt.Errorf("guest command: %w; stdout:\n%s\nstderr:\n%s",
+			err, guestOutputTail(out.String()), guestOutputTail(stderr.String()))
 	}
 	return out.String(), nil
 }
@@ -97,6 +106,39 @@ func runGuestJoined(ctx context.Context, vm *uvm.UtilityVM, script string, outpu
 		return out.String(), fmt.Errorf("protected guest %s: %w: %s", vm.ID(), err, strings.TrimSpace(stderr.String()))
 	}
 	return out.String(), ctx.Err()
+}
+
+func guestOutputTail(output string) string {
+	const limit = 16384
+	if len(output) > limit {
+		return "[earlier output truncated]\n" + output[len(output)-limit:]
+	}
+	return strings.TrimSpace(output)
+}
+
+func bootstrapCommand(stage, script string) string {
+	diagnostics := `rc=$?; trap - EXIT; if [ "$rc" -ne 0 ]; then set +e; set +x; ` +
+		`printf '%s\n' ` + Quote("sibling bootstrap failed: "+stage) + ` >&2; ` +
+		`for file in /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance ` +
+		`/sys/module/diode_storvsp/parameters/exports /run/gcs-relay.log; do ` +
+		`if [ -r "$file" ]; then printf '\n=== %s ===\n' "$file" >&2; tail -n 40 "$file" >&2; fi; done; ` +
+		`ls -l /sys/class/net >&2; ` +
+		`for p in /sys/class/net/*; do ` +
+		`printf '%s device=%s driver=%s\n' "$p" "$(readlink -f "$p/device")" "$(readlink -f "$p/device/driver")" >&2; done; ` +
+		`dmesg | tail -n 60 >&2; fi; exit "$rc"`
+	return "trap " + Quote(diagnostics) + " EXIT; set -x; " + script
+}
+
+func runBootstrapGuest(ctx context.Context, vm *uvm.UtilityVM, stage, script string) (string, error) {
+	entry := log.G(ctx).WithField("stage", stage)
+	entry.Info("sibling bootstrap starting")
+	output, err := runGuest(ctx, vm, bootstrapCommand(stage, script))
+	if err != nil {
+		entry.WithError(err).Error("sibling bootstrap failed")
+		return output, fmt.Errorf("%s: %w", stage, err)
+	}
+	entry.Info("sibling bootstrap complete")
+	return output, nil
 }
 
 type export struct {

@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/urfave/cli"
@@ -35,8 +35,7 @@ var hostCPUGroupOperations = cpuGroupOperations{
 
 type cpuGroupAssignments struct {
 	ids     []string
-	owned   []string
-	ops     cpuGroupOperations
+	groups  *cpugroup.Assignments
 	reports []cpuGroupReport
 }
 
@@ -48,6 +47,133 @@ type cpuGroupReport struct {
 }
 
 const cpuGroupPrioritiesArgName = "cpu-group-priorities"
+
+func checkedCPUGroup(ctx context.Context, id string, lps []uint32, priority uint32, ops cpuGroupOperations) (*cpugroup.Report, error) {
+	config, err := ops.query(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if config == nil || !strings.EqualFold(config.GroupId, id) || config.Affinity == nil {
+		return nil, errors.New("CPU group returned missing or mismatched identity/affinity")
+	}
+	actual := make([]uint32, len(config.Affinity.LogicalProcessors))
+	for i, lp := range config.Affinity.LogicalProcessors {
+		if lp < 0 {
+			return nil, fmt.Errorf("CPU group returned negative LP %d", lp)
+		}
+		actual[i] = uint32(lp)
+	}
+	actual, actualKey, err := canonicalLPs(actual)
+	_, expectedKey, expectedErr := canonicalLPs(lps)
+	if err != nil || expectedErr != nil || actualKey != expectedKey ||
+		config.Affinity.LogicalProcessorCount != int32(len(lps)) {
+		return nil, errors.New("CPU group affinity mismatch")
+	}
+	found := false
+	for _, property := range config.GroupProperties {
+		if property.PropertyCode == hcsschema.CPUSchedulingPriorityProperty {
+			if found || property.PropertyValue != priority {
+				return nil, errors.New("CPU group scheduling priority mismatch")
+			}
+			found = true
+		}
+	}
+	if !found {
+		return nil, errors.New("CPU group returned no scheduling priority")
+	}
+	return &cpugroup.Report{GroupID: config.GroupId, LogicalProcessors: actual, SchedulingPriority: priority}, nil
+}
+
+func manageCPUGroup(ctx context.Context, action, id string, lps []uint32, priority uint32, ifExists bool, ops cpuGroupOperations) (_ *cpugroup.Report, resultErr error) {
+	parsed, err := guid.FromString(id)
+	if err != nil || parsed == (guid.GUID{}) {
+		return nil, errors.New("CPU group requires a nonzero GUID")
+	}
+	id = parsed.String()
+	lps, _, err = canonicalLPs(lps)
+	if err != nil {
+		return nil, err
+	}
+	if priority > cpugroup.MaxSchedulingPriority {
+		return nil, errors.New("CPU group scheduling priority must be 0 through 7")
+	}
+	switch action {
+	case "create":
+		if err := ops.create(ctx, id, lps); err != nil {
+			return nil, err
+		}
+		defer func() {
+			if resultErr != nil {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				defer cancel()
+				if err := ops.delete(cleanupCtx, id); err != nil {
+					resultErr = errors.Join(resultErr, fmt.Errorf("rollback CPU group %s: %w", id, err))
+				}
+			}
+		}()
+		if err := ops.setPriority(ctx, id, priority); err != nil {
+			return nil, err
+		}
+	case "query", "delete":
+	default:
+		return nil, fmt.Errorf("unknown CPU group action %q", action)
+	}
+	report, err := checkedCPUGroup(ctx, id, lps, priority, ops)
+	if err != nil {
+		if action == "delete" && ifExists && errors.Is(err, cpugroup.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if action == "delete" {
+		return nil, ops.delete(ctx, id)
+	}
+	return report, nil
+}
+
+func cpuGroupSubcommand(action string) cli.Command {
+	flags := []cli.Flag{
+		cli.StringFlag{Name: "id", Required: true},
+		cli.StringFlag{Name: "lps", Required: true},
+		cli.UintFlag{Name: "priority", Required: true},
+	}
+	if action == "delete" {
+		flags = append(flags, cli.BoolFlag{Name: "if-exists", Usage: "Ignore only a successful host query proving the group is absent"})
+	}
+	return cli.Command{
+		Name:  action,
+		Flags: flags,
+		Action: func(c *cli.Context) error {
+			if c.NArg() != 0 {
+				return errors.New("unexpected CPU group positional arguments")
+			}
+			var lps []uint32
+			for _, part := range strings.Split(c.String("lps"), ",") {
+				lp, err := strconv.ParseUint(strings.TrimSpace(part), 10, 32)
+				if err != nil {
+					return fmt.Errorf("invalid logical processor %q: %w", part, err)
+				}
+				lps = append(lps, uint32(lp))
+			}
+			if c.Uint("priority") > uint(cpugroup.MaxSchedulingPriority) {
+				return errors.New("CPU group scheduling priority must be 0 through 7")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			report, err := manageCPUGroup(ctx, action, c.String("id"), lps, uint32(c.Uint("priority")), c.Bool("if-exists"), hostCPUGroupOperations)
+			if err != nil || report == nil {
+				return err
+			}
+			return json.NewEncoder(c.App.Writer).Encode(report)
+		},
+	}
+}
+
+var cpuGroupCommand = cli.Command{
+	Name:        "cpu-group",
+	Usage:       "Manage an explicitly owned CPU group with identity, affinity and priority readback",
+	Subcommands: []cli.Command{cpuGroupSubcommand("create"), cpuGroupSubcommand("query"), cpuGroupSubcommand("delete")},
+}
 
 func parseCPUGroupPriorities(value string) ([]uint32, error) {
 	if value == "" {
@@ -66,121 +192,22 @@ func parseCPUGroupPriorities(value string) ([]uint32, error) {
 }
 
 func canonicalLPs(lps []uint32) ([]uint32, string, error) {
-	if len(lps) == 0 {
-		return nil, "", errors.New("CPU affinity cannot be empty")
-	}
-	ordered := append([]uint32(nil), lps...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
-	parts := make([]string, len(ordered))
-	for i, lp := range ordered {
-		if i > 0 && ordered[i-1] == lp {
-			return nil, "", fmt.Errorf("duplicate logical processor %d", lp)
-		}
-		parts[i] = strconv.FormatUint(uint64(lp), 10)
-	}
-	return ordered, strings.Join(parts, ","), nil
+	return cpugroup.CanonicalLPs(lps)
 }
 
-func prepareCPUGroups(ctx context.Context, groups [][]uint32, vmCount int, ops cpuGroupOperations, priorities ...uint32) (_ *cpuGroupAssignments, resultErr error) {
-	assignments := &cpuGroupAssignments{ops: ops}
-	if len(priorities) != 0 {
-		if len(groups) == 0 || len(priorities) != vmCount {
-			return nil, fmt.Errorf("CPU group priorities require CPU affinity and exactly %d VM priorities", vmCount)
-		}
-		for _, priority := range priorities {
-			if priority > cpugroup.MaxSchedulingPriority {
-				return nil, fmt.Errorf("CPU group scheduling priority %d exceeds %d", priority, cpugroup.MaxSchedulingPriority)
-			}
-		}
+func prepareCPUGroups(ctx context.Context, groups [][]uint32, vmCount int, ops cpuGroupOperations, priorities ...uint32) (*cpuGroupAssignments, error) {
+	owned, err := cpugroup.Prepare(ctx, groups, vmCount, cpugroup.Operations{
+		Create: ops.create, SetPriority: ops.setPriority, Query: ops.query, Delete: ops.delete,
+	}, priorities...)
+	if err != nil {
+		return nil, err
 	}
-	if len(groups) == 0 {
-		return assignments, nil
-	}
-	if len(groups) != vmCount {
-		return nil, fmt.Errorf("CPU affinity has %d VM lists, expected %d", len(groups), vmCount)
-	}
-	ordered := make([][]uint32, len(groups))
-	keys := make([]string, len(groups))
-	lpOwners := map[uint32]string{}
-	for i, group := range groups {
-		var err error
-		ordered[i], keys[i], err = canonicalLPs(group)
-		if err != nil {
-			return nil, err
-		}
-		for _, lp := range ordered[i] {
-			if owner, ok := lpOwners[lp]; ok && owner != keys[i] {
-				return nil, fmt.Errorf("partially overlapping CPU affinities: %s and %s", owner, keys[i])
-			}
-			lpOwners[lp] = keys[i]
-		}
-	}
-	defer func() {
-		if resultErr != nil {
-			resultErr = errors.Join(resultErr, assignments.close(context.WithoutCancel(ctx)))
-		}
-	}()
-	created := map[string]string{}
-	for i, lps := range ordered {
-		if id, ok := created[keys[i]]; ok && len(priorities) == 0 {
-			assignments.ids = append(assignments.ids, id)
-			continue
-		}
-		id, err := guid.NewV4()
-		if err != nil {
-			return nil, fmt.Errorf("allocate CPU group ID: %w", err)
-		}
-		if err := ops.create(ctx, id.String(), lps); err != nil {
-			return nil, fmt.Errorf("create CPU affinity %s: %w", keys[i], err)
-		}
-		assignments.owned = append(assignments.owned, id.String())
-		if len(priorities) != 0 {
-			if err := ops.setPriority(ctx, id.String(), priorities[i]); err != nil {
-				return nil, fmt.Errorf("set CPU group %s scheduling priority: %w", id, err)
-			}
-		}
-		config, err := ops.query(ctx, id.String())
-		if err != nil {
-			return nil, fmt.Errorf("verify CPU group %s: %w", id, err)
-		}
-		if config == nil || config.Affinity == nil {
-			return nil, fmt.Errorf("CPU group %s returned no affinity", id)
-		}
-		actual := make([]uint32, len(config.Affinity.LogicalProcessors))
-		for j, lp := range config.Affinity.LogicalProcessors {
-			if lp < 0 {
-				return nil, fmt.Errorf("CPU group %s returned negative LP %d", id, lp)
-			}
-			actual[j] = uint32(lp)
-		}
-		_, actualKey, err := canonicalLPs(actual)
-		if err != nil || actualKey != keys[i] || config.Affinity.LogicalProcessorCount != int32(len(lps)) {
-			return nil, fmt.Errorf("CPU group %s affinity mismatch: requested %s, got %+v", id, keys[i], config.Affinity)
-		}
-		if len(priorities) != 0 {
-			if !strings.EqualFold(config.GroupId, id.String()) {
-				return nil, fmt.Errorf("CPU group %s returned mismatched group ID %q", id, config.GroupId)
-			}
-			found := false
-			for _, property := range config.GroupProperties {
-				if property.PropertyCode == hcsschema.CPUSchedulingPriorityProperty {
-					if found || property.PropertyValue != priorities[i] {
-						return nil, fmt.Errorf("CPU group %s scheduling priority mismatch: requested %d, got %+v",
-							id, priorities[i], config.GroupProperties)
-					}
-					found = true
-				}
-			}
-			if !found {
-				return nil, fmt.Errorf("CPU group %s returned no scheduling priority", id)
-			}
-			assignments.reports = append(assignments.reports, cpuGroupReport{
-				VM: fmt.Sprintf("uvmboot-%d", i), GroupID: config.GroupId,
-				LogicalProcessors: actual, SchedulingPriority: priorities[i],
-			})
-		}
-		created[keys[i]] = id.String()
-		assignments.ids = append(assignments.ids, id.String())
+	assignments := &cpuGroupAssignments{ids: owned.IDs, groups: owned}
+	for i, report := range owned.Reports {
+		assignments.reports = append(assignments.reports, cpuGroupReport{
+			VM: fmt.Sprintf("uvmboot-%d", i), GroupID: report.GroupID,
+			LogicalProcessors: report.LogicalProcessors, SchedulingPriority: report.SchedulingPriority,
+		})
 	}
 	return assignments, nil
 }
@@ -200,14 +227,7 @@ func (a *cpuGroupAssignments) groupForVM(id string) (string, error) {
 }
 
 func (a *cpuGroupAssignments) close(ctx context.Context) error {
-	var result error
-	for i := len(a.owned) - 1; i >= 0; i-- {
-		if err := a.ops.delete(ctx, a.owned[i]); err != nil {
-			result = errors.Join(result, fmt.Errorf("delete CPU group %s: %w", a.owned[i], err))
-		}
-	}
-	a.owned = nil
-	return result
+	return a.groups.Close(ctx)
 }
 
 func hostProcessorTopology(ctx context.Context) (*hcsschema.ProcessorTopology, error) {
@@ -230,9 +250,65 @@ func hostProcessorTopology(ctx context.Context) (*hcsschema.ProcessorTopology, e
 	return &topology, nil
 }
 
-func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uint32, noSMT bool) error {
-	if topology == nil || len(groups) < 1 || len(groups) > 2 {
-		return errors.New("benchmark requires host topology and one or two CPU affinity pairs")
+func validateBenchmarkCPUPlacement(c *cli.Context, topology *hcsschema.ProcessorTopology, groups [][]uint32) error {
+	if !c.Bool(networkBenchmarkSMTOffPlacementArgName) {
+		return validateBenchmarkCPUs(topology, groups, c.Bool(networkBenchmarkNoSMTArgName), requestedVMProcessors(c, "uvmboot-0"))
+	}
+	if !c.Bool(networkBenchmarkNoSMTArgName) || c.String(networkBenchmarkScriptArgName) == "" ||
+		c.String(storageBenchmarkScriptArgName) != "" {
+		return errors.New("SMT-off debugging placement requires a network-only benchmark with --network-benchmark-no-smt")
+	}
+	resources, err := resolvedVMResources(c)
+	if err != nil {
+		return err
+	}
+	if topology == nil || len(groups) < 1 || len(groups) > 2 || len(groups) != len(resources) {
+		return errors.New("SMT-off debugging requires host topology and one affinity per VM")
+	}
+	byLP := map[uint32]hcsschema.LogicalProcessor{}
+	rootCores := map[string]bool{}
+	for _, lp := range topology.LogicalProcessors {
+		if _, exists := byLP[lp.LpIndex]; exists || lp.RootVpIndex < -1 {
+			return fmt.Errorf("invalid or duplicate LP %d in host topology", lp.LpIndex)
+		}
+		byLP[lp.LpIndex] = lp
+		if lp.RootVpIndex >= 0 {
+			rootCores[fmt.Sprintf("%d:%d", lp.PackageId, lp.CoreId)] = true
+		}
+	}
+	selectedCores := map[string]uint32{}
+	var node uint8
+	for i, group := range groups {
+		if _, _, err := canonicalLPs(group); err != nil || len(group) > 2 ||
+			resources[i].ProcessorCount < 1 || resources[i].ProcessorCount > 2 ||
+			int(resources[i].ProcessorCount) > len(group) {
+			return fmt.Errorf("SMT-off benchmark VM %d requires one or two distinct LPs covering its requested VPs", i)
+		}
+		for j, index := range group {
+			lp, exists := byLP[index]
+			if !exists {
+				return fmt.Errorf("SMT-off benchmark affinity includes nonexistent LP %d", index)
+			}
+			core := fmt.Sprintf("%d:%d", lp.PackageId, lp.CoreId)
+			if rootCores[core] {
+				return fmt.Errorf("SMT-off benchmark LP %d belongs to a root-partition physical core", index)
+			}
+			if previous, exists := selectedCores[core]; exists && previous != index {
+				return errors.New("SMT-off debugging requires one selected LP per physical core")
+			}
+			selectedCores[core] = index
+			if (i != 0 || j != 0) && node != lp.NodeNumber {
+				return errors.New("SMT-off benchmark physical cores must be in the same NUMA node")
+			}
+			node = lp.NodeNumber
+		}
+	}
+	return nil
+}
+
+func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uint32, noSMT bool, processors uint64) error {
+	if topology == nil || len(groups) < 1 || len(groups) > 2 || (processors != 1 && processors != 2) {
+		return errors.New("benchmark requires host topology, one or two VM affinities, and one or two VPs per VM")
 	}
 	byLP := map[uint32]hcsschema.LogicalProcessor{}
 	coreLPs := map[string][]uint32{}
@@ -267,9 +343,12 @@ func validateBenchmarkCPUs(topology *hcsschema.ProcessorTopology, groups [][]uin
 	for i, group := range groups {
 		_, key, err := canonicalLPs(group)
 		if err != nil || len(group) != 2 {
-			return fmt.Errorf("benchmark VM %d requires exactly two distinct logical processors", i)
+			return fmt.Errorf("benchmark VM %d requires exactly two distinct logical processors, including complete SMT pairs when SMT is enabled", i)
 		}
 		first, foundFirst := byLP[group[0]]
+		if !foundFirst {
+			return fmt.Errorf("benchmark affinity %s includes a nonexistent LP", key)
+		}
 		second, foundSecond := byLP[group[1]]
 		if !foundFirst || !foundSecond {
 			return fmt.Errorf("benchmark affinity %s includes a nonexistent LP", key)

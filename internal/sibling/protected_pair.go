@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/internal/cpugroup"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
@@ -92,6 +93,7 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 		return nil, errors.New("protected pair config is nil")
 	}
 	// Reuse strict validation for future programmatic dispatch, not just files.
+	directory := config.directory
 	encoded, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
@@ -100,6 +102,7 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 	if err != nil {
 		return nil, err
 	}
+	config.directory = directory
 	if !config.ProtectedShared {
 		return nil, errors.New("protected pair requires protected_shared")
 	}
@@ -324,6 +327,10 @@ func (p *protectedPair) bootstrap(group string) error {
 	for _, v := range []*protectedVMAttempt{&p.diode, &p.workload} {
 		v.options.SiblingCommunicationEndpoints[0].SharedMemorySectionName = p.backing.SectionName()
 	}
+	p.pair.cpuGroups, err = preparePairCPUGroups(setup, p.config, p.workload.options, p.diode.options, cpugroup.HostOperations)
+	if err != nil {
+		return err
+	}
 
 	// Import is impossible until the diode's actual complete Install receipt
 	// supplies the lease. Neither Create success nor GCS presence substitutes.
@@ -364,7 +371,7 @@ func (p *protectedPair) bootstrap(group string) error {
 		BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
 		protectedDiodeLinkCommand() +
 		`insmod /run/sibling/diode_timesyncvsp.ko/diode_timesyncvsp.ko; ` + resolve +
-		`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true; ` +
+		storageProviderCommand(p.config.StorageDirectIO) + `; ` +
 		`exec /bin/gcs -sibling-relay -sibling-log-relay -relay-ready /run/sibling-exec/gcs-relay.ready`
 	if err := p.startService(setup, &p.diode, provider); err != nil {
 		return err
@@ -773,7 +780,20 @@ func (p *protectedPair) configure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return p.workload.vm.ConfigureSiblingStorage(backend)
+	if err := p.workload.vm.ConfigureSiblingStorage(backend); err != nil {
+		return err
+	}
+	if p.config.directory != "" {
+		metadata, err := newBenchmarkNetwork("10.200.0.2", uplink.Address, "linux", p.workload.vm.ID(), p.diode.vm.ID())
+		if err != nil {
+			return err
+		}
+		metadata.PublishedTCPPorts = append([]uint16(nil), p.config.PublishedTCPPorts...)
+		if err := writeBenchmarkNetwork(p.config.directory, metadata); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IsProtected identifies the native protected-backing owner.
@@ -896,6 +916,9 @@ func (p *protectedPair) cleanup() {
 			result = errors.Join(result, v.vm.CloseAfterNativeExit(ctx))
 		}
 	}
+	if p.pair.cpuGroups != nil {
+		result = errors.Join(result, p.pair.cpuGroups.Close(ctx))
+	}
 	if p.workload.vm != nil {
 		if err := os.Remove(filepath.Join(p.workload.options.BundleDirectory, p.workload.options.GuestStateFilePath)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			result = errors.Join(result, fmt.Errorf("remove owned workload VMGS copy: %w", err))
@@ -988,7 +1011,7 @@ func (p *protectedPair) configureNetwork(ctx context.Context, uplink *Uplink, dn
 	var device string
 	// Provider creation and carrier checks may await workload NIC configuration.
 	group.Go(func() error {
-		_, err := p.guest(ctx, &p.diode, protectedDiodeNetworkCommand(uplink))
+		_, err := p.guest(ctx, &p.diode, protectedDiodeNetworkCommand(uplink, p.config.PublishedTCPPorts...))
 		return err
 	})
 	// The workload can discover its NIC only after the provider starts.
@@ -1009,10 +1032,11 @@ func (p *protectedPair) configureNetwork(ctx context.Context, uplink *Uplink, dn
 	return device, err
 }
 
-// protectedDiodeNetworkCommand configures only the stock provider and NAT.
-// It uses staged iptables, never demo/benchmark services or a second tmpfs mount.
-func protectedDiodeNetworkCommand(uplink *Uplink) string {
-	return `insmod /run/sibling/diode_netvsp.ko/diode_netvsp.ko; ` +
+// protectedDiodeNetworkCommand configures only the stock provider, NAT, and
+// optional published TCP port DNAT rules. It uses staged iptables, never
+// demo/benchmark services or a second tmpfs mount.
+func protectedDiodeNetworkCommand(uplink *Uplink, ports ...uint16) string {
+	command := `insmod /run/sibling/diode_netvsp.ko/diode_netvsp.ko; ` +
 		`until [ -e /sys/class/net/dvsp0 ]; do sleep 0.1; done; ` +
 		`ip addr add 10.200.0.1/30 dev dvsp0; ip link set dvsp0 up; ` +
 		`until up=; count=0; for p in /sys/class/net/*; do [ -e "$p/device" ] || continue; ` +
@@ -1028,6 +1052,12 @@ func protectedDiodeNetworkCommand(uplink *Uplink) string {
 		`[ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ]; ` +
 		`ip route show default | grep -q "via ` + uplink.Gateway + ` dev $up"; ` +
 		`ip -4 addr show dev "$up" | grep -qF ` + Quote(uplink.Address)
+	address := strings.SplitN(uplink.Address, "/", 2)[0]
+	for _, port := range ports {
+		command += fmt.Sprintf(`; /run/sibling-exec/diode_iptables iptables -w -t nat -A PREROUTING -i "$up" -d %s -p tcp --dport %d -j DNAT --to-destination 10.200.0.2:%d`,
+			Quote(address), port, port)
+	}
+	return command
 }
 
 // protectedWorkloadNetworkCommand applies the discovered stock peer NIC only.

@@ -5,6 +5,7 @@ package guestresource
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/Microsoft/hcsshim/hcn"
@@ -29,6 +30,10 @@ func BuildLCOWNetworkAdapter(netnsID string, nicID string, endpoint *hcn.HostCom
 			PrefixLength: i.PrefixLength,
 		}
 		req.IPConfigs = append(req.IPConfigs, ipConfig)
+		if req.IPAddress == "" && net.ParseIP(i.IpAddress).To4() != nil {
+			req.IPAddress = i.IpAddress
+			req.PrefixLength = i.PrefixLength
+		}
 	}
 
 	for _, r := range endpoint.Routes {
@@ -38,6 +43,9 @@ func BuildLCOWNetworkAdapter(netnsID string, nicID string, endpoint *hcn.HostCom
 			Metric:            r.Metric,
 		}
 		req.Routes = append(req.Routes, newRoute)
+		if req.GatewayAddress == "" && r.DestinationPrefix == "0.0.0.0/0" && net.ParseIP(r.NextHop).To4() != nil {
+			req.GatewayAddress = r.NextHop
+		}
 	}
 
 	// !NOTE:

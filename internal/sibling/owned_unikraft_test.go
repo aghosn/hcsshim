@@ -93,6 +93,58 @@ func TestOwnedUnikraftPrebootRootAndNoDiodeGCS(t *testing.T) {
 	}
 }
 
+func TestOwnedUnikraftIndependentWorkloadResources(t *testing.T) {
+	config := ownedUnikraftFixture(t, ownedUnikraftParameters(), 32768)
+	for _, resources := range [][]VMResources{
+		nil,
+		{{ProcessorCount: 1, MemoryMB: 130}, {ProcessorCount: 1, MemoryMB: 4096}},
+		{{ProcessorCount: 1, MemoryMB: 130}, {ProcessorCount: 2, MemoryMB: 8192}},
+		{{ProcessorCount: 1, MemoryMB: 130}, {ProcessorCount: 8, MemoryMB: 4096}},
+	} {
+		config.VMResources = resources
+		cfg, err := loadOwnedUnikraft(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := testOptions()
+		base.ProcessorCount, base.MemorySizeInMB = 4, 2048
+		workload, diode, err := pairOptions(base, config, "group", &Section{HCSName: "owned", Size: 32 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := VMResources{ProcessorCount: base.ProcessorCount, MemoryMB: base.MemorySizeInMB}
+		if resources != nil {
+			expected = resources[1]
+		}
+		if err := configureOwnedUnikraft(workload, diode, config, cfg, "group"); err != nil {
+			t.Fatal(err)
+		}
+		if workload.ProcessorCount != expected.ProcessorCount || workload.MemorySizeInMB != expected.MemoryMB ||
+			diode.ProcessorCount != 1 || diode.MemorySizeInMB != 130 ||
+			base.ProcessorCount != 4 || base.MemorySizeInMB != 2048 {
+			t.Fatal("Unikraft image capability changed or constrained independent workload resources")
+		}
+	}
+	for _, resource := range []VMResources{
+		{ProcessorCount: 2, MemoryMB: 130},
+		{ProcessorCount: 1, MemoryMB: 128},
+		{ProcessorCount: 1, MemoryMB: 132},
+	} {
+		config.VMResources = []VMResources{resource, {ProcessorCount: 8, MemoryMB: 4096}}
+		if _, err := loadOwnedUnikraft(config); err == nil || !strings.Contains(err.Error(), "image capability") {
+			t.Fatalf("incompatible image allocation accepted: %+v %v", resource, err)
+		}
+		workload, diode, err := pairOptions(testOptions(), config, "group", &Section{HCSName: "owned", Size: 32 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := &UnikraftConfig{MemoryMB: 128}
+		if err := configureOwnedUnikraft(workload, diode, config, cfg, "group"); err == nil {
+			t.Fatal("programmatic native configuration silently discarded incompatible resources")
+		}
+	}
+}
+
 func TestOwnedUnikraftRejectsWrongBootGeometry(t *testing.T) {
 	parameters := ownedUnikraftParameters()
 	for name, command := range map[string]string{
@@ -150,7 +202,6 @@ func TestOwnedUnikraftSelectionIsExplicitAndRejectsRelayFallback(t *testing.T) {
 		t.Fatal("accepted mediation with direct-mode firmware")
 	}
 	for _, change := range []func(*uvm.OptionsLCOW){
-		func(o *uvm.OptionsLCOW) { o.ProcessorCount = 2 },
 		func(o *uvm.OptionsLCOW) { hcl := true; o.HclEnabled = &hcl },
 		func(o *uvm.OptionsLCOW) { o.Appliance = &uvm.LCOWApplianceOptions{} },
 	} {
@@ -186,6 +237,12 @@ func TestOwnedUnikraftMediatedFirmwareSelection(t *testing.T) {
 		&output, ready, "halt")
 	if err == nil || !strings.Contains(err.Error(), "management relay failed") {
 		t.Fatalf("native relay failure did not reach provider supervision: %v", err)
+	}
+	detail := "diode-gcs: IO port 1610612738 root->workload failed: -107; buffered=0 eof=1 fin=0"
+	err = CaptureUnikraftConsole(strings.NewReader(detail+"\ndiode-gcs: session failed: -107; no fallback\n"),
+		&output, ready, "halt")
+	if err == nil || !strings.Contains(err.Error(), detail) {
+		t.Fatalf("native stream failure details were lost: %v", err)
 	}
 }
 

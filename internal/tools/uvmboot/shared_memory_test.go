@@ -26,7 +26,7 @@ func TestProtectedSiblingRejectsUnsupportedUpstreamModes(t *testing.T) {
 	defer func() { useGCS = previousGCS }()
 	for _, test := range []struct{ name, value string }{
 		{baselineVsockArgName, "runtime"},
-		{networkBenchmarkSingleVPArgName, "true"},
+		{networkBenchmarkSMTOffPlacementArgName, "true"},
 		{storageBenchmarkIdleArgName, "halt"},
 	} {
 		t.Run(test.name+"="+test.value, func(t *testing.T) {

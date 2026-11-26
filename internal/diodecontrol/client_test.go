@@ -73,8 +73,9 @@ func fixtureClient(t *testing.T, handle func(Frame) []Frame) *Client {
 			if err != nil {
 				return
 			}
+
 			var replies []Frame
-			if request.Header.Operation == Capabilities {
+			if request.Header.Service == Storage && request.Header.Operation == Capabilities {
 				replies = []Frame{response(request, capabilityBody(), OK)}
 			} else {
 				replies = handle(request)
@@ -94,6 +95,42 @@ func fixtureClient(t *testing.T, handle func(Frame) []Frame) *Client {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 	return client
+}
+
+func TestClientPublishTCPPorts(t *testing.T) {
+	for _, failure := range []string{"", "mismatch", "unsupported"} {
+		t.Run(failure, func(t *testing.T) {
+			client := fixtureClient(t, func(request Frame) []Frame {
+				if request.Header.Service != Network || request.Header.Operation != PublishTCP {
+					t.Errorf("incorrect publication request: %+v", request.Header)
+				}
+				reply := response(request, append([]byte(nil), request.Body...), OK)
+				reply.Header.Service = Network
+				switch failure {
+				case "mismatch":
+					binary.LittleEndian.PutUint16(reply.Body[4:], 11212)
+				case "unsupported":
+					reply.Header.Status = Unsupported
+					reply.Body = nil
+					reply.Header.Length = HeaderSize
+				}
+				return []Frame{reply}
+			})
+			err := client.PublishTCPPorts(context.Background(), []uint16{11211})
+			if (err != nil) != (failure != "") {
+				t.Fatalf("publication result: %v", err)
+			}
+		})
+	}
+	client := fixtureClient(t, func(Frame) []Frame {
+		t.Error("invalid ports reached control transport")
+		return nil
+	})
+	for _, ports := range [][]uint16{{0}, {11211, 11211}, make([]uint16, 17)} {
+		if err := client.PublishTCPPorts(context.Background(), ports); err == nil {
+			t.Fatalf("accepted invalid ports: %v", ports)
+		}
+	}
 }
 
 var bootExport = Export{Sectors: 4096, Flags: Boot | ReadOnly}
@@ -367,6 +404,9 @@ func TestClientProductionStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	if err := client.PublishTCPPorts(ctx, []uint16{11211}); err != nil {
+		t.Fatal(err)
+	}
 	for _, e := range []Export{
 		{Token: 101, RootLUN: 7, LUN: 1},
 		{Token: 202, RootLUN: 9, LUN: 2, Flags: ReadOnly},

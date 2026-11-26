@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -14,8 +15,45 @@ import (
 	"github.com/Microsoft/hcsshim/pkg/annotations"
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/ttrpc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+func TestSiblingStartupErrorLegacyStatus(t *testing.T) {
+	if err := siblingStartupError(nil); err != nil {
+		t.Fatalf("successful startup became an error: %v", err)
+	}
+	joined := errors.Join(fmt.Errorf("workload peer NIC: %w", errdefs.ErrUnavailable),
+		errors.New("Unikraft workload management relay failed: port 1610612737: -107"))
+	detailed, err := status.New(codes.Internal, "existing structured error").WithDetails(&emptypb.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cause := range []error{joined, detailed.Err()} {
+		before := status.Convert(errgrpc.ToGRPC(cause))
+		if len(before.Proto().Details) == 0 {
+			t.Fatal("fixture no longer exercises the legacy Any decoder failure")
+		}
+		after := status.Convert(siblingStartupError(cause))
+		wire, err := proto.Marshal(&ttrpc.Response{Status: after.Proto()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reply ttrpc.Response
+		if err := proto.Unmarshal(wire, &reply); err != nil {
+			t.Fatal(err)
+		}
+		if reply.Status == nil || reply.Status.Code != int32(before.Code()) ||
+			reply.Status.Message != before.Message() || len(reply.Status.Details) != 0 {
+			t.Fatalf("startup error lost its code/message or retained unsafe details: %v", &reply)
+		}
+	}
+}
 
 var _ = (shimPod)(&testShimPod{})
 

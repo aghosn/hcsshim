@@ -197,6 +197,10 @@ type LCOWNetworkAdapter struct {
 	VPCIAssigned  bool           `json:",omitempty"`
 	IPConfigs     []LCOWIPConfig `json:",omitempty"`
 	Routes        []LCOWRoute    `json:",omitempty"`
+	// Older installed GCS images require these IPv4 fields instead of IPConfigs/Routes.
+	IPAddress      string `json:",omitempty"`
+	PrefixLength   uint8  `json:",omitempty"`
+	GatewayAddress string `json:",omitempty"`
 	// PolicyBasedRouting determines if we should use old policy based routing in the
 	// guest when configuring the endpoint.
 	PolicyBasedRouting bool `json:",omitempty"`

@@ -293,7 +293,7 @@ func classifyProtectedSiblingProfile(c *cli.Context) (protectedSiblingProfile, e
 		validateStorageBackendsArgName, unikraftPackageArgName,
 		siblingOpenShellBundleArgName, baselineNICArgName, baselinePairArgName, baselineVsockArgName,
 		networkBenchmarkScriptArgName, networkBenchmarkServerArgName, networkBenchmarkPortArgName,
-		networkBenchmarkTimeoutArgName, networkBenchmarkNoSMTArgName, networkBenchmarkIdleArgName, networkBenchmarkSingleVPArgName,
+		networkBenchmarkTimeoutArgName, networkBenchmarkNoSMTArgName, networkBenchmarkSMTOffPlacementArgName, networkBenchmarkIdleArgName, networkBenchmarkDiodeIdleArgName,
 		storageBenchmarkScriptArgName, storageBenchmarkDiskArgName, storageBenchmarkOutputArgName,
 		storageBenchmarkTimeoutArgName, storageBenchmarkIOArgName, storageBenchmarkSyncIOArgName,
 		storageBenchmarkSizeArgName, storageBenchmarkSmokeArgName, storageBenchmarkStatsArgName,

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
+	"github.com/Microsoft/hcsshim/internal/cpugroup"
 	"github.com/Microsoft/hcsshim/internal/diodecontrol"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
@@ -35,21 +36,28 @@ import (
 // PageMetadataOutputPath optionally exports an existing local directory writable
 // only to the protected diode; preflight validates the filesystem destination.
 // WorkloadVmbusNoRp is an optional, default-off native workload-only request.
+// VMResources optionally replaces CPU/memory in [diode, workload] order (or
+// [workload] in standalone mode); memory is the HCS allocation in MiB.
 type Config struct {
-	Version                   int     `json:"version"`
-	ModuleDirectory           string  `json:"module_directory"`
-	SharedMemoryBytes         uint64  `json:"shared_memory_bytes"`
-	WorkloadGuestStateFile    string  `json:"workload_guest_state_file"`
-	Interactive               bool    `json:"interactive,omitempty"`
-	MediateGCS                bool    `json:"mediate_gcs,omitempty"`
-	WorkloadVmbusNoRp         bool    `json:"workload_vmbus_no_rp,omitempty"`
-	UnikraftPackage           string  `json:"unikraft_package,omitempty"`
-	ProtectedShared           bool    `json:"protected_shared,omitempty"`
-	DiodePartitionSealMask    *uint64 `json:"diode_partition_seal_mask,omitempty,string"`
-	WorkloadPartitionSealMask *uint64 `json:"workload_partition_seal_mask,omitempty,string"`
-	RunID                     string  `json:"run_id,omitempty"`
-	CleanupReceiptPath        string  `json:"cleanup_receipt_path,omitempty"`
-	PageMetadataOutputPath    string  `json:"page_metadata_output_path,omitempty"`
+	Version                   int           `json:"version"`
+	Standalone                bool          `json:"standalone,omitempty"`
+	ModuleDirectory           string        `json:"module_directory,omitempty"`
+	SharedMemoryBytes         uint64        `json:"shared_memory_bytes,omitempty"`
+	WorkloadGuestStateFile    string        `json:"workload_guest_state_file,omitempty"`
+	Interactive               bool          `json:"interactive,omitempty"`
+	MediateGCS                bool          `json:"mediate_gcs,omitempty"`
+	StorageDirectIO           bool          `json:"storage_direct_io,omitempty"`
+	WorkloadVmbusNoRp         bool          `json:"workload_vmbus_no_rp,omitempty"`
+	UnikraftPackage           string        `json:"unikraft_package,omitempty"`
+	ProtectedShared           bool          `json:"protected_shared,omitempty"`
+	DiodePartitionSealMask    *uint64       `json:"diode_partition_seal_mask,omitempty,string"`
+	WorkloadPartitionSealMask *uint64       `json:"workload_partition_seal_mask,omitempty,string"`
+	RunID                     string        `json:"run_id,omitempty"`
+	CleanupReceiptPath        string        `json:"cleanup_receipt_path,omitempty"`
+	PageMetadataOutputPath    string        `json:"page_metadata_output_path,omitempty"`
+	VMResources               []VMResources `json:"vm_resources,omitempty"`
+	PublishedTCPPorts         []uint16      `json:"published_tcp_ports,omitempty"`
+	directory                 string
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -61,7 +69,12 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	defer file.Close()
-	return decodeConfig(file)
+	config, err := decodeConfig(file)
+	if err != nil {
+		return nil, err
+	}
+	config.directory = filepath.Dir(path)
+	return config, nil
 }
 
 func decodeConfig(reader io.Reader) (*Config, error) {
@@ -87,13 +100,26 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	if err := decoder.Decode(&config); err != nil {
 		return nil, err
 	}
-	if config.Version != 1 || !filepath.IsAbs(config.ModuleDirectory) ||
+	if config.Version != 1 {
+		return nil, errors.New("sibling config requires version 1")
+	}
+	if err := diodecontrol.ValidatePublishedTCPPorts(config.PublishedTCPPorts); err != nil {
+		return nil, err
+	}
+	if config.Standalone {
+		if config.ModuleDirectory != "" || config.SharedMemoryBytes != 0 ||
+			config.MediateGCS || config.StorageDirectIO || config.UnikraftPackage != "" ||
+			config.ProtectedShared || len(config.PublishedTCPPorts) != 0 {
+			return nil, errors.New("standalone cannot configure a diode, shared memory, modules, protected_shared or GCS mediation")
+		}
+	} else if !filepath.IsAbs(config.ModuleDirectory) ||
 		config.SharedMemoryBytes < 1<<20 || config.SharedMemoryBytes > 0x7ffff000 ||
 		config.SharedMemoryBytes%4096 != 0 {
 		return nil, errors.New("sibling pair requires version 1, an absolute module directory and page-aligned shared memory in 1 MiB..2 GiB")
 	}
-	if config.WorkloadGuestStateFile == "" || filepath.Base(config.WorkloadGuestStateFile) != config.WorkloadGuestStateFile ||
-		strings.ContainsAny(config.WorkloadGuestStateFile, "\\/:\x00") || !strings.EqualFold(filepath.Ext(config.WorkloadGuestStateFile), ".vmgs") {
+	if (!config.Standalone || config.WorkloadGuestStateFile != "") &&
+		(config.WorkloadGuestStateFile == "" || filepath.Base(config.WorkloadGuestStateFile) != config.WorkloadGuestStateFile ||
+			strings.ContainsAny(config.WorkloadGuestStateFile, "\\/:\x00") || !strings.EqualFold(filepath.Ext(config.WorkloadGuestStateFile), ".vmgs")) {
 		return nil, errors.New("sibling workload guest state must be a VMGS filename under the existing boot files directory")
 	}
 	if config.UnikraftPackage != "" && (!filepath.IsAbs(config.UnikraftPackage) ||
@@ -101,7 +127,7 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
 	}
 	if config.ProtectedShared {
-		if !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 || config.UnikraftPackage != "" ||
+		if config.Standalone || !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 || config.UnikraftPackage != "" ||
 			config.RunID == "" || len(config.RunID) > 128 ||
 			strings.Trim(config.RunID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" ||
 			!filepath.IsAbs(config.CleanupReceiptPath) || strings.ContainsRune(config.CleanupReceiptPath, '\x00') {
@@ -120,7 +146,13 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 			return nil, errors.New("page metadata output requires the protected owned Linux profile and an absolute local drive directory path")
 		}
 	}
+	if config.StorageDirectIO && config.UnikraftPackage != "" {
+		return nil, errors.New("storage direct I/O requires a Linux diode")
+	}
 	if err := validateWorkloadVmbusNoRpConfig(&config); err != nil {
+		return nil, err
+	}
+	if err := config.validateResources(); err != nil {
 		return nil, err
 	}
 	return &config, nil
@@ -186,9 +218,10 @@ func validateWorkloadVmbusNoRpConfig(config *Config) error {
 	return nil
 }
 
-// Pair is the sole lifetime owner of two newly created UVMs and their shared
-// section. The sandbox owns Pair closure; protected participant/service loss
-// also requests native shutdown independently of workload task cleanup.
+// Pair owns a newly created workload and, unless standalone, its diode and
+// shared section. Workload tasks borrow Workload; only the sandbox closes it.
+// Protected participant/service loss also requests native shutdown independently
+// of workload task cleanup.
 type Pair struct {
 	Workload        *uvm.UtilityVM
 	Diode           *uvm.UtilityVM
@@ -200,6 +233,7 @@ type Pair struct {
 	unikraft        bool
 	unikraftConsole *ownedUnikraftConsole
 	protected       *protectedPair
+	cpuGroups       *cpugroup.Assignments
 	// Closers are captured immediately after acquisition so partial startup
 	// follows the same consumer-before-provider ownership order.
 	workloadCloser    io.Closer
@@ -220,7 +254,13 @@ func (p *Pair) SealPartition(role string, mask uint64) (string, error) {
 // commonPairOptions clones security and role settings without acquiring backing.
 // Callers assign either an ordinary section or a real protected capability later.
 func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	if config.Standalone {
+		return nil, nil, errors.New("standalone does not have pair options")
+	}
 	if err := validateWorkloadVmbusNoRpConfig(config); err != nil {
+		return nil, nil, err
+	}
+	if err := config.validateResources(); err != nil {
 		return nil, nil, err
 	}
 	if base == nil || base.Options == nil || base.ConfidentialLCOWOptions == nil ||
@@ -243,6 +283,13 @@ func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uv
 		options.Options, options.ConfidentialLCOWOptions = &common, &confidential
 		options.ConfidentialCommonOptions = &security
 		options.ID, options.BundleDirectory = id, bundle
+		if config.VMResources != nil {
+			index := 0
+			if role == Workload {
+				index = 1
+			}
+			config.VMResources[index].Apply(options.Options)
+		}
 		options.KernelBootOptions = strings.TrimSpace(base.KernelBootOptions + " hcs_shmem_diag.role=" + string(role))
 		endpoint, err := Endpoint(role, group)
 		if err != nil {
@@ -292,6 +339,10 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
 	}
+	consoleDirectory := config.directory
+	if err := config.validateResources(); err != nil {
+		return nil, err
+	}
 	// Validate programmatic callers as strictly as annotation/config-file callers.
 	encoded, err := json.Marshal(config)
 	if err != nil {
@@ -307,6 +358,9 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			err = errors.Join(err, pair.Close())
 		}
 		return pair, err
+	}
+	if config.Standalone {
+		return startStandalone(ctx, base, config)
 	}
 	native, err := loadOwnedUnikraft(config)
 	if err != nil {
@@ -352,6 +406,10 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return nil, err
 		}
 	}
+	pair.cpuGroups, err = preparePairCPUGroups(ctx, config, workloadOptions, diodeOptions, cpugroup.HostOperations)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.Mkdir(diodeOptions.BundleDirectory, 0700); err != nil {
 		return nil, fmt.Errorf("create owned diode bundle: %w", err)
 	}
@@ -363,7 +421,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, fmt.Errorf("create sibling workload: %w", err)
 	}
 	if native != nil {
-		if err := pair.prepareOwnedUnikraft(diodeOptions, native); err != nil {
+		if err := pair.prepareOwnedUnikraft(diodeOptions, native, consoleDirectory); err != nil {
 			return nil, err
 		}
 		cancelOnProviderLoss(ctx, pair.unikraftConsole, cancelStartup)
@@ -384,6 +442,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if err != nil {
 		return nil, err
 	}
+	var diodeUplink string
 	err = bootstrap(ctx, func(bootCtx context.Context) error {
 		if err := pair.Workload.Start(bootCtx); err != nil {
 			return fmt.Errorf("start sibling workload: %w", err)
@@ -418,8 +477,8 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		if err != nil {
 			return err
 		}
-		if _, err := runGuest(bootCtx, pair.Diode, BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko")+
-			resolve+`insmod /run/sibling/diode_storvsp.ko/diode_storvsp.ko "backends=$storage_dev" luns=0 read_only=true`); err != nil {
+		if _, err := runBootstrapGuest(bootCtx, pair.Diode, "diode root provider", BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko")+
+			resolve+storageProviderCommand(config.StorageDirectIO)); err != nil {
 			return fmt.Errorf("bootstrap permanent sibling root provider: %w", err)
 		}
 		uplink, cleanup, err := AttachUplink(bootCtx, pair.Diode)
@@ -427,7 +486,8 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 			return err
 		}
 		pair.uplinkCleanup = cleanup
-		_, err = runGuest(bootCtx, pair.Diode, diodeBootstrapCommand(uplink, config.MediateGCS))
+		diodeUplink = uplink.Address
+		_, err = runBootstrapGuest(bootCtx, pair.Diode, "diode network and GCS relay", diodeBootstrapCommand(uplink, config.MediateGCS, config.PublishedTCPPorts...))
 		return err
 	})
 	if err != nil {
@@ -457,7 +517,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		nicCommand = workloadNICCommandForMAC(native.Network.PeerMAC.String())
 		ip, gateway = native.Network.Peer.String(), native.Network.Provider.String()
 	}
-	device, err := runGuest(nicCtx, pair.Workload, demoToolsStage+nicCommand)
+	device, err := runBootstrapGuest(nicCtx, pair.Workload, "workload peer NIC", demoToolsStage+nicCommand)
 	if err != nil {
 		return nil, err
 	}
@@ -471,6 +531,11 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		Routes:    []guestresource.LCOWRoute{{DestinationPrefix: "0.0.0.0/0", NextHop: gateway}},
 	}); err != nil {
 		return nil, err
+	}
+	if native != nil && len(config.PublishedTCPPorts) != 0 {
+		if err := nativeControl.PublishTCPPorts(ctx, config.PublishedTCPPorts); err != nil {
+			return nil, fmt.Errorf("publish owned workload TCP ports: %w", err)
+		}
 	}
 	var control scsi.SiblingExportControl
 	if native != nil {
@@ -507,6 +572,22 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		if err := pair.unikraftConsole.Err(); err != nil {
 			return nil, err
 		}
+	}
+	provider := "linux"
+	if native != nil {
+		provider, diodeUplink = "unikraft", native.Network.Uplink.String()
+	}
+	if consoleDirectory != "" {
+		metadata, err := newBenchmarkNetwork(ip, diodeUplink, provider, pair.Workload.ID(), pair.Diode.ID())
+		if err != nil {
+			return nil, err
+		}
+		metadata.PublishedTCPPorts = append([]uint16(nil), config.PublishedTCPPorts...)
+		if err := writeBenchmarkNetwork(consoleDirectory, metadata); err != nil {
+			return nil, err
+		}
+	}
+	if native != nil {
 		pair.watchOwnedProvider(nativeControl)
 	} else {
 		go func() {
@@ -532,7 +613,7 @@ const demoToolsStage = `mkdir -p /run/sibling-exec && mount -t tmpfs -o exec,siz
 
 // GCSRelayCommand starts the same guest relay for standalone and shim-owned pairs.
 func GCSRelayCommand() string {
-	return `rm -f /run/gcs-relay.ready; ` +
+	return guestInstanceCommand(4, 3) + `rm -f /run/gcs-relay.ready; ` +
 		`/bin/gcs -sibling-relay -relay-ready /run/gcs-relay.ready </dev/null >/run/gcs-relay.log 2>&1 & relay_pid=$!; ` +
 		`echo "$relay_pid" >/run/gcs-relay.pid; ` +
 		`relay_wait=0; until [ -f /run/gcs-relay.ready ]; do ` +
@@ -542,8 +623,16 @@ func GCSRelayCommand() string {
 		`sleep 0.1; done; echo 'GCS_RELAY_READY: workload control and stdio through diode; Plan9 unchanged'`
 }
 
-func diodeBootstrapCommand(uplink *Uplink, mediateGCS bool) string {
+func diodeBootstrapCommand(uplink *Uplink, mediateGCS bool, ports ...uint16) string {
 	command := diodeNetworkCommand(uplink)
+	if len(ports) != 0 {
+		command += " || exit 1"
+	}
+	for _, port := range ports {
+		address := strings.SplitN(uplink.Address, "/", 2)[0]
+		command += fmt.Sprintf(`; /run/sibling-exec/ipt iptables -w -t nat -A PREROUTING -i "$up" -d %s -p tcp --dport %d -j DNAT --to-destination 10.200.0.2:%d || exit 1`,
+			Quote(address), port, port)
+	}
 	if mediateGCS {
 		command += "; " + GCSRelayCommand()
 	}
@@ -638,6 +727,11 @@ func (p *Pair) close(cause error) error {
 		}
 		if p.sectionCloser != nil {
 			p.closeErr = errors.Join(p.closeErr, p.sectionCloser.Close())
+		}
+		if p.cpuGroups != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			p.closeErr = errors.Join(p.closeErr, p.cpuGroups.Close(ctx))
 		}
 	})
 	return p.closeErr

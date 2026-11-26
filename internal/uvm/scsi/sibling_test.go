@@ -116,6 +116,30 @@ func TestSiblingStorageSharesReadOnlyLayer(t *testing.T) {
 	}
 }
 
+func TestSiblingStorageWritableDataDisk(t *testing.T) {
+	mgr, diodeHost, control, events := siblingTestManager(t)
+	ctx := context.Background()
+	mount, err := mgr.AddVirtualDisk(ctx, "layer.vhd", false, "workload-id", "", &MountConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest := mgr.mountManager.mounter.(*siblingGuestTest)
+	if len(diodeHost.attachments) != 1 || diodeHost.attachments[0].config.readOnly ||
+		control.adds != 1 || control.readOnly || control.lun != 5 || control.exportLUN != 1 ||
+		len(guest.mounts) != 1 || guest.mounts[0].controller != 0 || guest.mounts[0].lun != 1 ||
+		guest.mounts[0].config.readOnly || len(guest.mounts[0].config.options) != 0 ||
+		mount.GuestPath() != guest.mounts[0].path {
+		t.Fatalf("incorrect writable disk handoff: export=%+v guest=%+v", control, guest.mounts)
+	}
+	if err := mount.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(guest.mounts) != 0 || len(diodeHost.attachments) != 0 ||
+		!reflect.DeepEqual(*events, []string{"diode-acl", "export", "withdraw", "unplug"}) {
+		t.Fatalf("writable disk was not released in order: %v", *events)
+	}
+}
+
 func TestSiblingReleaseRetainsBackingAndCanRetry(t *testing.T) {
 	mgr, diodeHost, control, events := siblingTestManager(t)
 	ctx := context.Background()

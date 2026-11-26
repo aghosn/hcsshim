@@ -20,23 +20,34 @@ import (
 
 	"github.com/Microsoft/hcsshim/internal/sibling"
 	"github.com/Microsoft/hcsshim/internal/uvm"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
 )
 
 const (
-	networkBenchmarkScriptArgName   = "network-benchmark-script"
-	networkBenchmarkServerArgName   = "network-benchmark-server"
-	networkBenchmarkPortArgName     = "network-benchmark-port"
-	networkBenchmarkTimeoutArgName  = "network-benchmark-timeout"
-	networkBenchmarkNoSMTArgName    = "network-benchmark-no-smt"
-	networkBenchmarkIdleArgName     = "network-benchmark-idle"
-	networkBenchmarkSingleVPArgName = "network-benchmark-single-vp"
+	networkBenchmarkScriptArgName          = "network-benchmark-script"
+	networkBenchmarkServerArgName          = "network-benchmark-server"
+	networkBenchmarkPortArgName            = "network-benchmark-port"
+	networkBenchmarkTimeoutArgName         = "network-benchmark-timeout"
+	networkBenchmarkNoSMTArgName           = "network-benchmark-no-smt"
+	networkBenchmarkSMTOffPlacementArgName = "network-benchmark-smt-off-placement"
+	networkBenchmarkIdleArgName            = "network-benchmark-idle"
+	networkBenchmarkDiodeIdleArgName       = "network-benchmark-diode-idle"
+	networkBenchmarkWorkloadVMGS           = "network-workload.vmgs"
 )
 
-func networkBenchmarkProcessors(c *cli.Context) uint64 {
-	if c.Bool(networkBenchmarkSingleVPArgName) {
-		return 1
+func networkBenchmarkDiodeIdlePolicy(c *cli.Context) string {
+	if idle := c.String(networkBenchmarkDiodeIdleArgName); idle != "" {
+		return idle
 	}
-	return 2
+	return c.String(networkBenchmarkIdleArgName)
+}
+
+func networkBenchmarkGuestStateFile(c *cli.Context, id string) string {
+	if c.String(networkBenchmarkScriptArgName) != "" && c.String(unikraftPackageArgName) == "" && id == "uvmboot-1" &&
+		networkBenchmarkDiodeIdlePolicy(c) != c.String(networkBenchmarkIdleArgName) {
+		return networkBenchmarkWorkloadVMGS
+	}
+	return vmutils.DefaultGuestStateFile
 }
 
 func networkBenchmarkCPUEnabled(c *cli.Context) (bool, error) {
@@ -84,13 +95,25 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.String(networkBenchmarkScriptArgName) == "" {
 		if c.IsSet(networkBenchmarkServerArgName) || c.IsSet(networkBenchmarkPortArgName) ||
 			c.IsSet(networkBenchmarkTimeoutArgName) || c.IsSet(networkBenchmarkNoSMTArgName) ||
-			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkSingleVPArgName) {
+			c.IsSet(networkBenchmarkIdleArgName) || c.IsSet(networkBenchmarkDiodeIdleArgName) ||
+			c.IsSet(networkBenchmarkSMTOffPlacementArgName) {
 			return errors.New("network benchmark server, port and timeout require --network-benchmark-script")
 		}
 		return nil
 	}
+	if c.Bool(networkBenchmarkSMTOffPlacementArgName) && !c.Bool(networkBenchmarkNoSMTArgName) {
+		return errors.New("SMT-off debugging placement requires --network-benchmark-no-smt")
+	}
 	if idle := c.String(networkBenchmarkIdleArgName); idle != "poll" && idle != "halt" {
 		return errors.New("network benchmark idle policy must be poll or halt")
+	}
+	if c.IsSet(networkBenchmarkDiodeIdleArgName) {
+		if idle := c.String(networkBenchmarkDiodeIdleArgName); idle != "poll" && idle != "halt" {
+			return errors.New("network benchmark diode idle policy must be poll or halt")
+		}
+		if c.GlobalInt(countArgName) != 2 || c.String(baselineVsockArgName) != "" {
+			return errors.New("independent network benchmark idle policies require a sibling pair without a vSock relay")
+		}
 	}
 	addresses, err := net.InterfaceAddrs()
 	if err != nil {
@@ -109,19 +132,17 @@ func validateNetworkBenchmark(c *cli.Context, groups [][]uint32) error {
 	if c.Duration(networkBenchmarkTimeoutArgName) <= 0 {
 		return errors.New("network benchmark timeout must be positive")
 	}
-	processors := networkBenchmarkProcessors(c)
-	if !useGCS || !c.Bool(securityHardwareFlag) || c.GlobalUint64(cpusArgName) != processors ||
+	if err := validateBenchmarkVMResources(c); err != nil {
+		return err
+	}
+	if !useGCS || !c.Bool(securityHardwareFlag) ||
 		c.GlobalInt(countArgName) != c.GlobalInt(parallelArgName) ||
 		len(groups) != c.GlobalInt(countArgName) {
-		return fmt.Errorf("network benchmark requires SNP, GCS, --cpus %d and one explicit affinity pair per concurrently launched VM", processors)
+		return errors.New("network benchmark requires SNP, GCS and one explicit affinity pair per concurrently launched VM")
 	}
 	baseline := c.IsSet(baselineNICArgName) && c.GlobalInt(countArgName) == 1
 	sibling := c.IsSet(siblingBusGuestModuleArgName) && c.Bool(sharedMemoryTwoUVMArgName) &&
 		c.Bool(siblingDiodeUplinkArgName) && c.GlobalInt(countArgName) == 2
-	unikraft := c.String(unikraftPackageArgName) != ""
-	if unikraft && !c.Bool(networkBenchmarkSingleVPArgName) {
-		return errors.New("Unikraft network benchmarks require --network-benchmark-single-vp")
-	}
 	vsock := c.String(baselineVsockArgName) != ""
 	if (!baseline && !sibling && !vsock) || c.IsSet(baselinePairArgName) ||
 		c.String(siblingOpenShellBundleArgName) != "" || siblingInteractive || debug ||
@@ -147,11 +168,7 @@ func shareNetworkBenchmark(ctx context.Context, c *cli.Context, vm *uvm.UtilityV
 	return nil
 }
 
-func networkBenchmarkPreflight(role, server string, noSMT bool, idlePolicy string) string {
-	return networkBenchmarkVPPreflight(role, server, noSMT, idlePolicy, false)
-}
-
-func networkBenchmarkVPPreflight(role, server string, noSMT bool, idlePolicy string, singleVP bool) string {
+func networkBenchmarkVPPreflight(role, server string, noSMT bool, idlePolicy string, processors uint64) string {
 	topologyCheck := `for c in 0 1; do s=$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list); ` +
 		`case "$s" in 0-1|0,1) :;; *) echo "network_benchmark: FAIL guest virtual SMT pair missing: cpu$c=$s" >&2; exit 1;; esac; done; `
 	topologyEvidence := "threads_per_core=2"
@@ -160,25 +177,27 @@ func networkBenchmarkVPPreflight(role, server string, noSMT bool, idlePolicy str
 			`echo "network_benchmark: guest_topology cpu$c thread_siblings=$s"; done; `
 		topologyEvidence = "host_smt=disabled guest_topology=recorded"
 	}
-	online, expected, processors := "0-1", "two", "2"
-	if singleVP {
-		online, expected, processors = "0", "one", "1"
-		topologyCheck = `s=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list); ` +
-			`echo "network_benchmark: guest_topology cpu0 thread_siblings=$s"; `
-		topologyEvidence = "single_vp=true guest_topology=recorded"
+	online := "0"
+	if processors > 1 {
+		online = fmt.Sprintf("0-%d", processors-1)
+	}
+	if processors != 2 {
+		topologyCheck = fmt.Sprintf(`for c in $(seq 0 %d); do s=$(cat /sys/devices/system/cpu/cpu$c/topology/thread_siblings_list); `+
+			`echo "network_benchmark: guest_topology cpu$c thread_siblings=$s"; done; `, processors-1)
+		topologyEvidence = "guest_topology=recorded"
 	}
 	return `set -eu; ` +
 		`dmesg | grep -F 'Memory Encryption Features active:' | grep -qw 'SEV-SNP' || ` +
 		`{ echo 'network_benchmark: FAIL SNP boot evidence missing' >&2; exit 1; }; ` +
 		`[ "$(cat /sys/devices/system/cpu/online)" = '` + online + `' ] || ` +
-		`{ echo 'network_benchmark: FAIL expected exactly ` + expected + ` online VPs' >&2; exit 1; }; ` +
+		`{ echo 'network_benchmark: FAIL expected exactly ` + fmt.Sprint(processors) + ` online VPs' >&2; exit 1; }; ` +
 		topologyCheck +
 		`idle=$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^idle=/) print $i}' /proc/cmdline); ` +
 		`[ "$idle" = 'idle=` + idlePolicy + `' ] || ` +
 		`{ echo "network_benchmark: FAIL expected idle=` + idlePolicy + `, got: $idle" >&2; exit 1; }; ` +
 		`[ -x "$ipf" ] && "$ipf" --version 2>&1 | grep -F 'iperf version 2.2.1' || ` +
 		`{ echo 'network_benchmark: FAIL matching iperf2 not staged' >&2; exit 1; }; ` +
-		`echo 'network_benchmark: preflight role=` + role + ` idle=` + idlePolicy + ` snp=boot-evidence attestation=not-collected vcpus=` + processors + ` ` + topologyEvidence + `'; ` +
+		`echo 'network_benchmark: preflight role=` + role + ` idle=` + idlePolicy + ` snp=boot-evidence attestation=not-collected vcpus=` + fmt.Sprint(processors) + ` ` + topologyEvidence + `'; ` +
 		`uname -a; cat /proc/cmdline; cat /proc/cpuinfo; ip addr show; ip route; ` +
 		`ip route get ` + server + `; `
 }
@@ -214,7 +233,8 @@ func networkBenchmarkClient(c *cli.Context, role string) string {
 	if role == "baseline" || role == "vsock" {
 		discovery = "sibling_benchmark=0\n"
 	}
-	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) + deviceCheck +
+	workloadID := fmt.Sprintf("uvmboot-%d", c.GlobalInt(countArgName)-1)
+	return networkBenchmarkVPPreflight(role, server, c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), requestedVMProcessors(c, workloadID)) + deviceCheck +
 		`ip route get ` + server + ` | grep -q "dev ` + expected + ` " || ` +
 		`{ echo 'network_benchmark: FAIL unexpected egress interface' >&2; exit 1; }; ` +
 		networkBenchmarkDiagnosticStage(script) +
@@ -242,16 +262,19 @@ func networkBenchmarkSiblingCommand(c *cli.Context, module, netModule, role stri
 	return command + siblingDiodeUplinkCommand(uplink, guestWaitFor) +
 		`echo 1 >/proc/sys/net/ipv4/ip_forward; ` +
 		`"$ipt" iptables -w -t nat -A POSTROUTING -s 10.200.0.0/30 -o "$up" -j MASQUERADE; ` +
-		networkBenchmarkVPPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), c.String(networkBenchmarkIdleArgName), c.Bool(networkBenchmarkSingleVPArgName)) +
+		networkBenchmarkVPPreflight("diode", c.String(networkBenchmarkServerArgName), c.Bool(networkBenchmarkNoSMTArgName), networkBenchmarkDiodeIdlePolicy(c), requestedVMProcessors(c, "uvmboot-0")) +
 		`[ "$(basename "$(readlink /sys/class/net/$up/device/driver)")" = hv_netvsc ] || ` +
 		`{ echo 'network_benchmark: FAIL diode uplink is not synthetic hv_netvsc' >&2; exit 1; }; ` +
 		`diag=/run/dtb-exec/receive-diagnostics.log; ` +
 		`if grep -qx 'receive_diagnostics=1' /run/network-benchmark/` + filepath.Base(c.String(networkBenchmarkScriptArgName)) + `; then ` +
 		`[ -x /run/dtb-exec/diode-controller ] || { echo 'network_benchmark: FAIL diagnostic helper missing' >&2; exit 1; }; ` +
-		`/run/dtb-exec/diode-controller net-diagnostics -interface "$up" >"$diag"; fi; ` +
+		`stats=/sys/module/diode_netvsp/parameters/stats_enabled; ` +
+		`[ -w "$stats" ] || { echo 'network_benchmark: FAIL provider receive counters missing' >&2; exit 1; }; ` +
+		`printf 'Y\n' >"$stats"; ` +
+		`/run/dtb-exec/diode-controller net-diagnostics -interface "$up" -provider-interface dvsp0 >"$diag"; fi; ` +
 		`echo 'network_benchmark: diode forwarding ready'; ` +
 		`until dmesg | grep -qF 'dvsp0: channel closed'; do sleep 1; done; ` +
-		`if [ -f "$diag" ]; then /run/dtb-exec/diode-controller net-diagnostics -interface "$up" >>"$diag"; ` +
+		`if [ -f "$diag" ]; then /run/dtb-exec/diode-controller net-diagnostics -interface "$up" -provider-interface dvsp0 >>"$diag"; ` +
 		`echo 'NETBENCH_DIODE_DIAGNOSTICS_BEGIN'; cat "$diag"; echo 'NETBENCH_DIODE_DIAGNOSTICS_END'; fi; ` +
 		`"$ipt" iptables -t nat -L POSTROUTING -v -n -x; `
 }

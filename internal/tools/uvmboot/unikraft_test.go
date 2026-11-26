@@ -99,7 +99,7 @@ func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.
 		"--shared-memory-size", "33554432", "--sibling-bus-guest-module", filepath.Join(directory, "sibling_bus.ko"),
 		"--unikraft-diode-package", directory, "--storage-benchmark-script", filepath.Join(directory, "fio.sh"),
 		"--storage-benchmark-idle", "poll")
-	for flag, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for flag, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.Parent().Set(flag, value); err != nil {
 			t.Fatal(err)
 		}
@@ -119,6 +119,29 @@ func TestUnikraftStorageBenchmarkRequiresWritableStorageOnlyFirmware(t *testing.
 		writeManifest(invalid)
 		if _, err := loadUnikraftConfig(c, plan); err == nil {
 			t.Fatalf("accepted incompatible storage firmware: %s", invalid)
+		}
+	}
+	writeManifest(strings.Replace(command, "idle=poll", "idle=halt", 1))
+	if err := c.Set(storageBenchmarkDiodeIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = loadUnikraftConfig(c, plan)
+	if err != nil || cfg.Idle != "halt" || c.String(storageBenchmarkIdleArgName) != "poll" {
+		t.Fatalf("independent Unikraft halt/workload poll rejected: cfg=%+v err=%v", cfg, err)
+	}
+	if err := c.Set(storageBenchmarkDiodeIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, plan); err == nil {
+		t.Fatal("accepted Unikraft halt firmware with a poll diode expectation")
+	}
+	for _, args := range [][]string{
+		{"--storage-benchmark-diode-idle", "halt"},
+		{"--storage-benchmark-script", "fixture", "--storage-benchmark-diode-idle", "invalid"},
+		{"--storage-benchmark-script", "fixture", "--storage-benchmark-diode-idle", "halt"},
+	} {
+		if err := validateStorageBenchmark(benchmarkTestContext(t, args...), nil, nil); err == nil {
+			t.Fatalf("unsupported storage diode override accepted: %v", args)
 		}
 	}
 }
@@ -321,7 +344,7 @@ func TestUnikraftRootOnlyPairUsesStaticManifestAndSharedWorkload(t *testing.T) {
 		"--"+sharedMemoryTwoUVMArgName, "--"+sharedMemorySizeArgName, "33554432",
 		"--"+siblingBusGuestModuleArgName, modulePath, "--"+siblingInteractiveArgName,
 		"--"+siblingStorageRootArgName, "--"+siblingStorageBackendsArgName, filepath.Join(directory, "storage.json"))
-	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for name, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.GlobalSet(name, value); err != nil {
 			t.Fatal(err)
 		}
@@ -422,11 +445,11 @@ func TestUnikraftPairPreflight(t *testing.T) {
 		extra []string
 		error string
 	}{
+		{cpus: "2"},
+		{cpus: "2", extra: []string{"--" + sharedMemoryGuestModuleArgName, "marker.ko"}, error: "does not support"},
+		{cpus: "0", error: "processor_count"},
 		{cpus: "1"},
-		{cpus: "1", extra: []string{"--" + sharedMemoryGuestModuleArgName, "marker.ko"}, error: "does not support"},
-		{cpus: "0", error: "one-to-one workload/diode VP pairing"},
-		{cpus: "2", error: "one-to-one workload/diode VP pairing"},
-		{cpus: "4", error: "one-to-one workload/diode VP pairing"},
+		{cpus: "4"},
 	} {
 		context := benchmarkTestContext(t, append(append([]string{}, args...), test.extra...)...)
 		if err := context.GlobalSet(cpusArgName, test.cpus); err != nil {
@@ -446,9 +469,9 @@ func TestUnikraftPairPreflight(t *testing.T) {
 	}
 	benchmarkArgs := append(append([]string{}, args[:len(args)-2]...),
 		"--network-benchmark-script", filepath.Join(directory, "bench.sh"),
-		"--network-benchmark-server", "192.0.2.10", "--network-benchmark-single-vp")
+		"--network-benchmark-server", "192.0.2.10")
 	c := benchmarkTestContext(t, benchmarkArgs...)
-	for name, value := range map[string]string{cpusArgName: "1", countArgName: "2", parallelArgName: "2"} {
+	for name, value := range map[string]string{cpusArgName: "2", countArgName: "2", parallelArgName: "2"} {
 		if err := c.GlobalSet(name, value); err != nil {
 			t.Fatal(err)
 		}
@@ -464,5 +487,31 @@ func TestUnikraftPairPreflight(t *testing.T) {
 	}
 	if _, err := loadUnikraftConfig(c, nil); err == nil || !strings.Contains(err.Error(), "does not match benchmark") {
 		t.Fatalf("mismatched benchmark firmware was accepted: %v", err)
+	}
+	if err := c.Set(networkBenchmarkIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Set(networkBenchmarkDiodeIdleArgName, "halt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "launch-manifest.json"),
+		[]byte(unikraftTestManifest(strings.Join(network, " ")+" libukbus_vmbus.idle=halt")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadUnikraftConfig(c, nil)
+	if err != nil || cfg.Idle != "halt" {
+		t.Fatalf("mixed Unikraft network idle rejected: cfg=%+v err=%v", cfg, err)
+	}
+	if err := validateNetworkBenchmark(c, [][]uint32{{8, 24}, {8, 24}}); err != nil {
+		t.Fatal(err)
+	}
+	if networkBenchmarkGuestStateFile(c, "uvmboot-1") != "kernel.vmgs" {
+		t.Fatal("Unikraft pair selected the Linux-only network firmware path instead of retaining root mediation")
+	}
+	if err := c.Set(networkBenchmarkDiodeIdleArgName, "poll"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadUnikraftConfig(c, nil); err == nil {
+		t.Fatal("accepted network Unikraft firmware inconsistent with diode idle expectation")
 	}
 }
