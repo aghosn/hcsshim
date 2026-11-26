@@ -77,6 +77,24 @@ func LoadConfig(path string) (*Config, error) {
 	return config, nil
 }
 
+// validatedCopy checks programmatic configs like file inputs, retaining the
+// loader-owned directory used to publish per-pair files outside the JSON schema.
+func (c *Config) validatedCopy() (*Config, error) {
+	if err := c.validateResources(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	config, err := decodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	config.directory = c.directory
+	return config, nil
+}
+
 func decodeConfig(reader io.Reader) (*Config, error) {
 	limited := &io.LimitedReader{R: reader, N: (64 << 10) + 1}
 	decoder := json.NewDecoder(limited)
@@ -339,16 +357,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
 	}
-	consoleDirectory := config.directory
-	if err := config.validateResources(); err != nil {
-		return nil, err
-	}
-	// Validate programmatic callers as strictly as annotation/config-file callers.
-	encoded, err := json.Marshal(config)
-	if err != nil {
-		return nil, err
-	}
-	config, err = decodeConfig(strings.NewReader(string(encoded)))
+	config, err := config.validatedCopy()
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +430,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, fmt.Errorf("create sibling workload: %w", err)
 	}
 	if native != nil {
-		if err := pair.prepareOwnedUnikraft(diodeOptions, native, consoleDirectory); err != nil {
+		if err := pair.prepareOwnedUnikraft(diodeOptions, native, config.directory); err != nil {
 			return nil, err
 		}
 		cancelOnProviderLoss(ctx, pair.unikraftConsole, cancelStartup)
@@ -577,13 +586,13 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if native != nil {
 		provider, diodeUplink = "unikraft", native.Network.Uplink.String()
 	}
-	if consoleDirectory != "" {
+	if config.directory != "" {
 		metadata, err := newBenchmarkNetwork(ip, diodeUplink, provider, pair.Workload.ID(), pair.Diode.ID())
 		if err != nil {
 			return nil, err
 		}
 		metadata.PublishedTCPPorts = append([]uint16(nil), config.PublishedTCPPorts...)
-		if err := writeBenchmarkNetwork(consoleDirectory, metadata); err != nil {
+		if err := writeBenchmarkNetwork(config.directory, metadata); err != nil {
 			return nil, err
 		}
 	}

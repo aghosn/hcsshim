@@ -92,17 +92,10 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 	if config == nil {
 		return nil, errors.New("protected pair config is nil")
 	}
-	// Reuse strict validation for future programmatic dispatch, not just files.
-	directory := config.directory
-	encoded, err := json.Marshal(config)
+	config, err := config.validatedCopy()
 	if err != nil {
 		return nil, err
 	}
-	config, err = decodeConfig(strings.NewReader(string(encoded)))
-	if err != nil {
-		return nil, err
-	}
-	config.directory = directory
 	if !config.ProtectedShared {
 		return nil, errors.New("protected pair requires protected_shared")
 	}

@@ -52,6 +52,55 @@ func TestBenchmarkNetworkMetadata(t *testing.T) {
 	}
 }
 
+// Protected startup must publish the route next to the file the launcher supplied,
+// even after both the common and protected paths validate their private copies.
+func TestProtectedConfigRetainsBenchmarkNetworkDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sibling-pair.json")
+	input := testConfig()
+	input.ProtectedShared, input.MediateGCS, input.Interactive = true, true, true
+	input.SharedMemoryBytes = 32 << 20
+	input.RunID = "benchmark"
+	input.CleanupReceiptPath = filepath.Join(dir, "protected-cleanup-result.json")
+	input.PublishedTCPPorts = []uint16{11211}
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		config, err = config.validatedCopy()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta, err := newBenchmarkNetwork("10.200.0.2", "172.31.250.42/24", "linux", "workload", "diode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.PublishedTCPPorts = config.PublishedTCPPorts
+	if err := writeBenchmarkNetwork(config.directory, meta); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "benchmark-network.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var published benchmarkNetwork
+	if err := json.Unmarshal(raw, &published); err != nil {
+		t.Fatal(err)
+	}
+	if published.DiodeUplinkIPv4 != "172.31.250.42" || !reflect.DeepEqual(published.PublishedTCPPorts, []uint16{11211}) {
+		t.Fatalf("incorrect published route: %+v", published)
+	}
+}
+
 func TestPublishedTCPPortsConfigAndLinuxDNAT(t *testing.T) {
 	for _, ports := range [][]uint16{nil, {11211}, {11211, 11212}} {
 		config := testConfig()
