@@ -516,6 +516,10 @@ func makeLCOWVMGSBootDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM,
 		ForceTransientState: true, // tell HCS that this is just the source of the images, not ongoing state
 	}
 
+	// Shared backing and sibling signaling compose with both VMGS device layouts.
+	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
+	applyLCOWSiblingCommunication(doc, opts.SiblingCommunicationEndpoints)
+
 	return doc, nil
 }
 
@@ -636,9 +640,6 @@ func makeLCOWSecurityDoc(ctx context.Context, opts *OptionsLCOW, uvm *UtilityVM)
 			HclEnabled: opts.HclEnabled,
 		},
 	}
-
-	applyLCOWSharedMemory(doc, opts.SharedMemoryRegions)
-	applyLCOWSiblingCommunication(doc, opts.SiblingCommunicationEndpoints)
 
 	return doc, nil
 }
@@ -1167,6 +1168,8 @@ func CreateLCOW(ctx context.Context, opts *OptionsLCOW) (_ *UtilityVM, err error
 		return nil, err
 	}
 
+	// The native create borrows the same controller capability for either VMGS
+	// provider; the document's controller URI alone does not grant access.
 	if err = uvm.create(ctx, doc, opts.ProtectedSharedResources...); err != nil {
 		return nil, fmt.Errorf("error while creating the compute system: %w", err)
 	}

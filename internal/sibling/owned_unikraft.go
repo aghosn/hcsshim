@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Microsoft/hcsshim/internal/copyfile"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	"github.com/Microsoft/hcsshim/internal/log"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
@@ -57,7 +58,10 @@ func loadOwnedUnikraft(config *Config) (*UnikraftConfig, error) {
 	return cfg, nil
 }
 
-func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cfg *UnikraftConfig, group string) error {
+// configureOwnedUnikraft selects appliance boot without changing the workload.
+// root is the permanent read-only attachment; empty selects the ordinary copy
+// made by workload Create. The protected caller prepares its own copy first.
+func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cfg *UnikraftConfig, group, root string) error {
 	if workload.Appliance != nil ||
 		(workload.HclEnabled != nil && *workload.HclEnabled) {
 		return errors.New("owned Unikraft requires a direct-SNP workload")
@@ -80,18 +84,35 @@ func configureOwnedUnikraft(workload, diode *uvm.OptionsLCOW, config *Config, cf
 	hcl := false
 	diode.HclEnabled = &hcl
 	diode.ConsolePipe = `\\.\pipe\hcsshim-unikraft-` + group
+	if root == "" {
+		root = filepath.Join(workload.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd)
+	}
 	diode.Appliance = &uvm.LCOWApplianceOptions{
 		NativeStorageControl: true,
 		SCSI: map[string]hcsschema.Scsi{guestrequest.ScsiControllerGuids[0]: {
 			Attachments: map[string]hcsschema.Attachment{
-				"0": {Type_: "VirtualDisk",
-					Path: filepath.Join(workload.BundleDirectory, vmutils.DefaultDmVerityRootfsVhd), ReadOnly: true},
+				"0": {Type_: "VirtualDisk", Path: root, ReadOnly: true},
 			},
 		}},
 	}
 	return uvm.VerifyOptions(context.Background(), diode)
 }
 
+// stageProtectedUnikraftRoot copies the same verified root template used by
+// workload Create, without replacing an existing file or changing the template.
+// The protected owner retains this distinct attachment until native release.
+func stageProtectedUnikraftRoot(ctx context.Context, workload, diode *uvm.OptionsLCOW) error {
+	source := filepath.Join(workload.BootFilesPath, workload.DmVerityRootFsVhd)
+	root := diode.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"].Path
+	if err := copyfile.CopyFile(ctx, source, root, false); err != nil {
+		return fmt.Errorf("stage permanent Unikraft boot root: %w", err)
+	}
+	return nil
+}
+
+// prepareOwnedUnikraft grants access to the already prepared read-only root and
+// acquires the uplink and console before the diode can use them. The caller owns
+// any partial acquisitions, including an uplink acquired before a console error.
 func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig, consoleDirectory string) error {
 	root := opts.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"].Path
 	if err := security.GrantVmGroupAccessWithMask(root, security.AccessMaskAll); err != nil {
@@ -108,8 +129,8 @@ func (p *Pair) prepareOwnedUnikraft(opts *uvm.OptionsLCOW, cfg *UnikraftConfig, 
 	if consoleDirectory == "" {
 		consoleDirectory = opts.BundleDirectory
 	}
-	// Config-file callers retain the console outside the disposable task bundle.
-	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, consoleDirectory, cfg.Idle)
+	// Config-file and protected callers retain diagnostics outside the disposable bundle.
+	p.unikraftConsole, err = newOwnedUnikraftConsole(opts.ConsolePipe, consoleDirectory, cfg.Idle, p.IsProtected())
 	return err
 }
 

@@ -370,6 +370,27 @@ do not enable ordinary backing or relax receipt checks to obtain a boot.
 Native build, matched deployment and hardware recovery remain pending; use
 section 9's T1-T6 handoff rather than treating source acceptance as execution.
 
+### Experimental containerd-owned Unikraft bootstrap
+
+The shim can select the service-capable Unikraft package as the protected
+Bootstrap backend for an explicitly owned, mediated pair with 32 MiB of
+backing. The workload is still hardened Linux with protected Import, mediated
+root/GCS and workload-only no-RP. Standalone protected Unikraft is not supported.
+
+The owner attaches its own read-only copy of the verified root and prepares
+the uplink and console before diode Create. Native installation and the
+storage export handshake must both succeed before workload Create. The
+existing Unikraft console readiness check then gates a bounded workload Start.
+Whether the provider can report readiness before that Start is unverified.
+Early console output proves guest execution only; it does not prove backing
+installation, an active root export or provider readiness.
+
+Even a successful Start returns a bring-up-only error. The probe never
+publishes a sandbox, exports page metadata or sends seals. Keep
+`protected-pair.log`, `unikraft-console.log` and the cleanup receipt together.
+Native termination/reclaim does not wait for console or storage-control
+housekeeping; an unresolved native decision retains the owner and inputs.
+
 ### Reduced containerd-owned Linux profile
 
 Use the newly built matched shim and launcher from this worktree pair, not
@@ -387,8 +408,8 @@ after stopping any existing pair, use a fresh state directory:
 ```
 
 `StateDirectory` or `CrictlPath` explicitly selects containerd ownership.
-Only Linux with both root/GCS mediation, 32 MiB backing and unchanged SNP/
-dm-verity/prototype policy is admitted. No owned seal pause, Unikraft,
+The Linux profile requires both root/GCS mediation, 32 MiB backing and unchanged
+SNP/dm-verity/prototype policy. No owned seal pause,
 OpenShell, tuning/CPU groups, static custom exports, direct workload root/GCS
 or page-metadata host export. Preparation requires only sibling bus, storage
 and network providers, iptables and the AHV tool, not benchmark/covert tools.

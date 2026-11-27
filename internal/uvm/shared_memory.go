@@ -9,14 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/Microsoft/hcsshim/internal/computecore"
 	"github.com/Microsoft/hcsshim/internal/hcs"
 	"github.com/Microsoft/hcsshim/internal/hcs/resourcepaths"
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
 	hcsv2 "github.com/Microsoft/hcsshim/internal/hcs/v2"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestrequest"
 )
 
 const sharedMemoryRegionProperty = "SharedMemoryRegion"
@@ -147,8 +151,8 @@ func ValidateProtectedSharedRegion(r hcsschema.SharedMemoryRegion) error {
 // file-capability matches before creation. Bootstrap expects lease zero; Import
 // requires the observed nonzero lease. Ordinary settings remain resource-free
 // and cannot smuggle private fields. With protected backing, sibling-root boot
-// permits only one Import region; appliances and Bootstrap sibling roots remain
-// unsupported.
+// permits only one Import region. A native appliance may only be the Bootstrap
+// backend; it still borrows a matching controller under the same checks.
 // It neither closes originals nor proves that the underlying handles are valid.
 func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 	controllers := make(map[string]bool)
@@ -168,7 +172,9 @@ func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 			return err
 		}
 		if opts.Appliance != nil {
-			return fmt.Errorf("protected shared-memory does not support appliance boot")
+			if err := validateProtectedApplianceBootstrap(opts, r); err != nil {
+				return err
+			}
 		}
 		// A mediated workload root uses the diode's single installed backing.
 		// Do not admit Bootstrap or a mixture with ordinary/other regions.
@@ -204,6 +210,51 @@ func validateProtectedSharedOptions(opts *OptionsLCOW) error {
 		if !seen[uri] {
 			return fmt.Errorf("protected startup requires controller capability %q", uri)
 		}
+	}
+	return nil
+}
+
+// validateProtectedApplianceBootstrap restricts protected VMGS appliances to
+// the owned diode geometry, prepared uplink and permanent root0. VerifyOptions
+// also applies its normal appliance checks; Start must still validate the export.
+func validateProtectedApplianceBootstrap(opts *OptionsLCOW, region LCOWSharedMemoryRegion) error {
+	if opts.Options == nil || opts.ConfidentialLCOWOptions == nil || opts.ConfidentialCommonOptions == nil ||
+		!opts.Appliance.NativeStorageControl || opts.SiblingRoot || opts.UseGuestConnection ||
+		opts.WorkloadVmbusNoRp || opts.TimesyncRelayID != nil || opts.DisableTimeSyncService ||
+		opts.VPMemDeviceCount != 0 || len(opts.AssignedDevices) != 0 ||
+		len(opts.SharedMemoryRegions) != 1 || region.ProtectedSharedBackingMode != hcsschema.ProtectedSharedBackingBootstrap ||
+		region.StartOffset != 0 || region.Length != 32<<20 || !region.AllowGuestWrite ||
+		len(opts.SiblingCommunicationEndpoints) != 1 {
+		return errors.New("protected appliance requires one native diode Bootstrap region and endpoint")
+	}
+	endpoint := opts.SiblingCommunicationEndpoints[0]
+	group, err := guid.FromString(endpoint.GroupID)
+	if err != nil || group == (guid.GUID{}) || endpoint.Role != hcsschema.SiblingCommunicationEndpointRoleBackend ||
+		endpoint.SharedMemorySectionName != region.SectionName {
+		return errors.New("protected appliance requires the Bootstrap region's matching backend endpoint and group")
+	}
+	if opts.ProcessorCount != 1 || opts.MemorySizeInMB != 130 {
+		return errors.New("protected appliance requires one VP and 130 MiB of VM memory")
+	}
+	if len(opts.Appliance.NetworkAdapters) != 1 {
+		return errors.New("protected appliance requires one prepared uplink")
+	}
+	for id, adapter := range opts.Appliance.NetworkAdapters {
+		nic, nicErr := guid.FromString(id)
+		uplink, uplinkErr := guid.FromString(adapter.EndpointId)
+		mac, macErr := net.ParseMAC(adapter.MacAddress)
+		if nicErr != nil || nic == (guid.GUID{}) || uplinkErr != nil || uplink == (guid.GUID{}) ||
+			macErr != nil || len(mac) != 6 || mac[0]&1 != 0 || bytes.Equal(mac, []byte{0, 0, 0, 0, 0, 0}) {
+			return errors.New("protected appliance uplink requires a valid adapter ID, endpoint ID and unicast MAC")
+		}
+	}
+	slots, err := applianceStorageSlots(opts.Appliance)
+	if err != nil {
+		return err
+	}
+	root := opts.Appliance.SCSI[guestrequest.ScsiControllerGuids[0]].Attachments["0"]
+	if len(slots) != 1 || !filepath.IsAbs(root.Path) {
+		return errors.New("protected appliance requires only a permanent absolute read-only root0 attachment")
 	}
 	return nil
 }

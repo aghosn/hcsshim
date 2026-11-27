@@ -21,6 +21,12 @@ import (
 
 // CaptureUnikraftConsole records output and checks the existing boot markers.
 func CaptureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- time.Time, expectedIdle string) error {
+	return captureUnikraftConsole(reader, output, ready, nil, expectedIdle)
+}
+
+// captureUnikraftConsole optionally reports the first persisted direct-SNP
+// marker on a buffered channel. This is guest execution evidence, not readiness.
+func captureUnikraftConsole(reader io.Reader, output io.Writer, ready, boot chan<- time.Time, expectedIdle string) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 65536)
 	snp, offers, provider, reported := false, false, false, false
@@ -40,7 +46,12 @@ func CaptureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- tim
 			}
 			return fmt.Errorf("Unikraft workload management relay failed: %s", line)
 		}
-		snp = snp || strings.Contains(line, "hyperv: isolation type 2 (SNP), paravisor absent")
+		if !snp && strings.Contains(line, "hyperv: isolation type 2 (SNP), paravisor absent") {
+			snp = true
+			if boot != nil {
+				boot <- time.Now()
+			}
+		}
 		offers = offers || strings.Contains(line, "vmbus: all offers delivered")
 		if _, value, ok := strings.Cut(line, "vmbus: idle="); ok {
 			fields := strings.Fields(value)
@@ -74,6 +85,7 @@ func CaptureUnikraftConsole(reader io.Reader, output io.Writer, ready chan<- tim
 type ownedUnikraftConsole struct {
 	cancel    context.CancelFunc
 	ready     chan time.Time
+	boot      chan time.Time
 	done      chan struct{}
 	err       error
 	log       *os.File
@@ -81,20 +93,28 @@ type ownedUnikraftConsole struct {
 	closeErr  error
 }
 
-func newOwnedUnikraftConsole(pipe, directory, idle string) (*ownedUnikraftConsole, error) {
+// newOwnedUnikraftConsole captures a single connection. A protected probe uses
+// exclusive creation so a stale or competing log is never overwritten.
+func newOwnedUnikraftConsole(pipe, directory, idle string, exclusive bool) (*ownedUnikraftConsole, error) {
 	listener, err := winio.ListenPipe(pipe, &winio.PipeConfig{
 		SecurityDescriptor: "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)",
 	})
 	if err != nil {
 		return nil, err
 	}
-	log, err := os.Create(filepath.Join(directory, "unikraft-console.log"))
+	flags := os.O_WRONLY | os.O_CREATE
+	if exclusive {
+		flags |= os.O_EXCL
+	} else {
+		flags |= os.O_TRUNC
+	}
+	log, err := os.OpenFile(filepath.Join(directory, "unikraft-console.log"), flags, 0666)
 	if err != nil {
 		return nil, errors.Join(err, listener.Close())
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	console := &ownedUnikraftConsole{
-		cancel: cancel, ready: make(chan time.Time, 1), done: make(chan struct{}), log: log,
+		cancel: cancel, ready: make(chan time.Time, 1), boot: make(chan time.Time, 1), done: make(chan struct{}), log: log,
 	}
 	go func() {
 		defer close(console.done)
@@ -109,7 +129,7 @@ func newOwnedUnikraftConsole(pipe, directory, idle string) (*ownedUnikraftConsol
 		defer conn.Close()
 		stopRead := context.AfterFunc(ctx, func() { _ = conn.Close() })
 		defer stopRead()
-		console.err = CaptureUnikraftConsole(conn, log, console.ready, idle)
+		console.err = captureUnikraftConsole(conn, log, console.ready, console.boot, idle)
 	}()
 	return console, nil
 }
@@ -125,11 +145,15 @@ func (c *ownedUnikraftConsole) Err() error {
 	}
 }
 
+// waitReady requires the full provider marker set, not just early guest output.
 func (c *ownedUnikraftConsole) waitReady(ctx context.Context) error {
 	select {
 	case <-c.ready:
 		if err := c.Err(); err != nil {
 			return fmt.Errorf("Unikraft console ended during boot: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait for Unikraft boot markers: %w", err)
 		}
 		return nil
 	case <-c.done:

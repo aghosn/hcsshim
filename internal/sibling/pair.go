@@ -32,7 +32,8 @@ import (
 // Protected masks are optional decimal strings: nil is omitted, not selected zero.
 // RunID and CleanupReceiptPath identify the one final S3 cleanup result; early/late
 // AHV selection is already encoded in prepared boot inputs, not another shim flag.
-// The protected profile requires interactive endpoint acquisition before sealing.
+// The protected Linux profile acquires interactive endpoints before sealing.
+// ProtectedShared with UnikraftPackage selects an error-only bring-up probe.
 // PageMetadataOutputPath optionally exports an existing local directory writable
 // only to the protected diode; preflight validates the filesystem destination.
 // WorkloadVmbusNoRp is an optional, default-off native workload-only request.
@@ -145,11 +146,15 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
 	}
 	if config.ProtectedShared {
-		if config.Standalone || !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 || config.UnikraftPackage != "" ||
+		if config.Standalone || !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 ||
 			config.RunID == "" || len(config.RunID) > 128 ||
 			strings.Trim(config.RunID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" ||
 			!filepath.IsAbs(config.CleanupReceiptPath) || strings.ContainsRune(config.CleanupReceiptPath, '\x00') {
-			return nil, errors.New("protected owned pair requires mediated GCS/root, interactive endpoints, 32 MiB, Linux, a simple run ID and an absolute cleanup receipt path")
+			return nil, errors.New("protected owned pair requires mediated GCS/root, interactive mode, 32 MiB, a simple run ID and an absolute cleanup receipt path")
+		}
+		if config.UnikraftPackage != "" && (!config.WorkloadVmbusNoRp ||
+			config.PageMetadataOutputPath != "" || config.DiodePartitionSealMask != nil || config.WorkloadPartitionSealMask != nil) {
+			return nil, errors.New("protected Unikraft bring-up requires workload_vmbus_no_rp and does not support page export or startup partition masks")
 		}
 	} else if config.DiodePartitionSealMask != nil || config.WorkloadPartitionSealMask != nil ||
 		config.RunID != "" || config.CleanupReceiptPath != "" {
@@ -227,11 +232,11 @@ func validateConfigMasks(raw []byte) error {
 }
 
 // validateWorkloadVmbusNoRpConfig restricts explicit native suppression to the
-// protected mediated owned Linux profile, including directly constructed Configs.
+// protected mediated Linux workload, including when its backend is Unikraft.
 func validateWorkloadVmbusNoRpConfig(config *Config) error {
-	if config.WorkloadVmbusNoRp && (!config.ProtectedShared || !config.MediateGCS ||
-		!config.Interactive || config.UnikraftPackage != "" || config.SharedMemoryBytes != 32<<20) {
-		return errors.New("workload_vmbus_no_rp requires the protected mediated interactive owned Linux profile")
+	if config.WorkloadVmbusNoRp && (config.Standalone || !config.ProtectedShared || !config.MediateGCS ||
+		!config.Interactive || config.SharedMemoryBytes != 32<<20) {
+		return errors.New("workload_vmbus_no_rp requires a protected mediated interactive owned Linux workload")
 	}
 	return nil
 }
@@ -292,6 +297,9 @@ func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uv
 		len(base.AssignedDevices) != 0 || base.TimesyncRelayID != nil || base.WorkloadVmbusNoRp {
 		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership, assigned devices, a timesync route or WorkloadVmbusNoRp")
 	}
+	if config.ProtectedShared && base.Appliance != nil {
+		return nil, nil, errors.New("protected pair workload cannot inherit appliance boot")
+	}
 	// Each guest owns independent mutable option structs; policy bytes are unchanged.
 	clone := func(role Role, id, bundle string) (*uvm.OptionsLCOW, error) {
 		options := *base
@@ -348,7 +356,8 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 }
 
 // Start creates and bootstraps a pair in-process. Workload boot and diode root
-// provider bootstrap must overlap: the workload cannot reach GCS without root0.
+// provider bootstrap normally overlap: the workload cannot reach GCS without
+// root0. Protected Unikraft is instead a staged, error-only bring-up probe.
 // Protected errors run the single cleanup decision; incomplete owners stay
 // retained in-process even when no sandbox task was published.
 func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair, resultErr error) {
@@ -411,7 +420,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, err
 	}
 	if native != nil {
-		if err := configureOwnedUnikraft(workloadOptions, diodeOptions, config, native, group.String()); err != nil {
+		if err := configureOwnedUnikraft(workloadOptions, diodeOptions, config, native, group.String(), ""); err != nil {
 			return nil, err
 		}
 	}

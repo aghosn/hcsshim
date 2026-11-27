@@ -116,7 +116,6 @@ func TestWorkloadVmbusNoRpConfig(t *testing.T) {
 		"ordinary":   func(c *Config) { c.ProtectedShared = false },
 		"direct-gcs": func(c *Config) { c.MediateGCS = false },
 		"unowned":    func(c *Config) { c.Interactive = false },
-		"unikraft":   func(c *Config) { c.UnikraftPackage = `C:\unikraft` },
 		"size":       func(c *Config) { c.SharedMemoryBytes = 16 << 20 },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -130,6 +129,52 @@ func TestWorkloadVmbusNoRpConfig(t *testing.T) {
 				t.Fatal("direct Config bypassed selection scope")
 			}
 		})
+	}
+}
+
+// TestProtectedSharedOwnedUnikraftSelection checks that only an explicit
+// protected mediated probe selects the appliance without weakening its Linux
+// workload. Unsupported options must fail before entering the protected owner.
+func TestProtectedSharedOwnedUnikraftSelection(t *testing.T) {
+	config := workloadVmbusNoRpConfigFixture()
+	config.UnikraftPackage = `C:\unikraft`
+	selected, err := config.validatedCopy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := testOptions()
+	workload, diode, err := commonPairOptions(base, selected, "group")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !workload.WorkloadVmbusNoRp || !workload.SiblingRoot || !workload.DmVerityMode ||
+		!workload.SecurityPolicyEnabled || workload.Appliance != nil || diode.WorkloadVmbusNoRp || base.WorkloadVmbusNoRp {
+		t.Fatal("protected appliance selection changed workload hardening or leaked no-RP")
+	}
+	base.Appliance = &uvm.LCOWApplianceOptions{}
+	if _, _, err := commonPairOptions(base, selected, "group"); err == nil {
+		t.Fatal("protected workload inherited appliance boot")
+	}
+	zero := uint64(0)
+	for name, change := range map[string]func(*Config){
+		"no-rp-off":     func(c *Config) { c.WorkloadVmbusNoRp = false },
+		"unowned":       func(c *Config) { c.Interactive = false },
+		"standalone":    func(c *Config) { c.Standalone = true },
+		"direct-gcs":    func(c *Config) { c.MediateGCS = false },
+		"storage-io":    func(c *Config) { c.StorageDirectIO = true },
+		"page-export":   func(c *Config) { c.PageMetadataOutputPath = `C:\export` },
+		"diode-mask":    func(c *Config) { c.DiodePartitionSealMask = &zero },
+		"workload-mask": func(c *Config) { c.WorkloadPartitionSealMask = &zero },
+	} {
+		bad := *config
+		change(&bad)
+		if _, err := bad.validatedCopy(); err == nil {
+			t.Errorf("%s: accepted excluded protected appliance selection", name)
+		}
+	}
+	data, _ := json.Marshal(config)
+	if _, err := decodeConfig(strings.NewReader(strings.TrimSuffix(string(data), "}") + `,"diode_snp_transport":true}`)); err == nil {
+		t.Fatal("accepted a diode SNP transport override")
 	}
 }
 

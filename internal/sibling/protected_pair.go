@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,11 +29,13 @@ import (
 )
 
 const (
-	protectedPairSetupBudget = 10 * time.Minute
-	protectedPairGCSBudget   = 7 * time.Minute
-	protectedPartitionBudget = 5 * time.Minute
-	protectedPairLogName     = "protected-pair.log"
-	protectedCleanupBudget   = 2 * time.Minute
+	protectedPairSetupBudget     = 10 * time.Minute
+	protectedPairGCSBudget       = 7 * time.Minute
+	protectedPartitionBudget     = 5 * time.Minute
+	protectedPairLogName         = "protected-pair.log"
+	protectedCleanupBudget       = 2 * time.Minute
+	protectedUnikraftReadyBudget = 3 * time.Minute
+	protectedUnikraftRootName    = "unikraft-root.vhd"
 )
 
 // protectedVMAttempt is retained before CreateLCOW, even when it returns no VM.
@@ -54,27 +57,33 @@ type protectedService struct {
 // protectedPair owns the native capability and participant operations. Guest
 // commands and child containers do not hold this boundary or authorize release.
 type protectedPair struct {
-	pair          *Pair
-	config        *Config
-	backing       *ProtectedBacking
-	diode         protectedVMAttempt
-	workload      protectedVMAttempt
-	uplinkAttempt bool
-	services      []*protectedService
-	timesync      *pairTimesync
-	log           *os.File
-	startupDone   chan struct{}
-	startupParent context.Context // Checked at seal commitment, never used as a service lifetime.
-	ctx           context.Context
-	cancel        context.CancelCauseFunc
-	watchCtx      context.Context
-	stopWatch     context.CancelFunc
-	forwardMu     sync.Mutex
-	closing       bool
-	nativeMu      sync.Mutex // Acquisition, Create/Start, seals and final controls only.
+	pair               *Pair
+	config             *Config
+	backing            *ProtectedBacking
+	unikraft           *UnikraftConfig
+	applianceRootOwned bool
+	diode              protectedVMAttempt
+	workload           protectedVMAttempt
+	uplinkAttempt      bool
+	services           []*protectedService
+	timesync           *pairTimesync
+	log                *os.File
+	startupDone        chan struct{}
+	startupParent      context.Context // Checked at seal commitment, never used as a service lifetime.
+	ctx                context.Context
+	cancel             context.CancelCauseFunc
+	watchCtx           context.Context
+	stopWatch          context.CancelFunc
+	forwardMu          sync.Mutex
+	closing            bool
+	nativeMu           sync.Mutex // Acquisition, Create/Start, seals and final controls only.
 	// Attempts are retained evidence, not permission to replay controls.
 	admissionAttempt bool
 	sealAttempt      [2]bool
+
+	// Startup owns this pending close until startupDone. Housekeeping can retry
+	// a failed close after native release, before joining other borrowers.
+	probeEntropyClose func(context.Context) error
 }
 
 // startProtectedPair implements the owned Bootstrap-before-Import sequence.
@@ -83,6 +92,9 @@ type protectedPair struct {
 // before workload Start, then checks mediation and seals before sandbox creation.
 // Only the cloned workload receives a fresh pair-owned native timesync route;
 // pipe/device acquisition overlaps boot, with no sample/convergence handoff gate.
+// The explicitly selected Unikraft backend instead prepares its permanent
+// root, then gates a bounded workload Start on console readiness after Create.
+// That probe always returns an error and never reaches readiness or seals.
 //
 // After owner allocation,
 // even an error returns the Pair: the caller must retain it, never ordinary-close
@@ -112,9 +124,20 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 		// Preserve the caller's and workload's inherited restrictions.
 		diode.NoWritableFileShares = false
 	}
-	// Only the protected Linux provider owns the root-facing log service.
-	// commonPairOptions may retain inherited slice storage; do not mutate it.
-	diode.ExtraVSockPorts = append(append([]uint32(nil), diode.ExtraVSockPorts...), guestresource.GCSRelayLogPort)
+	native, err := loadOwnedUnikraft(config)
+	if err != nil {
+		return nil, err
+	}
+	if native != nil {
+		root := filepath.Join(diode.BundleDirectory, protectedUnikraftRootName)
+		if err := configureOwnedUnikraft(workload, diode, config, native, group.String(), root); err != nil {
+			return nil, err
+		}
+	} else {
+		// Only the protected Linux provider owns the root-facing log service.
+		// commonPairOptions may retain inherited slice storage; do not mutate it.
+		diode.ExtraVSockPorts = append(append([]uint32(nil), diode.ExtraVSockPorts...), guestresource.GCSRelayLogPort)
+	}
 	if err := preflightProtectedPair(parent, config, workload, diode); err != nil {
 		return nil, err
 	}
@@ -122,9 +145,9 @@ func startProtectedPair(parent context.Context, base *uvm.OptionsLCOW, config *C
 
 	ctx, cancel := context.WithCancelCause(context.Background())
 	watch, stopWatch := context.WithCancel(context.Background())
-	pair := &Pair{done: make(chan struct{})}
+	pair := &Pair{done: make(chan struct{}), unikraft: native != nil}
 	p := &protectedPair{
-		pair: pair, config: config, ctx: ctx, cancel: cancel,
+		pair: pair, config: config, unikraft: native, ctx: ctx, cancel: cancel,
 		watchCtx: watch, stopWatch: stopWatch, startupDone: make(chan struct{}), startupParent: parent,
 		diode: protectedVMAttempt{options: diode}, workload: protectedVMAttempt{options: workload},
 	}
@@ -209,15 +232,19 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 	if err := ValidateProtectedBackingSize(config.SharedMemoryBytes); err != nil {
 		return err
 	}
+	appliance := config.UnikraftPackage != ""
+	if appliance != (diode.Appliance != nil) || appliance && !diode.Appliance.NativeStorageControl {
+		return errors.New("protected provider options do not match the selected bootstrap")
+	}
 	for _, options := range []*uvm.OptionsLCOW{diode, workload} {
-		if options.Appliance != nil || options.HclEnabled == nil || *options.HclEnabled ||
+		if (options == workload && options.Appliance != nil) || options.HclEnabled == nil || *options.HclEnabled ||
 			options.AllowOvercommit || options.EnableDeferredCommit ||
 			options.PreferredRootFSType != uvm.PreferredRootFSTypeNA ||
 			options.CPUGroupID != "" || options.ResourcePartitionID != nil ||
 			options.ProcessorLimit != 0 || options.ProcessorWeight != 0 ||
 			len(options.ProtectedSharedResources) != 0 || options.NetworkConfigProxy != "" ||
 			options.DisableTimeSyncService {
-			return errors.New("protected owned pair requires unchanged direct SNP Linux dm-verity boot with timesync enabled, without CPU-group/tuning or appliance options")
+			return errors.New("protected owned pair requires direct SNP with timesync enabled, a Linux workload and no CPU-group or processor tuning")
 		}
 		if err := uvm.VerifyOptions(ctx, options); err != nil {
 			return err
@@ -228,8 +255,10 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 		filepath.Join(workload.BootFilesPath, workload.GuestStateFilePath),
 		filepath.Join(workload.BootFilesPath, workload.DmVerityRootFsVhd),
 	}
-	for _, name := range protectedPairInputs() {
-		paths = append(paths, filepath.Join(config.ModuleDirectory, name))
+	if !appliance {
+		for _, name := range protectedPairInputs() {
+			paths = append(paths, filepath.Join(config.ModuleDirectory, name))
+		}
 	}
 	for _, path := range paths {
 		info, err := os.Stat(path)
@@ -238,6 +267,9 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("protected input %q is not a regular file", path)
+		}
+		if appliance && info.Size() == 0 {
+			return fmt.Errorf("protected appliance input %q is empty", path)
 		}
 	}
 	logPath := filepath.Join(filepath.Dir(config.CleanupReceiptPath), protectedPairLogName)
@@ -254,7 +286,11 @@ func preflightProtectedPair(ctx context.Context, config *Config, workload, diode
 	if !parent.IsDir() {
 		return errors.New("protected cleanup receipt parent is not a directory")
 	}
-	for _, path := range []string{config.CleanupReceiptPath, logPath, diode.BundleDirectory} {
+	outputs := []string{config.CleanupReceiptPath, logPath, diode.BundleDirectory}
+	if appliance {
+		outputs = append(outputs, filepath.Join(filepath.Dir(logPath), "unikraft-console.log"))
+	}
+	for _, path := range outputs {
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 			return errors.Join(err, fmt.Errorf("protected output must be fresh: %s", path))
 		}
@@ -323,6 +359,9 @@ func (p *protectedPair) bootstrap(group string) error {
 	p.pair.cpuGroups, err = preparePairCPUGroups(setup, p.config, p.workload.options, p.diode.options, cpugroup.HostOperations)
 	if err != nil {
 		return err
+	}
+	if p.unikraft != nil {
+		return p.bootstrapUnikraft(setup)
 	}
 
 	// Import is impossible until the diode's actual complete Install receipt
@@ -428,6 +467,171 @@ func (p *protectedPair) bootstrap(group string) error {
 	return p.checkServices()
 }
 
+// protectedUnikraftSteps are the forward milestones only. The protected pair
+// owns partial acquisitions and all cleanup, regardless of which step fails.
+type protectedUnikraftSteps struct {
+	prepare, createDiode, startDiode, createWorkload, configureRelay, waitReady func(context.Context) error
+	startWorkload                                                               func(context.Context) protectedStartOutcome
+}
+
+var errProtectedUnikraftBringUpOnly = errors.New("protected Unikraft bring-up only: workload Start returned successfully; no sandbox published")
+
+// run executes the probe's receipt-before-Import and readiness-before-Start
+// gates. A successful Start is still a terminal probe result, not a handoff.
+func (s protectedUnikraftSteps) run(ctx context.Context, record func(string, error) error) error {
+	var diagnostics error
+	for _, step := range []struct {
+		phase string
+		run   func(context.Context) error
+	}{
+		{"diode_prepare", s.prepare},
+		{"diode_create", s.createDiode},
+		{"diode_start_and_storage_handshake", s.startDiode},
+		{"workload_create", s.createWorkload},
+		{"workload_gcs_relay", s.configureRelay},
+		{"provider_readiness", s.waitReady},
+	} {
+		if err := context.Cause(ctx); err != nil {
+			return errors.Join(fmt.Errorf("protected Unikraft before %s: %w", step.phase, err), diagnostics)
+		}
+		err := step.run(ctx)
+		diagnostics = errors.Join(diagnostics, record(step.phase, err))
+		if err != nil {
+			return errors.Join(fmt.Errorf("protected Unikraft %s: %w", step.phase, err), diagnostics)
+		}
+	}
+	outcome := protectedStartOutcome{err: context.Cause(ctx)}
+	if outcome.err == nil {
+		outcome = s.startWorkload(ctx)
+	}
+	phase := "workload_start_not_dispatched"
+	if outcome.called {
+		phase = "workload_start_result"
+	}
+	diagnostics = errors.Join(diagnostics, outcome.diagnosticErr, record(phase, outcome.err))
+	if outcome.err != nil {
+		return errors.Join(fmt.Errorf("protected Unikraft %s: %w", phase, outcome.err), diagnostics)
+	}
+	return errors.Join(errProtectedUnikraftBringUpOnly, diagnostics)
+}
+
+// bootstrapUnikraft runs the appliance probe for bootstrap. Storage management
+// still uses the native export check in Start. Neither console nor control work
+// sits on the native receipt or termination boundary.
+func (p *protectedPair) bootstrapUnikraft(ctx context.Context) error {
+	diodeID, workloadID := p.diode.options.ID, p.workload.options.ID
+	// The setup deadline can request native shutdown even if the storage/GCS
+	// call has not returned. A voluntary end of startup is not a timeout.
+	stopTimeout := context.AfterFunc(ctx, func() {
+		if ctx.Err() == context.DeadlineExceeded {
+			p.stop(fmt.Errorf("protected Unikraft setup: %w", context.Cause(ctx)))
+		}
+	})
+	defer stopTimeout()
+	defer p.recordUnikraftBoot()
+	var storageControl providerState
+	steps := protectedUnikraftSteps{
+		// Prepare the root before arming the console or creating the diode;
+		// workload Create owns a different copy and cannot replace this disk.
+		prepare: func(ctx context.Context) error {
+			if err := stageProtectedUnikraftRoot(ctx, p.workload.options, p.diode.options); err != nil {
+				return err
+			}
+			p.applianceRootOwned = true
+			if err := p.pair.prepareOwnedUnikraft(p.diode.options, p.unikraft, filepath.Dir(p.config.CleanupReceiptPath)); err != nil {
+				return err
+			}
+			p.watchUnikraftService(p.pair.unikraftConsole, "console")
+			return nil
+		},
+		// Only the protected owner can dispatch Bootstrap with its controller.
+		createDiode: func(ctx context.Context) error {
+			return p.create(ctx, &p.diode, hcsschema.ProtectedSharedBackingBootstrap)
+		},
+		// Wait for the storage handshake after the native receipt has been
+		// observed; neither handshake success nor console output grants Import.
+		startDiode: func(ctx context.Context) error {
+			if err := p.start(ctx, &p.diode); err != nil {
+				return err
+			}
+			p.recordUnikraftBoot()
+			control, err := p.diode.vm.NativeStorageControl()
+			if err != nil {
+				return err
+			}
+			storageControl = control
+			p.watchUnikraftService(control, "storage control")
+			return nil
+		},
+		// Region(Import) consumes the lease already validated by diode Start.
+		createWorkload: func(ctx context.Context) error {
+			// Import borrows the controller only for the existing native path.
+			create := func(ctx context.Context) error {
+				return p.create(ctx, &p.workload, hcsschema.ProtectedSharedBackingImport)
+			}
+			// The workload VM is published only on successful Create.
+			disable := func(ctx context.Context) error { return p.workload.vm.DisableBootEntropy(ctx) }
+			return p.createUnikraftWorkload(ctx, create, disable)
+		},
+		configureRelay: p.configureGCSRelay,
+		// This is an ordering probe: readiness before Start is not established.
+		waitReady: func(ctx context.Context) error {
+			ready, cancel := context.WithTimeout(ctx, protectedUnikraftReadyBudget)
+			defer cancel()
+			return p.pair.unikraftConsole.waitReady(ready)
+		},
+		// Attempt real protected Start, without Linux diode scripts, dummy
+		// services, application publication or any kind of seal.
+		startWorkload: func(ctx context.Context) protectedStartOutcome {
+			select {
+			case <-storageControl.Done():
+				return protectedStartOutcome{err: fmt.Errorf("protected Unikraft storage control ended: %w", storageControl.Err())}
+			case <-p.pair.unikraftConsole.Done():
+				return protectedStartOutcome{err: fmt.Errorf("protected Unikraft console ended: %w", p.pair.unikraftConsole.Err())}
+			default:
+				return p.startWithNativeCompletion(ctx, &p.workload, p.log, p.workload.vm.StartWithNativeStartCompletion)
+			}
+		},
+	}
+	// Report each gate result with the same run and participant identities.
+	return steps.run(ctx, func(phase string, err error) error {
+		if _, logErr := fmt.Fprintf(p.log, "unikraft phase=%s run=%s diode=%s workload=%s error=%v\n",
+			phase, p.config.RunID, diodeID, workloadID, err); logErr != nil {
+			return fmt.Errorf("log protected Unikraft %s: %w", phase, logErr)
+		}
+		return nil
+	})
+}
+
+// recordUnikraftBoot records an already captured guest marker without waiting
+// for console output. The console retains the raw text even on handshake failure.
+func (p *protectedPair) recordUnikraftBoot() {
+	if p.pair.unikraftConsole == nil {
+		return
+	}
+	select {
+	case observed := <-p.pair.unikraftConsole.boot:
+		if _, err := fmt.Fprintf(p.log, "unikraft phase=guest_boot run=%s vm=%s marker=direct-SNP observed=%s\n",
+			p.config.RunID, p.diode.options.ID, observed.Format(time.RFC3339Nano)); err != nil {
+			log.G(p.ctx).WithError(err).Warn("protected Unikraft boot marker could not be logged")
+		}
+	default:
+	}
+}
+
+// watchUnikraftService turns console/control loss into a protected stop without
+// joining guest I/O. Native exit is monitored independently by watch.
+func (p *protectedPair) watchUnikraftService(state providerState, name string) {
+	// Observe service loss independently of the startup goroutine's current wait.
+	go func() {
+		select {
+		case <-p.watchCtx.Done():
+		case <-state.Done():
+			p.stop(fmt.Errorf("protected Unikraft %s ended: %w", name, state.Err()))
+		}
+	}()
+}
+
 // create records the attempt and real capability before synchronous CreateLCOW.
 // Existing CreateLCOW error cleanup is unchanged; unobservable work stays unknown.
 func (p *protectedPair) create(ctx context.Context, v *protectedVMAttempt, mode hcsschema.ProtectedSharedBackingMode) error {
@@ -461,11 +665,38 @@ func (p *protectedPair) create(ctx context.Context, v *protectedVMAttempt, mode 
 	return nil
 }
 
-// configureGCSRelay publishes the listener before native Start, excluding stop.
-// Ordinary listener/connection closure waits for startupDone, not native reclaim.
+// createUnikraftWorkload disables entropy as part of successful Create even
+// if cancellation has ended forward work. This runs outside nativeMu, before
+// relay binding or Start. Housekeeping can retry if the first close failed.
+func (p *protectedPair) createUnikraftWorkload(ctx context.Context, create, disable func(context.Context) error) error {
+	if err := create(ctx); err != nil {
+		return err
+	}
+	p.probeEntropyClose = disable
+	return p.disableUnikraftEntropy(context.WithoutCancel(ctx))
+}
+
+// disableUnikraftEntropy closes a published pre-Start listener if still owned.
+// Only startup, or housekeeping after startupDone, may call it.
+func (p *protectedPair) disableUnikraftEntropy(ctx context.Context) error {
+	if p.probeEntropyClose == nil {
+		return nil
+	}
+	if err := p.probeEntropyClose(ctx); err != nil {
+		return fmt.Errorf("disable protected Unikraft workload boot entropy: %w", err)
+	}
+	p.probeEntropyClose = nil
+	return nil
+}
+
+// configureGCSRelay publishes the listener before native Start. For the probe
+// relay setup is startup-owned and cannot delay native cleanup. Housekeeping
+// waits for startupDone before touching its listeners.
 func (p *protectedPair) configureGCSRelay(ctx context.Context) error {
-	p.nativeMu.Lock()
-	defer p.nativeMu.Unlock()
+	if p.unikraft == nil {
+		p.nativeMu.Lock()
+		defer p.nativeMu.Unlock()
+	}
 	if err := p.ctx.Err(); err != nil {
 		return context.Cause(p.ctx)
 	}
@@ -475,18 +706,56 @@ func (p *protectedPair) configureGCSRelay(ctx context.Context) error {
 	if err := p.workload.vm.ConfigureGCSRelay(p.diode.vm); err != nil {
 		return err
 	}
-	if err := p.workload.vm.ConfigureGCSLogRelay(p.diode.vm); err != nil {
-		return err
+	// If the probe inherits a workload output listener, retarget it too; never
+	// fall back to direct host output or invent an appliance log service.
+	if p.unikraft == nil || p.workload.options.ForwardStdout || p.workload.options.ForwardStderr {
+		if err := p.workload.vm.ConfigureGCSLogRelay(p.diode.vm); err != nil {
+			return err
+		}
 	}
-	return p.workload.vm.DisableBootEntropy(ctx)
+	if p.unikraft == nil {
+		return p.workload.vm.DisableBootEntropy(ctx)
+	}
+	return nil
 }
 
 // start retains native dispatch through its actual return and receipt observation,
 // then releases nativeMu before ordinary GCS bootstrap. Guest bootstrap failure
 // cannot invalidate an already observed native result or delay native shutdown.
 func (p *protectedPair) start(ctx context.Context, v *protectedVMAttempt) error {
+	outcome := p.startWithNativeCompletion(ctx, v, p.log, v.vm.StartWithNativeStartCompletion)
+	if outcome.diagnosticErr != nil {
+		return errors.Join(outcome.err, outcome.diagnosticErr)
+	}
+	return outcome.err
+}
+
+// protectedStartOutcome keeps the owner-side call boundary and operational
+// result independent of diagnostic I/O. Called does not prove native dispatch.
+type protectedStartOutcome struct {
+	called        bool
+	err           error
+	diagnosticErr error
+}
+
+// startWithNativeCompletion records an admitted owner attempt before entering
+// Start, without holding nativeMu across the diagnostic write. Admission is
+// checked again under nativeMu; install evidence still requires the callback.
+func (p *protectedPair) startWithNativeCompletion(ctx context.Context, v *protectedVMAttempt, attemptLog io.Writer,
+	start func(context.Context, time.Duration, func(context.Context, error) error) error,
+) protectedStartOutcome {
+	var logErr error
+	if p.unikraft != nil && v == &p.workload {
+		if err := p.startCancellation(ctx); err != nil {
+			return protectedStartOutcome{err: err}
+		}
+		_, logErr = fmt.Fprintf(attemptLog, "unikraft phase=workload_start_attempt run=%s vm=%s attempted=%s\n",
+			p.config.RunID, v.options.ID, time.Now().Format(time.RFC3339Nano))
+	}
+
 	p.nativeMu.Lock()
 	locked := true
+	// A receipt callback releases native authority before guest bootstrap.
 	unlock := func() {
 		if locked {
 			locked = false
@@ -494,11 +763,8 @@ func (p *protectedPair) start(ctx context.Context, v *protectedVMAttempt) error 
 		}
 	}
 	defer unlock()
-	if err := p.ctx.Err(); err != nil {
-		return context.Cause(p.ctx)
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+	if err := p.startCancellation(ctx); err != nil {
+		return protectedStartOutcome{err: err, diagnosticErr: logErr}
 	}
 	connectionTimeout := timeout.GCSConnectionTimeout
 	if v == &p.workload {
@@ -506,7 +772,19 @@ func (p *protectedPair) start(ctx context.Context, v *protectedVMAttempt) error 
 	}
 	var gpa uint64
 	observed := false
-	err := v.vm.StartWithNativeStartCompletion(ctx, connectionTimeout, func(ctx context.Context, nativeErr error) (result error) {
+	// The callback captures the native outcome even if guest startup cannot finish.
+	err := start(ctx, connectionTimeout, func(ctx context.Context, nativeErr error) (result error) {
+		// Publish probe evidence after unlocking, but before the later storage
+		// handshake or GCS bootstrap can wait or fail.
+		if p.unikraft != nil {
+			defer func() {
+				if observed {
+					_, receiptLogErr := fmt.Fprintf(p.log, "startup run=%s vm=%s mode=%s lease=%d byte_gpa=%#x installed=true\n",
+						p.config.RunID, v.options.ID, v.region.ProtectedSharedBackingMode, v.region.ProtectedSharedLeaseId, gpa)
+					logErr = errors.Join(logErr, receiptLogErr)
+				}
+			}()
+		}
 		defer func() {
 			if result != nil {
 				p.stop(result)
@@ -517,6 +795,13 @@ func (p *protectedPair) start(ctx context.Context, v *protectedVMAttempt) error 
 			p.backing.MarkUnknown()
 			p.observeFailedStartup(v)
 			return fmt.Errorf("protected native start %s (progress uncertain): %w", v.options.ID, nativeErr)
+		}
+		if p.unikraft != nil {
+			// Cancellation and console loss are not native receipt evidence.
+			// Observe completed Start with an independent, bounded native query.
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
 		}
 		regions, err := v.vm.SharedMemoryRegions(ctx)
 		if err != nil || len(regions) != 1 || regions[0].SectionName != v.region.SectionName {
@@ -536,12 +821,27 @@ func (p *protectedPair) start(ctx context.Context, v *protectedVMAttempt) error 
 		p.watch(v)
 		return nil
 	})
+	if p.unikraft != nil {
+		if observed && v == &p.diode && err != nil {
+			err = fmt.Errorf("Unikraft native storage handshake: %w", err)
+		}
+		return protectedStartOutcome{called: true, err: err, diagnosticErr: logErr}
+	}
 	if observed {
 		_, logErr := fmt.Fprintf(p.log, "startup run=%s vm=%s mode=%s lease=%d byte_gpa=%#x installed=true\n",
 			p.config.RunID, v.options.ID, v.region.ProtectedSharedBackingMode, v.region.ProtectedSharedLeaseId, gpa)
 		err = errors.Join(err, logErr)
 	}
-	return err
+	return protectedStartOutcome{called: true, err: err}
+}
+
+// startCancellation preserves the owner's stop cause ahead of startup
+// cancellation. Both are checked again at the native dispatch boundary.
+func (p *protectedPair) startCancellation(ctx context.Context) error {
+	if err := context.Cause(p.ctx); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // observeFailedStartup retains only validated cached initialization history,
@@ -692,7 +992,8 @@ func (p *protectedPair) seal(ctx context.Context, index int, mask uint64) error 
 }
 
 // sealPartition checks live owner cancellation before commitment under forwardMu,
-// not the detached startup caller or one-attempt guards. Startup completion is observed
+// not the detached startup caller or one-attempt guards. Probe owners never
+// admit seals. Startup completion is observed
 // nonblockingly so a request cannot hold the lock needed to finish startup.
 // Committed execution has no cancellation or deadline: nativeMu retains the
 // VM/backing until the HCS wait observes actual completion, even on disconnect.
@@ -702,6 +1003,9 @@ func (p *protectedPair) sealPartition(role string, mask uint64) (string, error) 
 		v = &p.diode
 	}
 	id := v.options.ID
+	if p.unikraft != nil {
+		return id, &uvm.PartitionSealError{Err: errors.New("protected Unikraft bring-up does not admit partition seals")}
+	}
 	select {
 	case <-p.startupDone:
 	default:
@@ -804,9 +1108,13 @@ func (p *Pair) Stop() {
 
 var protectedOwners = struct {
 	sync.Mutex
-	shutdown bool
-	pairs    map[*protectedPair]struct{}
-}{pairs: make(map[*protectedPair]struct{})}
+	shutdown          bool
+	pairs             map[*protectedPair]struct{}
+	probeHousekeeping map[*protectedPair]struct{}
+}{
+	pairs:             make(map[*protectedPair]struct{}),
+	probeHousekeeping: make(map[*protectedPair]struct{}),
+}
 
 // registerProtectedPair races atomically with shim shutdown, before effects.
 func registerProtectedPair(p *protectedPair) error {
@@ -819,15 +1127,27 @@ func registerProtectedPair(p *protectedPair) error {
 	return nil
 }
 
-// PrepareProtectedShutdown refuses shim exit while any protected owner is live
-// or incomplete, including startup failures with no published sandbox task.
+// PrepareProtectedShutdown refuses shim exit while native ownership remains
+// unresolved or a released probe still owes receipt publication or cleanup.
 func PrepareProtectedShutdown() error {
 	protectedOwners.Lock()
 	defer protectedOwners.Unlock()
+	if err := protectedShutdownBlocker(); err != nil {
+		return err
+	}
+	protectedOwners.shutdown = true
+	return nil
+}
+
+// protectedShutdownBlocker checks orderly exit eligibility with the registry
+// locked, without committing to shutdown.
+func protectedShutdownBlocker() error {
 	if len(protectedOwners.pairs) != 0 {
 		return fmt.Errorf("%d protected pair owners remain live or incomplete; retain shim and prepared inputs", len(protectedOwners.pairs))
 	}
-	protectedOwners.shutdown = true
+	if len(protectedOwners.probeHousekeeping) != 0 {
+		return fmt.Errorf("%d protected Unikraft probes still publishing receipts or cleaning up; retain shim", len(protectedOwners.probeHousekeeping))
+	}
 	return nil
 }
 
@@ -867,10 +1187,13 @@ func (p *protectedPair) close() error {
 	if nativeErr != nil {
 		return fmt.Errorf("protected native cleanup incomplete; retain backing owner and prepared inputs: %w", nativeErr)
 	}
-	// Ownership ends here, not after filesystem/network housekeeping or receipt
-	// publication. closeOnce caches communication failure without replaying controls.
+	// Native ownership ends here. Atomically replace probe ownership with an
+	// orderly shutdown hold; it grants no authority over the released backing.
 	protectedOwners.Lock()
 	delete(protectedOwners.pairs, p)
+	if p.unikraft != nil {
+		protectedOwners.probeHousekeeping[p] = struct{}{}
+	}
 	protectedOwners.Unlock()
 	// Native authority is finished. Release its lock before publication or any
 	// ordinary cleanup can start waiting for guest/process/output borrowers.
@@ -883,6 +1206,11 @@ func (p *protectedPair) close() error {
 	go func() {
 		<-p.startupDone
 		p.cleanup()
+		if p.unikraft != nil {
+			protectedOwners.Lock()
+			delete(protectedOwners.probeHousekeeping, p)
+			protectedOwners.Unlock()
+		}
 	}()
 	if receiptErr != nil {
 		return fmt.Errorf("protected backing released, but cleanup receipt publication failed: %w", receiptErr)
@@ -895,7 +1223,7 @@ func (p *protectedPair) close() error {
 func (p *protectedPair) cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), protectedCleanupBudget)
 	defer cancel()
-	var result error
+	result := p.disableUnikraftEntropy(ctx)
 	// Ordinary attach and time I/O can wait for drainage only after both native
 	// participants and backing are decided, with nativeMu no longer held.
 	if p.pair.interactiveCloser != nil {
@@ -903,6 +1231,9 @@ func (p *protectedPair) cleanup() {
 	}
 	if p.timesync != nil {
 		result = errors.Join(result, p.timesync.join())
+	}
+	if p.pair.unikraftConsole != nil {
+		result = errors.Join(result, p.pair.unikraftConsole.Close())
 	}
 	for _, v := range []*protectedVMAttempt{&p.workload, &p.diode} {
 		if v.vm != nil {
@@ -923,10 +1254,19 @@ func (p *protectedPair) cleanup() {
 		result = errors.Join(result, errors.New("protected uplink ownership is unknown"))
 	}
 	if p.diode.bundleOwned {
-		// Only CreateLCOW's two known boot copies belong to this owner.
-		// An unexpected directory entry is retained, never recursively deleted.
+		if p.applianceRootOwned {
+			if err := os.Remove(filepath.Join(p.diode.options.BundleDirectory, protectedUnikraftRootName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				result = errors.Join(result, err)
+			}
+		}
+		// Appliance Create copies only the VMGS; Linux Create also copies
+		// rootfs.vhd. Other files are retained, never recursively deleted.
 		if p.diode.createAttempt {
-			for _, name := range []string{p.diode.options.GuestStateFilePath, vmutils.DefaultDmVerityRootfsVhd} {
+			bootCopies := []string{p.diode.options.GuestStateFilePath}
+			if p.diode.options.Appliance == nil {
+				bootCopies = append(bootCopies, vmutils.DefaultDmVerityRootfsVhd)
+			}
+			for _, name := range bootCopies {
 				if err := os.Remove(filepath.Join(p.diode.options.BundleDirectory, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 					result = errors.Join(result, err)
 				}
