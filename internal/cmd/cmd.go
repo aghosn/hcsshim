@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,14 +53,36 @@ type Cmd struct {
 	// Context provides a context that terminates the process when it is done.
 	Context context.Context
 
+	// JoinBackgroundOperations opts into complete command-owned stdin and
+	// cancellation drainage before Wait returns or closes Process. Configure
+	// it before Start and do not mutate Cmd while it runs. A nonnil Stdin must
+	// implement io.ReadCloser: native process creation transfers that reader
+	// to Cmd, including on subsequent relay-setup failure. Earlier errors leave
+	// it caller-owned. Close must promptly unblock Read without waiting for
+	// input producers, and permit concurrent use.
+	// Wait closes the reader when Process.Wait returns, including on failure;
+	// callers must separately stop and join any producers of that input.
+	// Native stdin must also be closable so the post-exit timeout can interrupt
+	// a blocked write without closing Process before callbacks drain.
+	//
+	// False preserves detached background operations and caller stdin ownership.
+	// This is not a hard timeout: executing native/GCS calls cannot be abandoned;
+	// retain the host/VM until Wait actually returns, even on cancellation.
+	JoinBackgroundOperations bool
+
 	// CopyAfterExitTimeout is the amount of time after process exit we allow the
 	// stdout, stderr relays to continue before forcibly closing them if not
 	// already completed. This is primarily a safety step against the HCS when
 	// it fails to send a close on the stdout, stderr pipes when the process
-	// exits and blocks the relay wait groups forever.
+	// exits and blocks the relay wait groups forever. In joined mode this
+	// budget stays active through the background join and also interrupts a
+	// blocked native stdin write by closing that stream, rather than closing
+	// Process ahead of callback completion. It cannot interrupt a native call.
 	CopyAfterExitTimeout time.Duration
 
-	// Process is filled out after Start() returns.
+	// Process is usable after successful Start (or Attach). On joined
+	// relay-setup failure the retained value is already closed, not a process
+	// the caller may Wait on or use for further operations.
 	Process cow.Process
 
 	// ExitState is filled out after Wait() (or Run() or Output()) completes.
@@ -68,6 +91,18 @@ type Cmd struct {
 	ioGrp     errgroup.Group
 	stdinErr  atomic.Value
 	allDoneCh chan struct{}
+
+	// Only the opt-in path uses these owners. Relay preflight captures stream
+	// owners before launching; every background Add precedes Start's return,
+	// before the caller may Wait. Wait closes cancelStopCh when Process.Wait
+	// returns and joins background before Process.Close. Callback errors have
+	// one writer each and are read only after the join.
+	background    sync.WaitGroup
+	stdinCloser   io.ReadCloser
+	stdinWriter   io.Closer
+	cancelStopCh  chan struct{}
+	stdinCloseErr error
+	cancelErr     error
 }
 
 // ExitState contains whether a process has exited and with which exit code.
@@ -159,11 +194,21 @@ func Attach(ctx context.Context, p cow.Process, stdin io.Reader, stdout, stderr 
 	return cmd, nil
 }
 
-// Start starts a command. The caller must ensure that if Start succeeds,
-// Wait is eventually called to clean up resources.
+// Start creates a process and starts its command-owned relays/cancellation.
+// The caller must call Wait exactly once after success and retain Host through
+// completion. JoinBackgroundOperations validates transferable stdin before
+// creation; creation failure leaves it caller-owned. A later opt-in relay-setup
+// error closes transferred input, attempts Kill and closes the acquired process
+// synchronously, with no relays launched. Failure does not promise guest exit.
+// Native calls cannot be abandoned on context expiration.
 func (c *Cmd) Start() error {
 	if c.Host == nil {
 		return errors.New("empty ProcessHost")
+	}
+	if c.JoinBackgroundOperations && c.Stdin != nil {
+		if _, ok := c.Stdin.(io.ReadCloser); !ok {
+			return errors.New("joined command stdin must be a transferred io.ReadCloser")
+		}
 	}
 
 	// closed in (*Cmd).Wait; signals command execution is done
@@ -232,19 +277,71 @@ func (c *Cmd) Start() error {
 		c.Log = c.Log.WithField("pid", p.Pid())
 	}
 
-	return c.startRelay()
+	if err := c.startRelay(); err != nil {
+		if c.JoinBackgroundOperations {
+			return c.closeFailedJoinedStart(err)
+		}
+		return err
+	}
+	return nil
 }
 
-// startRelay wires the IO relay goroutines and the context-cancel
-// killer to [Cmd.Process].
+// closeFailedJoinedStart unwinds an acquired process after opt-in relay
+// preflight fails, before any command goroutine exists. It closes transferred
+// stdin, attempts one synchronous Kill with an uncanceled context, then closes
+// Process. All errors are returned; guest exit is not established by this
+// cleanup. Caller retains Host through return and handles any surviving guest.
+func (c *Cmd) closeFailedJoinedStart(setupErr error) error {
+	var inputErr error
+	if c.stdinCloser != nil {
+		inputErr = c.stdinCloser.Close()
+	}
+	ctx := context.Background()
+	if c.Context != nil {
+		ctx = context.WithoutCancel(c.Context)
+	}
+	_, killErr := c.Process.Kill(ctx)
+	return errors.Join(setupErr, inputErr, killErr, c.Process.Close())
+}
+
+// startRelay borrows Process and wires stdout/stderr relays plus stdin and
+// context cancellation. Opt-in setup validates all streams before launching
+// any goroutine, adopts stdin and tracks its final CloseStdin and any Kill.
+// Setup errors leave no callbacks running; Start unwinds acquired ownership.
+// The ordinary path retains its existing detached stdin/cancellation behavior.
 func (c *Cmd) startRelay() error {
 	p := c.Process
 	stdin, stdout, stderr := p.Stdio()
+	if c.JoinBackgroundOperations {
+		if c.Stdin != nil {
+			var ok bool
+			c.stdinCloser, ok = c.Stdin.(io.ReadCloser)
+			if !ok {
+				return errors.New("joined command stdin must be a transferred io.ReadCloser")
+			}
+			c.stdinWriter, ok = stdin.(io.Closer)
+			if !ok {
+				return errors.New("joined command requires closable native stdin")
+			}
+		}
+		if (c.Stdout != nil && stdout == nil) || (c.Stderr != nil && stderr == nil) {
+			return errors.New("joined command missing requested native output stream")
+		}
+		if c.Context != nil {
+			c.cancelStopCh = make(chan struct{})
+		}
+	}
 	if c.Stdin != nil {
-		// Do not make stdin part of the error group because there is no way for
-		// us or the caller to reliably unblock the c.Stdin read when the
-		// process exits.
+		// Ordinary stdin stays detached because its caller-owned reader
+		// cannot reliably be interrupted. Opt-in stdin transfers an
+		// interruptible reader and keeps the final CloseStdin in the join.
+		if c.JoinBackgroundOperations {
+			c.background.Add(1)
+		}
 		go func() {
+			if c.JoinBackgroundOperations {
+				defer c.background.Done()
+			}
 			_, err := relayIO(stdin, c.Stdin, c.Log, "stdin")
 			// Report the stdin copy error. If the process has exited, then the
 			// caller may never see it, but if the error was due to a failure in
@@ -253,7 +350,11 @@ func (c *Cmd) startRelay() error {
 				c.stdinErr.Store(err)
 			}
 			// Notify the process that there is no more input.
-			if err := p.CloseStdin(context.TODO()); err != nil && c.Log != nil {
+			err = p.CloseStdin(context.TODO())
+			if c.JoinBackgroundOperations {
+				c.stdinCloseErr = err
+			}
+			if err != nil && c.Log != nil {
 				c.Log.WithError(err).Warn("failed to close Cmd stdin")
 			}
 		}()
@@ -280,7 +381,17 @@ func (c *Cmd) startRelay() error {
 	}
 
 	if c.Context != nil {
+		stop := c.allDoneCh
+		if c.JoinBackgroundOperations {
+			// Stop future cancellation dispatch after process exit, without
+			// stopping the output timeout needed while stdin drains.
+			stop = c.cancelStopCh
+			c.background.Add(1)
+		}
 		go func() {
+			if c.JoinBackgroundOperations {
+				defer c.background.Done()
+			}
 			select {
 			case <-c.Context.Done():
 				// Process.Kill (via Process.Signal) will not send an RPC if the
@@ -290,17 +401,27 @@ func (c *Cmd) startRelay() error {
 					ctx = context.Background()
 				}
 				kctx := context.WithoutCancel(ctx)
-				_, _ = c.Process.Kill(kctx)
-			case <-c.allDoneCh:
+				_, err := c.Process.Kill(kctx)
+				if c.JoinBackgroundOperations {
+					c.cancelErr = err
+				}
+			case <-stop:
 			}
 		}()
 	}
 	return nil
 }
 
-// Wait waits for a command and its IO to complete and closes the underlying
-// process. It can only be called once. It returns an ExitError if the command
-// runs and returns a non-zero exit code.
+// Wait waits for the process and output relays, then closes Process. Call it
+// exactly once after successful Start. A nonzero exit returns ExitError.
+// With JoinBackgroundOperations, Wait also closes transferred stdin when the
+// process wait returns (including failure), and joins its relay/final CloseStdin
+// and the cancellation goroutine, including any dispatched Kill, before
+// Process.Close or return. CopyAfterExitTimeout
+// closes individual streams in this mode, not Process ahead of that join.
+// Executing native/GCS calls can outlast the timeout; the caller must retain
+// Host until return. Ordinary stdin/cancellation remain detached and stdin
+// stays caller-owned when the option is false.
 func (c *Cmd) Wait() error {
 	waitErr := c.Process.Wait()
 	if waitErr != nil && c.Log != nil {
@@ -312,12 +433,24 @@ func (c *Cmd) Wait() error {
 		state.exited = true
 		state.code = code
 	}
+	var errs []error
+	if c.JoinBackgroundOperations {
+		if c.cancelStopCh != nil {
+			close(c.cancelStopCh)
+		}
+		if c.stdinCloser != nil {
+			// This interrupts source reads but does not wait for an external
+			// producer such as an interactive frame reader. That producer
+			// must be closed/joined separately by the owning session.
+			errs = append(errs, c.stdinCloser.Close())
+		}
+		errs = append(errs, waitErr)
+	}
 
-	// Terminate the IO if the copy does not complete in the requested time.
-	// Closing the process should (eventually) lead to unblocking `ioGrp`, but we still need
-	// `timeoutErrCh` to:
-	// 	1. communitate that the IO copy timed out; and
-	// 	2. prevent a race condition between setting the timeout err in the goroutine and setting it for `ioErr`.
+	// Interrupt streams if copying does not finish in the post-wait budget.
+	// Ordinary mode closes Process; joined mode closes individual streams
+	// while keeping the process owner alive. timeoutErrCh joins this worker's
+	// native operations and error publication before final Process.Close.
 	timeoutErrCh := make(chan error)
 	if c.CopyAfterExitTimeout != 0 {
 		go func() {
@@ -327,9 +460,26 @@ func (c *Cmd) Wait() error {
 			select {
 			case <-c.allDoneCh:
 			case <-t.C:
-				// Close the process to cancel any reads to stdout or stderr.
-				c.Process.Close()
 				err := errIOTimeOut
+				if c.JoinBackgroundOperations {
+					err = errors.New("timed out waiting for joined command streams/background operations")
+					// Interrupt stream operations without retiring Process
+					// while stdin's CloseStdin or cancellation's Kill may
+					// still be in flight. This timeout worker is joined
+					// through timeoutErrCh before the final Process.Close.
+					if c.stdinWriter != nil {
+						err = errors.Join(err, c.stdinWriter.Close())
+					}
+					if c.Stdout != nil {
+						err = errors.Join(err, c.Process.CloseStdout(context.Background()))
+					}
+					if c.Stderr != nil {
+						err = errors.Join(err, c.Process.CloseStderr(context.Background()))
+					}
+				} else {
+					// Preserve ordinary timeout-driven process closure.
+					c.Process.Close()
+				}
 				// log the timeout, since we may not return it to the caller
 				if c.Log != nil {
 					c.Log.WithField("timeout", c.CopyAfterExitTimeout).Warn(err.Error())
@@ -341,8 +491,13 @@ func (c *Cmd) Wait() error {
 		close(timeoutErrCh)
 	}
 
-	var errs []error
 	errs = append(errs, c.ioGrp.Wait())
+	if c.JoinBackgroundOperations {
+		c.background.Wait()
+		// The join makes these final callback errors safe to read, including
+		// failure after copying or after Process.Wait had already returned.
+		errs = append(errs, c.stdinCloseErr, c.cancelErr)
+	}
 	if err, _ := c.stdinErr.Load().(error); err != nil {
 		errs = append(errs, err)
 	}
@@ -351,7 +506,11 @@ func (c *Cmd) Wait() error {
 		errs = append(errs, err)
 	}
 
-	c.Process.Close()
+	if c.JoinBackgroundOperations {
+		errs = append(errs, c.Process.Close())
+	} else {
+		c.Process.Close()
+	}
 	c.ExitState = state
 	if exitErr != nil {
 		errs = append(errs, exitErr)

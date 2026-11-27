@@ -42,6 +42,9 @@ type Devices struct {
 
 	SiblingCommunicationEndpoints []SiblingCommunicationEndpoint `json:"SiblingCommunicationEndpoints,omitempty"`
 
+	// WorkloadVmbusNoRp privately selects inert RP message endpoints on matched hosts.
+	WorkloadVmbusNoRp bool `json:"WorkloadVmbusNoRp,omitempty"`
+
 	// TODO: This is pre-release support in schema 2.3. Need to add build number
 	// docs when a public build with this is out.
 	VirtualPci map[string]VirtualPciDevice `json:",omitempty"`

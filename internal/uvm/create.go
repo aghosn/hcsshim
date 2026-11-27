@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/Microsoft/go-winio/pkg/guid"
 	"github.com/sirupsen/logrus"
@@ -162,10 +163,15 @@ func verifyWCOWBootFiles(bootFiles *WCOWBootFiles) error {
 	return nil
 }
 
-// Verifies that the final UVM options are correct and supported.
+// VerifyOptions checks supported UVM options without allocating native resources.
+// LCOW protected settings require an explicit non-hidden startup role and matching
+// borrowed capabilities. Errors leave ownership with the caller.
 func VerifyOptions(_ context.Context, options interface{}) error {
 	switch opts := options.(type) {
 	case *OptionsLCOW:
+		if err := validateProtectedSharedOptions(opts); err != nil {
+			return err
+		}
 		if opts.Appliance != nil {
 			if opts.Appliance.NativeStorageControl {
 				if _, err := applianceStorageSlots(opts.Appliance); err != nil {
@@ -320,16 +326,29 @@ func (uvm *UtilityVM) OS() string {
 	return uvm.operatingSystem
 }
 
-func (uvm *UtilityVM) create(ctx context.Context, doc interface{}) error {
+// create creates the HCS system and caches its runtime identity on success.
+// Optional resources are borrowed through completion, never serialized or closed
+// here. Failure returns no usable system and attempts bounded private cleanup;
+// it does not authorize releasing originals or infer zero protected progress.
+// The caller exclusively owns this not-yet-published UtilityVM during creation.
+func (uvm *UtilityVM) create(ctx context.Context, doc interface{}, resources ...hcs.OperationResource) (err error) {
 	uvm.exitCh = make(chan struct{})
-	system, err := hcs.CreateComputeSystem(ctx, uvm.id, doc)
+	system, err := hcs.CreateComputeSystemWithResources(ctx, uvm.id, doc, resources)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		if system != nil {
-			_ = system.Terminate(ctx)
-			_ = system.WaitCtx(ctx)
+			if len(resources) == 0 {
+				_ = system.Terminate(ctx)
+				_ = system.WaitCtx(ctx)
+			} else {
+				// Identity-query failure must not abandon native cleanup just
+				// because the create budget expired. Originals remain borrowed.
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				err = errors.Join(err, system.Terminate(cleanupCtx), system.WaitCtx(cleanupCtx), system.CloseCtx(cleanupCtx))
+			}
 		}
 	}()
 
@@ -357,6 +376,24 @@ func (uvm *UtilityVM) Close() error { return uvm.CloseCtx(context.Background()) 
 // The context is used for all operations, including waits, so timeouts/cancellations may prevent
 // proper uVM cleanup.
 func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
+	return uvm.closeCtx(ctx, true)
+}
+
+// CloseAfterNativeExit verifies native exit before releasing VM resources,
+// without joining output forwarding. Callers must first settle Start's ordinary
+// resource publication as well as native Create/Start/control work and release
+// any protected backing. Waiting for publication is a VM-handle lifetime rule,
+// not a protected backing release prerequisite.
+func (uvm *UtilityVM) CloseAfterNativeExit(ctx context.Context) error {
+	if err := uvm.WaitNativeExit(ctx); err != nil {
+		return err
+	}
+	return uvm.closeCtx(ctx, false)
+}
+
+// closeCtx shares resource cleanup; only ordinary CloseCtx joins output.
+// With joinOutput false, CloseAfterNativeExit must already have verified exit.
+func (uvm *UtilityVM) closeCtx(ctx context.Context, joinOutput bool) (err error) {
 	ctx, span := ot.StartSpan(ctx, "uvm::Close")
 	defer span.End()
 	defer func() { ot.SetSpanStatus(span, err) }()
@@ -377,10 +414,9 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 
 	if uvm.hcsSystem != nil {
 		_ = uvm.hcsSystem.Terminate(ctx)
-		// uvm.Wait() waits on <-uvm.outputProcessingDone, which may not be closed until below
-		// (for a Create -> Stop without a Start), or uvm.outputHandler may be blocked on IO and
-		// take a while to close.
-		// In either case, we want to wait on the system closing, not IO completion.
+		// uvm.Wait() also joins started output processing, which may remain
+		// blocked on IO until the listeners/connections are closed below.
+		// Wait on the system closing here, not IO completion.
 		_ = uvm.hcsSystem.WaitCtx(ctx)
 	}
 
@@ -397,7 +433,7 @@ func (uvm *UtilityVM) CloseCtx(ctx context.Context) (err error) {
 		uvm.outputListener = nil
 	}
 
-	if uvm.hcsSystem != nil {
+	if uvm.hcsSystem != nil && joinOutput {
 		// wait for IO to finish
 		// [WaitCtx] calls [uvm.hcsSystem.WaitCtx] again, but since we waited on it above already
 		// it should nop and return without issue.

@@ -67,9 +67,53 @@ func WaitForRoute(ctx context.Context, vm *uvm.UtilityVM, endpoint hcsschema.Sib
 	}
 }
 
+// DiscoveryShell defines mode/owner discovery for generated guest commands.
+// sibling_mode takes 1 to require an explicit mode, or 0 for legacy RP.
+// sibling_owner retains sb_owner/sb_instance; 1 means not ready, 2 means
+// invalid mode or link count. Callers own polling deadlines and identity checks.
+const DiscoveryShell = `
+# Select only the owner permitted by the kernel's measured mode.
+sibling_mode() {
+    sb_mode=N;
+    if [ -e /sys/module/hv_vmbus/parameters/no_rp ] || [ -L /sys/module/hv_vmbus/parameters/no_rp ]; then
+        [ -r /sys/module/hv_vmbus/parameters/no_rp ] &&
+            sb_mode=$(cat /sys/module/hv_vmbus/parameters/no_rp) ||
+            { echo 'sibling_vmbus: unreadable mode' >&2; return 2; };
+        case "$sb_mode" in Y|N) :;; *) echo 'sibling_vmbus: invalid mode' >&2; return 2;; esac;
+    elif [ "$1" = 1 ]; then
+        echo 'sibling_vmbus: explicit mode required' >&2; return 2;
+    fi;
+};
+# Re-expand the RP glob on every poll; identity and stats share this owner.
+sibling_owner() {
+    sb_owner=; sb_instance=;
+    sibling_mode "$1" || return 2;
+    case "$sb_mode" in
+        Y) set -- /sys/devices/sibling_bus_acpi/sibling_instance;;
+        N) set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance;;
+    esac;
+    [ "$#" -eq 1 ] || { echo 'sibling_vmbus: expected one configured link' >&2; return 2; };
+    sb_instance=$1; sb_owner=${sb_instance%/sibling_instance};
+    [ -r "$sb_instance" ] && grep -q 'ready=1' "$sb_instance";
+};
+`
+
+// OwnerReadyCommand polls through its caller, failing closed on mode/count
+// errors rather than retrying a different owner.
+func OwnerReadyCommand(requireMode bool) string {
+	strict := "0"
+	if requireMode {
+		strict = "1"
+	}
+	return `sibling_owner ` + strict + ` || { [ "$?" -ne 2 ] || exit 1; false; }`
+}
+
+// BusLoadCommand preserves ordinary RP loading; no-RP requires a built-in owner.
 func BusLoadCommand(modulePath string) string {
-	return "if [ ! -d /sys/bus/vmbus/drivers/sibling_bus ]; then insmod " +
-		Quote(modulePath) + " || exit 1; fi; "
+	return DiscoveryShell + `sibling_mode 0 || exit 1; if [ "$sb_mode" = Y ]; then ` +
+		`[ -d /sys/devices/sibling_bus_acpi ] || { echo 'sibling_vmbus: built-in ACPI owner missing' >&2; exit 1; }; ` +
+		`elif [ ! -d /sys/bus/vmbus/drivers/sibling_bus ]; then insmod ` +
+		Quote(modulePath) + ` || exit 1; fi; `
 }
 
 func guestInstanceCommand(localCID, peerCID int) string {

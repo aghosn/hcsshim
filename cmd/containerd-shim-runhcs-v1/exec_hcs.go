@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"github.com/Microsoft/hcsshim/internal/ot"
 	"sync"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"github.com/Microsoft/hcsshim/internal/cow"
 	hcs "github.com/Microsoft/hcsshim/internal/hcs/v2"
 	"github.com/Microsoft/hcsshim/internal/log"
+	"github.com/Microsoft/hcsshim/internal/ot"
 	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/Microsoft/hcsshim/internal/signals"
 	"github.com/Microsoft/hcsshim/internal/uvm"

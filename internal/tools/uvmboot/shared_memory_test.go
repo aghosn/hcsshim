@@ -3,12 +3,283 @@
 package main
 
 import (
+	"context"
+	"flag"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	hcsschema "github.com/Microsoft/hcsshim/internal/hcs/schema2"
+	"github.com/Microsoft/hcsshim/internal/sibling"
+	"github.com/Microsoft/hcsshim/internal/vm/vmutils"
+	"github.com/urfave/cli"
 )
+
+// TestProtectedSiblingRejectsUnsupportedUpstreamModes keeps diagnostics and
+// unsupported families out of protected startup before any artifact/native work.
+func TestProtectedSiblingRejectsUnsupportedUpstreamModes(t *testing.T) {
+	previousGCS := useGCS
+	useGCS = true
+	defer func() { useGCS = previousGCS }()
+	for _, test := range []struct{ name, value string }{
+		{baselineVsockArgName, "runtime"},
+		{networkBenchmarkSMTOffPlacementArgName, "true"},
+		{storageBenchmarkIdleArgName, "halt"},
+	} {
+		t.Run(test.name+"="+test.value, func(t *testing.T) {
+			global := flag.NewFlagSet("global", flag.ContinueOnError)
+			global.Int(countArgName, 2, "")
+			global.Int(parallelArgName, 2, "")
+			local := flag.NewFlagSet("lcow", flag.ContinueOnError)
+			for _, option := range lcowCommand.Flags {
+				option.Apply(local)
+			}
+			for name, value := range map[string]string{
+				protectedSharedMemoryArgName: "true",
+				securityHardwareFlag:         "true",
+				siblingInteractiveArgName:    "true",
+				siblingDiodeUplinkArgName:    "true",
+				siblingBusGuestModuleArgName: "missing-fixture-module",
+				rootFSTypeArgName:            "none",
+				test.name:                    test.value,
+			} {
+				if err := local.Set(name, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := cli.NewContext(nil, local, cli.NewContext(nil, global, nil))
+			err := validateProtectedSiblingCLI(c)
+			if err == nil || !strings.Contains(err.Error(), "--"+test.name+" is incompatible") {
+				t.Fatalf("unsupported mode reached artifact/resource preparation: %v", err)
+			}
+		})
+	}
+}
+
+// protectedSiblingTestArgs supplies regular input-shape fixtures for protected
+// preflight, including diode-only AHV tooling. No file is a bootable image and
+// no native controller or VM is created.
+func protectedSiblingTestArgs(t *testing.T, combined bool) []string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{
+		"sibling_bus.ko", siblingNetModuleName(diodeRole), "diode_tcpbulk",
+		"diode_vsock_test", iperfGuestName, "demo.sh", "covert_udp", "diode_tcpdump",
+		"diode_tc", "diode_iptables", "ahv-guest-ctl", pageMetadataCollector,
+		"diode_storvsp.ko", vmutils.DefaultGuestStateFile, siblingStorageRootVMGS,
+		vmutils.DefaultDmVerityRootfsVhd,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("shape fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{
+		"--" + protectedSharedMemoryArgName, "--" + securityHardwareFlag,
+		"--" + siblingInteractiveArgName, "--" + siblingDiodeUplinkArgName,
+		"--" + siblingBusGuestModuleArgName, filepath.Join(dir, "sibling_bus.ko"),
+		"--" + bootFilesPathArgName, dir, "--" + rootFSTypeArgName, "none",
+		"--" + sharedMemorySizeArgName, "2097152",
+	}
+	if combined {
+		lun := uint8(0)
+		plan := &siblingStoragePlan{Version: 1, Disks: []siblingStorageDisk{{
+			ID: "workload-root", Role: "root", HostPath: filepath.Join(dir, vmutils.DefaultDmVerityRootfsVhd),
+			Access: "read-only", ExportLUN: &lun,
+		}}}
+		path := filepath.Join(dir, "backends.json")
+		if err := os.WriteFile(path, []byte(storagePlanJSON(t, plan)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args = append(args, "--"+siblingStorageRootArgName, "--"+siblingGCSRelayArgName,
+			"--"+siblingStorageBackendsArgName, path, "--"+sharedMemorySizeArgName,
+			strconv.FormatUint(protectedCombinedBytes, 10))
+	}
+	return args
+}
+
+// TestProtectedSiblingProfilesPreflight admits both complete profiles without
+// native authority. The combined workload selects relay-root VMGS while the
+// diode/legacy roots remain direct; neither enables ordinary proof mappings.
+func TestProtectedSiblingProfilesPreflight(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, combined := range []bool{false, true} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, combined)...)
+		if !combined {
+			// The legacy route must not gain the combined provider/image
+			// dependencies or a new geometry requirement.
+			for _, name := range []string{"diode_storvsp.ko", siblingStorageRootVMGS} {
+				if err := os.Remove(filepath.Join(c.String(bootFilesPathArgName), name)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.Uint64(sharedMemorySizeArgName) != 2<<20 {
+				t.Fatal("legacy fixture lost its 2-MiB launcher geometry")
+			}
+		}
+		profile, err := preflightProtectedSiblingProfile(c)
+		want := protectedSiblingDirectRoot
+		if combined {
+			want = protectedSiblingMediatedRoot
+		}
+		if err != nil || profile != want || c.Bool(sharedMemoryTwoUVMArgName) {
+			t.Fatalf("combined=%t: profile=%v err=%v (must not enable proof mode)", combined, profile, err)
+		}
+		if err := validateProtectedSiblingCLI(c); err != nil {
+			t.Fatalf("supported profile did not reach protected owner admission: %v", err)
+		}
+		for i, id := range []string{"uvmboot-0", "uvmboot-1"} {
+			options, err := createLCOWOptions(context.Background(), c, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mediated := combined && i == 1
+			image := vmutils.DefaultGuestStateFile
+			if mediated {
+				image = siblingStorageRootVMGS
+			}
+			if options.SiblingRoot != mediated || options.GuestStateFilePath != image ||
+				options.BundleDirectory != "" || !options.DmVerityMode ||
+				len(options.SharedMemoryRegions) != 0 ||
+				strings.Contains(options.KernelBootOptions, "hcs_shmem_diag.role=") {
+				t.Fatalf("combined=%t role=%s: incorrect root image, premature bundle or ordinary proof state", combined, id)
+			}
+		}
+	}
+}
+
+// TestProtectedSiblingProfileSelections checks paired values, legacy geometry
+// and combined-only size/route requirements so explicit false cannot opt in or
+// silently downgrade a partial protected route.
+func TestProtectedSiblingProfileSelections(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, test := range []struct {
+		name     string
+		combined bool
+		args     []string
+		fail     bool
+	}{
+		{"omitted", false, nil, false},
+		{"false-pair", false, []string{"--" + siblingStorageRootArgName + "=false", "--" + siblingGCSRelayArgName + "=false"}, false},
+		{"root-only", false, []string{"--" + siblingStorageRootArgName}, true},
+		{"relay-only", false, []string{"--" + siblingGCSRelayArgName}, true},
+		{"root-false", true, []string{"--" + siblingStorageRootArgName + "=false"}, true},
+		{"relay-false", true, []string{"--" + siblingGCSRelayArgName + "=false"}, true},
+		{"legacy-min", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(sibling.ProtectedBackingMinBytes)}, false},
+		{"legacy-max", false, []string{"--" + sharedMemorySizeArgName, strconv.Itoa(sibling.ProtectedBackingMaxBytes)}, false},
+		{"legacy-unaligned", false, []string{"--" + sharedMemorySizeArgName, "2097153"}, true},
+		{"legacy-small", false, []string{"--" + sharedMemorySizeArgName, "4096"}, true},
+		{"legacy-large", false, []string{"--" + sharedMemorySizeArgName, "33558528"}, true},
+		{"legacy-exports", false, []string{"--" + siblingStorageBackendsArgName, "backends.json"}, true},
+		{"combined-small", true, []string{"--" + sharedMemorySizeArgName, "2097152"}, true},
+		{"combined-large", true, []string{"--" + sharedMemorySizeArgName, "33558528"}, true},
+		{"missing-plan", true, []string{"--" + siblingStorageBackendsArgName, ""}, true},
+		{"proof", true, []string{"--" + sharedMemoryTwoUVMArgName}, true},
+		{"proof-false", true, []string{"--" + sharedMemoryTwoUVMArgName + "=false"}, true},
+		{"mapping", true, []string{"--" + sharedMemoryMappingOnlyArgName}, true},
+		{"inventory", true, []string{"--" + sharedMemoryGuestInventoryArgName}, true},
+		{"unikraft", true, []string{"--" + unikraftPackageArgName, "package"}, true},
+		{"openshell", true, []string{"--" + siblingOpenShellBundleArgName, "bundle"}, true},
+		{"benchmark", true, []string{"--" + networkBenchmarkScriptArgName, "benchmark"}, true},
+		{"no-snp", true, []string{"--" + securityHardwareFlag + "=false"}, true},
+		{"no-protected", true, []string{"--" + protectedSharedMemoryArgName + "=false"}, true},
+		{"wrong-root-fs", true, []string{"--" + rootFSTypeArgName, "vhd"}, true},
+		{"no-interactive", true, []string{"--" + siblingInteractiveArgName + "=false"}, true},
+		{"no-uplink", true, []string{"--" + siblingDiodeUplinkArgName + "=false"}, true},
+		{"no-verity", true, []string{"--" + noVerityBoot}, true},
+	} {
+		c := storageTestContext(t, append(protectedSiblingTestArgs(t, test.combined), test.args...)...)
+		_, err := classifyProtectedSiblingProfile(c)
+		if (err != nil) != test.fail {
+			t.Fatalf("%s: error=%v, want failure=%t", test.name, err, test.fail)
+		}
+	}
+}
+
+// TestProtectedSiblingProfileWorkerConstraints rejects missing GCS and incorrect
+// worker counts before any native work; both peers are required for root/relay.
+func TestProtectedSiblingProfileWorkerConstraints(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, name := range []string{countArgName, parallelArgName} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, true)...)
+		if err := c.GlobalSet(name, "1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := classifyProtectedSiblingProfile(c); err == nil {
+			t.Fatalf("accepted one-worker %s", name)
+		}
+	}
+	useGCS = false
+	if _, err := classifyProtectedSiblingProfile(storageTestContext(t, protectedSiblingTestArgs(t, true)...)); err == nil {
+		t.Fatal("accepted protected root/relay without GCS")
+	}
+}
+
+// TestProtectedSiblingProfileArtifacts keeps relay-root/provider and AHV inputs
+// mandatory while treating files only as shape fixtures, not native evidence.
+func TestProtectedSiblingProfileArtifacts(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, name := range []string{"diode_storvsp.ko", siblingStorageRootVMGS, vmutils.DefaultGuestStateFile,
+		vmutils.DefaultDmVerityRootfsVhd, "ahv-guest-ctl"} {
+		c := storageTestContext(t, protectedSiblingTestArgs(t, true)...)
+		if err := os.Remove(filepath.Join(c.String(bootFilesPathArgName), name)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := preflightProtectedSiblingProfile(c); err == nil {
+			t.Fatalf("accepted missing required artifact %s", name)
+		}
+	}
+}
+
+// TestProtectedSiblingProfilePreservesPartitionMasks proves profile selection
+// leaves omission, explicit zero and all uint64 bits untouched for later native
+// experiments, rather than interpreting optional mask semantics.
+func TestProtectedSiblingProfilePreservesPartitionMasks(t *testing.T) {
+	oldGCS := useGCS
+	// Restore the process-wide CLI fixture setting after this serial test.
+	t.Cleanup(func() { useGCS = oldGCS })
+	useGCS = true
+	for _, combined := range []bool{false, true} {
+		for _, value := range []string{"", "0", "18446744073709551615"} {
+			args := protectedSiblingTestArgs(t, combined)
+			if value != "" {
+				args = append(args, "--"+diodePartitionSealMaskArgName, value,
+					"--"+workloadPartitionSealMaskArgName, value)
+			}
+			c := storageTestContext(t, args...)
+			if _, err := classifyProtectedSiblingProfile(c); err != nil {
+				t.Fatal(err)
+			}
+			var want uint64
+			if value != "" {
+				var err error
+				want, err = strconv.ParseUint(value, 10, 64)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range []string{diodePartitionSealMaskArgName, workloadPartitionSealMaskArgName} {
+				if c.IsSet(name) != (value != "") || c.Uint64(name) != want {
+					t.Fatalf("profile changed optional %s=%q", name, value)
+				}
+			}
+		}
+	}
+}
 
 func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 	shell, err := exec.LookPath("wsl.exe")
@@ -25,10 +296,12 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 		{"stale-v3", "bus_id=1 local_cid=3 peer_cid=4 version=3 ready=1", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			command := strings.Replace(siblingInstanceDiscoveryCommand(),
-				"set -- /sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance;",
-				`fixture=$(mktemp); trap 'rm -f "$fixture"' EXIT; printf '%s\n' `+
-					shellSingleQuote(test.instance)+` >"$fixture"; set -- "$fixture";`, 1)
+			setup := `fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; printf '%s\n' ` +
+				shellSingleQuote(test.instance) + ` >"$fixture/sibling_instance"; `
+			command := strings.ReplaceAll(siblingInstanceDiscoveryCommand(),
+				"/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance", `"$fixture/sibling_instance"`)
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/missing-mode"`)
+			command = setup + command
 			command += `echo "INSTANCE_ACCEPTED bus=$sb_bus local=$sb_local peer=$sb_peer"`
 			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
 			if (err != nil) != test.wantFail {
@@ -41,6 +314,78 @@ func TestSiblingInstanceCommandChecksActualTransportVersion(t *testing.T) {
 			if test.wantFail && (!strings.Contains(string(output), "protocol version mismatch expected=4") ||
 				strings.Contains(string(output), "INSTANCE_ACCEPTED")) {
 				t.Fatalf("incompatible transport was not explicitly rejected:\n%s", output)
+			}
+		})
+	}
+}
+
+// TestProtectedSiblingDelayedInstanceDiscovery exercises the production shell
+// guard when the native peer link appears only after its first failed poll.
+// Re-expansion must admit one ready current link while preserving rejection of
+// multiple links, unready instances, protocol mismatch and wrong local CID.
+func TestProtectedSiblingDelayedInstanceDiscovery(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Skip("WSL shell is required to exercise the generated Linux startup command")
+	}
+	for _, test := range []struct {
+		name, instance, failure string
+		multiple                bool
+		acpi                    bool
+	}{
+		{name: "delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1"},
+		{name: "delayed-multiple", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1",
+			failure: "expected one configured link", multiple: true},
+		{name: "delayed-unready", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=0",
+			failure: "common peer instance timed out"},
+		{name: "delayed-old-version", instance: "bus_id=1 local_cid=4 peer_cid=3 version=3 ready=1",
+			failure: "protocol version mismatch expected=4"},
+		{name: "delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
+			failure: "local CID mismatch"},
+		{name: "ACPI-delayed-current", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=1", acpi: true},
+		{name: "ACPI-delayed-unready", instance: "bus_id=1 local_cid=4 peer_cid=3 version=4 ready=0",
+			failure: "common peer instance timed out", acpi: true},
+		{name: "ACPI-delayed-old-version", instance: "bus_id=1 local_cid=4 peer_cid=3 version=3 ready=1",
+			failure: "protocol version mismatch expected=4", acpi: true},
+		{name: "ACPI-delayed-wrong-cid", instance: "bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1",
+			failure: "local CID mismatch", acpi: true},
+	} {
+		// Each fixture publishes sysfs-shaped files only from the polling
+		// sleep callback; no VM, transport or native receipt is simulated.
+		t.Run(test.name, func(t *testing.T) {
+			publish := `mkdir -p "$fixture/link-1"; printf '%s\n' ` +
+				shellSingleQuote(test.instance) + ` >"$fixture/link-1/sibling_instance"; `
+			if test.multiple {
+				publish += `mkdir -p "$fixture/link-2"; cp "$fixture/link-1/sibling_instance" "$fixture/link-2/sibling_instance"; `
+			}
+			if test.acpi {
+				publish = strings.ReplaceAll(publish, "/link-1", "/acpi")
+			}
+			// The fixture sleep publishes once, after discovery has already
+			// seen an unmatched glob, and makes timeout cases deterministic.
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; polls=0; ` +
+				`sleep() { polls=$((polls+1)); if [ "$polls" -eq 1 ]; then ` + publish + `fi; }; `
+			mode := "N"
+			if test.acpi {
+				mode = "Y"
+			}
+			setup += `echo ` + mode + ` >"$fixture/mode"; `
+			command := siblingInstanceDiscoveryCommand() + siblingVsockReadyCommand(diodeRole)
+			command = strings.ReplaceAll(command, siblingFailureDiagnosticsCommand(), `echo fixture-diagnostics >&2; `)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus/*-*/sibling_instance",
+				`"$fixture"/*-*/sibling_instance`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/hv_sock", `"$fixture"`)
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+			command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi/sibling_instance", `"$fixture/acpi/sibling_instance"`)
+			command = setup + command + `echo "INSTANCE_ACCEPTED polls=$polls bus=$sb_bus local=$sb_local peer=$sb_peer"`
+			output, err := exec.Command(shell, "--exec", "sh", "-c", command).CombinedOutput()
+			if test.failure == "" {
+				if err != nil || !strings.Contains(string(output), "INSTANCE_ACCEPTED polls=1 bus=1 local=4 peer=3") {
+					t.Fatalf("delayed link was not re-discovered: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), test.failure) ||
+				strings.Contains(string(output), "INSTANCE_ACCEPTED") {
+				t.Fatalf("delayed invalid link was not rejected with %q: %v\n%s", test.failure, err, output)
 			}
 		})
 	}
@@ -149,8 +494,8 @@ func TestSiblingGuestDiscoversInstanceOnce(t *testing.T) {
 	for _, role := range []string{diodeRole, workloadRole} {
 		command := siblingBusGuestModuleCommand("/run/sibling_bus.ko",
 			"", role, siblingNetConfig{ifName: "dvsc0"}, nil)
-		if strings.Count(command, "sb_instance=$1;") != 1 {
-			t.Fatal("guest setup must discover its bus exactly once")
+		if strings.Count(command, sibling.OwnerReadyCommand(false)) != 1 {
+			t.Fatal("guest setup must use shared owner discovery exactly once")
 		}
 		for _, expected := range []string{"/sibling_instance", `grep -q 'ready=1'`,
 			"sibling_vmbus: protocol version mismatch"} {
@@ -161,6 +506,118 @@ func TestSiblingGuestDiscoversInstanceOnce(t *testing.T) {
 		if role == workloadRole && strings.Index(command, "sb_bus=${1#*=}") >
 			strings.Index(command, "bus${sb_bus}-relid*") {
 			t.Fatal("bus discovery must precede NIC selection")
+		}
+	}
+}
+
+// TestSiblingStatisticsOwnerIsolation executes the production benchmark helper
+// with both owners present. Statistics must match mode and must not overwrite
+// the caller's discovered bus/owner while nested benchmark functions run.
+// Ordinary non-sibling guests retain empty, successful statistics; unready
+// owners remain diagnosable, while malformed mode is a hard failure.
+func TestSiblingStatisticsOwnerIsolation(t *testing.T) {
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for sibling statistics fixtures")
+	}
+	for _, mode := range []string{"Y", "N", "missing", "invalid", "unreadable", "unready"} {
+		t.Run(mode, func(t *testing.T) {
+			setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+				`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
+				`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/rp/link-1/sibling_instance"; ` +
+				`echo 'bus_id=2 local_cid=3 peer_cid=4 version=4 ready=1' >"$fixture/acpi/sibling_instance"; ` +
+				`echo RP_STATS >"$fixture/rp/link-1/sibling_stats"; echo ACPI_STATS >"$fixture/acpi/sibling_stats"; `
+			if mode == "missing" {
+				setup += `rm "$fixture/mode"; rm -rf "$fixture/rp" "$fixture/acpi"; `
+			} else if mode == "unready" {
+				setup += `echo Y >"$fixture/mode"; sed -i 's/ready=1/ready=0/' "$fixture/acpi/sibling_instance"; `
+			} else if mode == "unreadable" {
+				setup += `rm "$fixture/mode"; mkdir "$fixture/mode"; `
+			}
+			start := strings.Index(iperfStage, sibling.DiscoveryShell)
+			end := strings.Index(iperfStage, "bdelta()")
+			command := iperfStage[start:end] + `sb_bus=caller_bus; sb_owner=caller_owner; ` +
+				`stats=$(bstat); printf '%s bus=%s owner=%s\n' "$stats" "$sb_bus" "$sb_owner"`
+			command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+			command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+			command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+			output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c", setup+command).CombinedOutput()
+			want := "RP_STATS"
+			if mode == "Y" || mode == "unready" {
+				want = "ACPI_STATS"
+			} else if mode == "missing" {
+				want = ""
+			} else if mode == "invalid" || mode == "unreadable" {
+				if err == nil || !strings.Contains(string(output), mode+" mode") {
+					t.Fatalf("statistics accepted an explicitly invalid mode: %v\n%s", err, output)
+				}
+				return
+			}
+			if err != nil || !strings.Contains(string(output), want+" bus=caller_bus owner=caller_owner") {
+				t.Fatalf("statistics corrupted caller identity or read wrong owner: %v\n%s", err, output)
+			}
+		})
+	}
+	// Execute each production consumer under its real set +eu policy. The
+	// shell iperf interception changes mode after each completed traffic phase
+	// so all three ipbench assignments must independently propagate failure.
+	diode := siblingBusGuestModuleCommand("/bus.ko", "/net.ko", diodeRole,
+		siblingNetConfig{ifName: "dvsp0"}, &diodeUplink{address: "172.31.250.2/24", gateway: diodeUplinkGateway})
+	for _, consumer := range []string{"ipbench-before", "ipbench-bulk", "ipbench-rr", "snap", "diode-s1", "diode-s2"} {
+		for _, mode := range []string{"missing", "unready", "invalid", "unreadable"} {
+			t.Run(consumer+"/"+mode, func(t *testing.T) {
+				setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+					`mkdir -p "$fixture/acpi"; echo Y >"$fixture/mode"; ` +
+					`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=0' >"$fixture/acpi/sibling_instance"; ` +
+					`echo 'doorbells=1 guest=2 messages=3' >"$fixture/acpi/sibling_stats"; `
+				mutate := `echo invalid >"$fixture/mode"; `
+				if mode == "unreadable" {
+					mutate = `rm -f "$fixture/mode"; mkdir "$fixture/mode"; `
+				} else if mode == "missing" {
+					mutate = `rm -f "$fixture/mode"; rm -rf "$fixture/acpi"; `
+				} else if mode == "unready" {
+					mutate = ":; "
+				}
+				start := strings.Index(iperfStage, sibling.DiscoveryShell)
+				command := iperfStage[start:]
+				setup += `traffic=0; ipf=fixture_iperf; ` +
+					`fixture_iperf() { traffic=$((traffic+1)); `
+				if consumer == "ipbench-bulk" {
+					setup += mutate
+				} else if consumer == "ipbench-rr" {
+					setup += `if [ "$traffic" -eq 2 ]; then ` + mutate + `fi; `
+				}
+				setup += `echo '1 Mbits/sec'; }; `
+				if consumer != "ipbench-bulk" && consumer != "ipbench-rr" {
+					setup += mutate
+				}
+				switch consumer {
+				case "snap":
+					i := strings.Index(siblingWorkloadStage, "snap()")
+					command += siblingWorkloadStage[i:] + `snap; `
+				case "diode-s1", "diode-s2":
+					name := strings.TrimPrefix(consumer, "diode-")
+					i := strings.Index(diode, name+"=$(bstat)")
+					if i < 0 {
+						t.Fatalf("production diode consumer %s missing", name)
+					}
+					// Include its actual explicit propagation, not a fixture guard.
+					j := strings.Index(diode[i:], ";")
+					command += diode[i : i+j+1]
+				default:
+					command += `ipbench fixture 192.0.2.1 5201 1; `
+				}
+				command = strings.ReplaceAll(command, "/tmp/ipf-$1", `"$fixture/ipf-$1"`)
+				command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+				command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+				command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+				output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+					setup+`set +eu; `+command+`echo CONSUMER_FINISHED`).CombinedOutput()
+				fail := mode == "invalid" || mode == "unreadable"
+				if (err != nil) != fail || strings.Contains(string(output), "CONSUMER_FINISHED") == fail {
+					t.Fatalf("consumer masked failure or rejected legacy success: %v\n%s", err, output)
+				}
+			})
 		}
 	}
 }
@@ -228,6 +685,38 @@ func TestSiblingFailuresIncludeDeviceStateAndUnfilteredKernelLog(t *testing.T) {
 		}
 		if strings.Contains(command, "dmesg | grep") {
 			t.Fatal("failure diagnostics must not hide stock-driver probe errors")
+		}
+	}
+	// An unready owner still has useful identity/counters. Invalid mode must
+	// not read either owner or prevent the remaining kernel diagnostics.
+	shell, err := exec.LookPath("wsl.exe")
+	if err != nil {
+		t.Fatal("WSL is required for selected-owner failure diagnostics")
+	}
+	for _, mode := range []string{"Y", "N", "invalid"} {
+		setup := `set -eu; fixture=$(mktemp -d); trap 'rm -rf "$fixture"' EXIT; ` +
+			`mkdir -p "$fixture/acpi" "$fixture/rp/link-1"; echo ` + mode + ` >"$fixture/mode"; ` +
+			`echo 'bus_id=1 local_cid=3 peer_cid=4 version=4 ready=0' >"$fixture/acpi/sibling_instance"; ` +
+			`cp "$fixture/acpi/sibling_instance" "$fixture/rp/link-1/sibling_instance"; ` +
+			`echo ACPI_STATS >"$fixture/acpi/sibling_stats"; echo RP_STATS >"$fixture/rp/link-1/sibling_stats"; `
+		command := siblingFailureDiagnosticsCommand()
+		command = strings.ReplaceAll(command, "/sys/module/hv_vmbus/parameters/no_rp", `"$fixture/mode"`)
+		command = strings.ReplaceAll(command, "/sys/devices/sibling_bus_acpi", `"$fixture/acpi"`)
+		command = strings.ReplaceAll(command, "/sys/bus/vmbus/drivers/sibling_bus", `"$fixture/rp"`)
+		command = strings.ReplaceAll(command, "/sys/class/net/*", `"$fixture/no-net"/*`)
+		command = strings.ReplaceAll(command, "/sys/bus/vmbus/devices/bus*-relid*", `"$fixture/no-devices"/*`)
+		output, err := exec.Command(shell, "--distribution", "Ubuntu", "--exec", "sh", "-c",
+			setup+command+`echo DIAGNOSTICS_FINISHED`).CombinedOutput()
+		want, forbidden := "RP_STATS", "ACPI_STATS"
+		if mode == "Y" {
+			want, forbidden = forbidden, want
+		} else if mode == "invalid" {
+			want = "invalid mode"
+		}
+		if err != nil || !strings.Contains(string(output), want) ||
+			strings.Contains(string(output), forbidden) || !strings.Contains(string(output), "DIAGNOSTICS_FINISHED") ||
+			(mode == "invalid" && strings.Contains(string(output), "RP_STATS")) {
+			t.Fatalf("failure diagnostics lost or mixed selected owner %s: %v\n%s", mode, err, output)
 		}
 	}
 }

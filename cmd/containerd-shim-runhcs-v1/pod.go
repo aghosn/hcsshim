@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,12 +31,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// siblingStartupError preserves the gRPC code and diagnostic message without
+// Any details that legacy containerd cannot decode on sibling startup failure.
 func siblingStartupError(err error) error {
 	if err == nil {
 		return nil
 	}
 	st := status.Convert(errgrpc.ToGRPC(err))
-	// Legacy containerd panics decoding Any details from joined startup errors.
 	return status.Error(st.Code(), st.Message())
 }
 
@@ -264,7 +266,10 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 		// clean up the uvm if we fail any further operations
 		if err != nil {
 			if pair != nil {
-				pair.Close()
+				cleanupErr := pair.Close()
+				if pair.IsProtected() {
+					err = stderrors.Join(err, cleanupErr)
+				}
 			} else if parent != nil {
 				parent.Close()
 			}
@@ -272,6 +277,7 @@ func createPod(ctx context.Context, events publisher, req *task.CreateTaskReques
 	}()
 
 	p.host = parent
+	p.pair = pair
 	if parent != nil && (pair == nil || pair.Diode == nil) {
 		cid := req.ID
 		if id, ok := s.Annotations[annotations.NcproxyContainerID]; ok {
@@ -382,6 +388,7 @@ type pod struct {
 	spec *specs.Spec
 
 	workloadTasks sync.Map
+	pair          *sibling.Pair
 }
 
 func (p *pod) ID() string {
@@ -389,6 +396,13 @@ func (p *pod) ID() string {
 }
 
 func (p *pod) CreateTask(ctx context.Context, req *task.CreateTaskRequest, s *specs.Spec) (_ shimTask, err error) {
+	if p.pair != nil && p.pair.IsProtected() {
+		select {
+		case <-p.pair.Done():
+			return nil, errors.New("protected pod creation admission is closed")
+		default:
+		}
+	}
 	if config := s.Annotations[annotations.LCOWSiblingPair]; config != "" &&
 		config != p.spec.Annotations[annotations.LCOWSiblingPair] {
 		return nil, errors.New("a workload cannot create or change its sandbox's sibling pair ownership")
@@ -481,6 +495,11 @@ func (p *pod) KillTask(ctx context.Context, tid, eid string, signal uint32, all 
 	}
 	if all && eid != "" {
 		return errors.Wrapf(errdefs.ErrFailedPrecondition, "cannot signal all with non empty ExecID: '%s'", eid)
+	}
+	if all && tid == p.id && p.pair != nil && p.pair.IsProtected() && (signal == 9 || signal == 15) {
+		// Native pair shutdown stops every guest process; competing GCS kills
+		// can only race the bridge closure and falsely fail sandbox stop.
+		return t.KillExec(ctx, eid, signal, all)
 	}
 	eg := errgroup.Group{}
 	if all && tid == p.id {

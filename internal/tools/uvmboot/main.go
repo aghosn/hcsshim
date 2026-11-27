@@ -106,6 +106,7 @@ func main() {
 		wcowCommand,
 		cwcowCommand,
 		siblingAttachCommand,
+		siblingSealCommand,
 		siblingStopCommand,
 		siblingContainerCommand,
 		siblingRuntimeConfigCommand,

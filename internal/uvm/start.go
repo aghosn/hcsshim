@@ -5,10 +5,12 @@ package uvm
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/Microsoft/hcsshim/internal/gcs"
 	"github.com/Microsoft/hcsshim/internal/gcs/prot"
@@ -60,11 +62,81 @@ func (uvm *UtilityVM) configureHvSocketForGCS(ctx context.Context) (err error) {
 
 // Start synchronously starts the utility VM.
 func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
+	return uvm.start(ctx, timeout.GCSConnectionTimeout)
+}
+
+// DisableBootEntropy closes the selected protected workload's boot entropy
+// listener before Start. The caller must serialize access to the unstarted VM.
+func (uvm *UtilityVM) DisableBootEntropy(ctx context.Context) error {
+	if uvm == nil {
+		return errors.New("utility VM is required")
+	}
+	if uvm.startInvoked.Load() {
+		return errors.New("boot entropy cannot be disabled after Start")
+	}
+	opts, ok := uvm.createOpts.(*OptionsLCOW)
+	if !ok || uvm.operatingSystem != "linux" || opts.ConfidentialLCOWOptions == nil || !opts.SiblingRoot ||
+		len(opts.SharedMemoryRegions) != 1 ||
+		ValidateProtectedSharedRegion(opts.SharedMemoryRegions[0]) != nil ||
+		opts.SharedMemoryRegions[0].ProtectedSharedBackingMode != hcsschema.ProtectedSharedBackingImport ||
+		len(opts.SiblingCommunicationEndpoints) != 1 ||
+		opts.SiblingCommunicationEndpoints[0].Role != hcsschema.SiblingCommunicationEndpointRoleWorkload {
+		return errors.New("boot entropy disablement requires a protected sibling-root workload")
+	}
+	if uvm.entropyListener == nil {
+		return errors.New("boot entropy listener is missing or already disabled")
+	}
+	if err := uvm.entropyListener.Close(); err != nil {
+		return fmt.Errorf("close boot entropy listener: %w", err)
+	}
+	uvm.entropyListener = nil
+	log.G(ctx).WithField(logfields.UVMID, uvm.id).Info("intentionally disabled protected workload boot entropy")
+	return nil
+}
+
+// StartWithGCSConnectionTimeout starts through the same core as Start with a
+// positive per-call connection budget. It never changes the process default;
+// an earlier parent deadline or cancellation still wins.
+func (uvm *UtilityVM) StartWithGCSConnectionTimeout(ctx context.Context, connectionTimeout time.Duration) error {
+	if connectionTimeout <= 0 {
+		return fmt.Errorf("GCS connection timeout must be positive: %s", connectionTimeout)
+	}
+	return uvm.start(ctx, connectionTimeout)
+}
+
+// StartWithNativeStartCompletion invokes nativeComplete synchronously after HCS
+// Start returns, before waiting for entropy/output connections or GCS bootstrap.
+// The callback may observe native receipts and return an error to abort bootstrap;
+// it cannot mask a native Start error. VM resources must remain open until this
+// method returns, even if protected backing is released after the callback.
+func (uvm *UtilityVM) StartWithNativeStartCompletion(ctx context.Context, connectionTimeout time.Duration, nativeComplete func(context.Context, error) error) error {
+	if connectionTimeout <= 0 {
+		return fmt.Errorf("GCS connection timeout must be positive: %s", connectionTimeout)
+	}
+	if nativeComplete == nil {
+		return fmt.Errorf("native Start completion callback is required")
+	}
+	return uvm.startWithNativeStartCompletion(ctx, connectionTimeout, nativeComplete)
+}
+
+// gcsBootstrapContext bounds Start's native/GCS bootstrap without detaching it
+// from its parent. Termination continues to use the original parent context.
+func gcsBootstrapContext(parent context.Context, connectionTimeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, connectionTimeout)
+}
+
+// start is the shared production core for Start and its per-call timeout entry.
+// Both paths retain identical entropy, output, termination and borrower joins.
+func (uvm *UtilityVM) start(ctx context.Context, connectionTimeout time.Duration) (err error) {
+	return uvm.startWithNativeStartCompletion(ctx, connectionTimeout, nil)
+}
+
+func (uvm *UtilityVM) startWithNativeStartCompletion(ctx context.Context, connectionTimeout time.Duration, nativeComplete func(context.Context, error) error) (err error) {
 	uvm.startInvoked.Store(true)
 	// save parent context, without timeout to use in terminate
 	pCtx := ctx
-	ctx, cancel := context.WithTimeout(pCtx, timeout.GCSConnectionTimeout)
-	log.G(ctx).Debugf("using gcs connection timeout: %s\n", timeout.GCSConnectionTimeout)
+	ctx, cancel := gcsBootstrapContext(pCtx, connectionTimeout)
+	log.G(ctx).Debugf("using gcs connection timeout: %s\n", connectionTimeout)
 
 	g, gctx := errgroup.WithContext(ctx)
 	defer func() {
@@ -157,17 +229,22 @@ func (uvm *UtilityVM) Start(ctx context.Context) (err error) {
 	}
 
 	err = uvm.hcsSystem.Start(ctx)
+	if err == nil {
+		defer func() {
+			if err != nil {
+				// Use the parent so the connection budget cannot shorten the
+				// termination operation's own timeout.
+				_ = uvm.hcsSystem.Terminate(pCtx)
+				_ = uvm.hcsSystem.WaitCtx(pCtx)
+			}
+		}()
+	}
+	if nativeComplete != nil {
+		err = errors.Join(err, nativeComplete(ctx, err))
+	}
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			// use parent context, to prevent 2 minute timout (set above) from overridding terminate operation's
-			// timeout and erroring out prematurely
-			_ = uvm.hcsSystem.Terminate(pCtx)
-			_ = uvm.hcsSystem.WaitCtx(pCtx)
-		}
-	}()
 
 	// Start waiting on the utility VM.
 	go func() {

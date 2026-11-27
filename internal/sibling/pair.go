@@ -3,6 +3,7 @@
 package sibling
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,21 +29,35 @@ import (
 
 // Config is an explicit host-side opt-in; it never names existing HCS systems.
 // The workload inherits the sandbox's security/integrity options without alteration.
+// Protected masks are optional decimal strings: nil is omitted, not selected zero.
+// RunID and CleanupReceiptPath identify the one final S3 cleanup result; early/late
+// AHV selection is already encoded in prepared boot inputs, not another shim flag.
+// The protected profile requires interactive endpoint acquisition before sealing.
+// PageMetadataOutputPath optionally exports an existing local directory writable
+// only to the protected diode; preflight validates the filesystem destination.
+// WorkloadVmbusNoRp is an optional, default-off native workload-only request.
 // VMResources optionally replaces CPU/memory in [diode, workload] order (or
 // [workload] in standalone mode); memory is the HCS allocation in MiB.
 type Config struct {
-	Version                int           `json:"version"`
-	Standalone             bool          `json:"standalone,omitempty"`
-	ModuleDirectory        string        `json:"module_directory,omitempty"`
-	SharedMemoryBytes      uint64        `json:"shared_memory_bytes,omitempty"`
-	WorkloadGuestStateFile string        `json:"workload_guest_state_file,omitempty"`
-	Interactive            bool          `json:"interactive,omitempty"`
-	MediateGCS             bool          `json:"mediate_gcs,omitempty"`
-	StorageDirectIO        bool          `json:"storage_direct_io,omitempty"`
-	UnikraftPackage        string        `json:"unikraft_package,omitempty"`
-	VMResources            []VMResources `json:"vm_resources,omitempty"`
-	PublishedTCPPorts      []uint16      `json:"published_tcp_ports,omitempty"`
-	directory              string
+	Version                   int           `json:"version"`
+	Standalone                bool          `json:"standalone,omitempty"`
+	ModuleDirectory           string        `json:"module_directory,omitempty"`
+	SharedMemoryBytes         uint64        `json:"shared_memory_bytes,omitempty"`
+	WorkloadGuestStateFile    string        `json:"workload_guest_state_file,omitempty"`
+	Interactive               bool          `json:"interactive,omitempty"`
+	MediateGCS                bool          `json:"mediate_gcs,omitempty"`
+	StorageDirectIO           bool          `json:"storage_direct_io,omitempty"`
+	WorkloadVmbusNoRp         bool          `json:"workload_vmbus_no_rp,omitempty"`
+	UnikraftPackage           string        `json:"unikraft_package,omitempty"`
+	ProtectedShared           bool          `json:"protected_shared,omitempty"`
+	DiodePartitionSealMask    *uint64       `json:"diode_partition_seal_mask,omitempty,string"`
+	WorkloadPartitionSealMask *uint64       `json:"workload_partition_seal_mask,omitempty,string"`
+	RunID                     string        `json:"run_id,omitempty"`
+	CleanupReceiptPath        string        `json:"cleanup_receipt_path,omitempty"`
+	PageMetadataOutputPath    string        `json:"page_metadata_output_path,omitempty"`
+	VMResources               []VMResources `json:"vm_resources,omitempty"`
+	PublishedTCPPorts         []uint16      `json:"published_tcp_ports,omitempty"`
+	directory                 string
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -61,12 +77,29 @@ func LoadConfig(path string) (*Config, error) {
 	return config, nil
 }
 
+// validatedCopy checks programmatic configs like file inputs, retaining the
+// loader-owned directory used to publish per-pair files outside the JSON schema.
+func (c *Config) validatedCopy() (*Config, error) {
+	if err := c.validateResources(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	config, err := decodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	config.directory = c.directory
+	return config, nil
+}
+
 func decodeConfig(reader io.Reader) (*Config, error) {
 	limited := &io.LimitedReader{R: reader, N: (64 << 10) + 1}
 	decoder := json.NewDecoder(limited)
-	decoder.DisallowUnknownFields()
-	var config Config
-	if err := decoder.Decode(&config); err != nil {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
 		return nil, err
 	}
 	var extra interface{}
@@ -76,6 +109,15 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	if limited.N == 0 {
 		return nil, errors.New("sibling pair config exceeds 64 KiB")
 	}
+	if err := validateConfigMasks(raw); err != nil {
+		return nil, err
+	}
+	decoder = json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var config Config
+	if err := decoder.Decode(&config); err != nil {
+		return nil, err
+	}
 	if config.Version != 1 {
 		return nil, errors.New("sibling config requires version 1")
 	}
@@ -84,8 +126,9 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	}
 	if config.Standalone {
 		if config.ModuleDirectory != "" || config.SharedMemoryBytes != 0 ||
-			config.MediateGCS || config.StorageDirectIO || config.UnikraftPackage != "" || len(config.PublishedTCPPorts) != 0 {
-			return nil, errors.New("standalone cannot configure a diode, shared memory, modules or GCS mediation")
+			config.MediateGCS || config.StorageDirectIO || config.UnikraftPackage != "" ||
+			config.ProtectedShared || len(config.PublishedTCPPorts) != 0 {
+			return nil, errors.New("standalone cannot configure a diode, shared memory, modules, protected_shared or GCS mediation")
 		}
 	} else if !filepath.IsAbs(config.ModuleDirectory) ||
 		config.SharedMemoryBytes < 1<<20 || config.SharedMemoryBytes > 0x7ffff000 ||
@@ -101,8 +144,31 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 		config.SharedMemoryBytes != 32<<20) {
 		return nil, errors.New("owned Unikraft requires an absolute package path and a 32 MiB section")
 	}
+	if config.ProtectedShared {
+		if config.Standalone || !config.MediateGCS || !config.Interactive || config.SharedMemoryBytes != 32<<20 || config.UnikraftPackage != "" ||
+			config.RunID == "" || len(config.RunID) > 128 ||
+			strings.Trim(config.RunID, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != "" ||
+			!filepath.IsAbs(config.CleanupReceiptPath) || strings.ContainsRune(config.CleanupReceiptPath, '\x00') {
+			return nil, errors.New("protected owned pair requires mediated GCS/root, interactive endpoints, 32 MiB, Linux, a simple run ID and an absolute cleanup receipt path")
+		}
+	} else if config.DiodePartitionSealMask != nil || config.WorkloadPartitionSealMask != nil ||
+		config.RunID != "" || config.CleanupReceiptPath != "" {
+		return nil, errors.New("partition masks and cleanup receipt identity require protected_shared")
+	}
+	if config.PageMetadataOutputPath != "" {
+		volume := filepath.VolumeName(config.PageMetadataOutputPath)
+		if !config.ProtectedShared || !filepath.IsAbs(config.PageMetadataOutputPath) ||
+			len(volume) != 2 || volume[1] != ':' ||
+			!strings.ContainsAny(volume[:1], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") ||
+			strings.ContainsAny(config.PageMetadataOutputPath[2:], ":\x00") {
+			return nil, errors.New("page metadata output requires the protected owned Linux profile and an absolute local drive directory path")
+		}
+	}
 	if config.StorageDirectIO && config.UnikraftPackage != "" {
 		return nil, errors.New("storage direct I/O requires a Linux diode")
+	}
+	if err := validateWorkloadVmbusNoRpConfig(&config); err != nil {
+		return nil, err
 	}
 	if err := config.validateResources(); err != nil {
 		return nil, err
@@ -110,8 +176,70 @@ func decodeConfig(reader io.Reader) (*Config, error) {
 	return &config, nil
 }
 
+// validateConfigMasks rejects ambiguous mask and native no-RP selection before
+// normal strict decoding. Masks require decimal strings; no-RP requires a bool.
+func validateConfigMasks(raw []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("sibling pair config must be an object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name := token.(string)
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+		switch {
+		case strings.EqualFold(name, "workload_vmbus_no_rp"):
+			name = "workload_vmbus_no_rp"
+			if seen[name] || (!bytes.Equal(value, []byte("true")) && !bytes.Equal(value, []byte("false"))) {
+				return errors.New("workload_vmbus_no_rp must be a single JSON boolean")
+			}
+			seen[name] = true
+			continue
+		case strings.EqualFold(name, "diode_partition_seal_mask"):
+			name = "diode_partition_seal_mask"
+		case strings.EqualFold(name, "workload_partition_seal_mask"):
+			name = "workload_partition_seal_mask"
+		default:
+			continue
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate partition mask %q", name)
+		}
+		seen[name] = true
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil || text == "" ||
+			strings.Trim(text, "0123456789") != "" {
+			return fmt.Errorf("%s must be an unsigned decimal string, not null or a JSON number", name)
+		}
+		if _, err := strconv.ParseUint(text, 10, 64); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// validateWorkloadVmbusNoRpConfig restricts explicit native suppression to the
+// protected mediated owned Linux profile, including directly constructed Configs.
+func validateWorkloadVmbusNoRpConfig(config *Config) error {
+	if config.WorkloadVmbusNoRp && (!config.ProtectedShared || !config.MediateGCS ||
+		!config.Interactive || config.UnikraftPackage != "" || config.SharedMemoryBytes != 32<<20) {
+		return errors.New("workload_vmbus_no_rp requires the protected mediated interactive owned Linux profile")
+	}
+	return nil
+}
+
 // Pair owns a newly created workload and, unless standalone, its diode and
 // shared section. Workload tasks borrow Workload; only the sandbox closes it.
+// Protected participant/service loss also requests native shutdown independently
+// of workload task cleanup.
 type Pair struct {
 	Workload        *uvm.UtilityVM
 	Diode           *uvm.UtilityVM
@@ -122,6 +250,7 @@ type Pair struct {
 	done            chan struct{}
 	unikraft        bool
 	unikraftConsole *ownedUnikraftConsole
+	protected       *protectedPair
 	cpuGroups       *cpugroup.Assignments
 	// Closers are captured immediately after acquisition so partial startup
 	// follows the same consumer-before-provider ownership order.
@@ -131,9 +260,23 @@ type Pair struct {
 	interactiveCloser io.Closer
 }
 
-func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+// SealPartition binds a runtime request to this protected owner, never a saved
+// HCS ID. Ordinary pairs reject without dispatch; explicit repeats are not cached.
+func (p *Pair) SealPartition(role string, mask uint64) (string, error) {
+	if !validSealRole(role) || !p.IsProtected() {
+		return "", &uvm.PartitionSealError{Err: errors.New("partition seal requires a protected live diode/workload owner")}
+	}
+	return p.protected.sealPartition(role, mask)
+}
+
+// commonPairOptions clones security and role settings without acquiring backing.
+// Callers assign either an ordinary section or a real protected capability later.
+func commonPairOptions(base *uvm.OptionsLCOW, config *Config, group string) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
 	if config.Standalone {
 		return nil, nil, errors.New("standalone does not have pair options")
+	}
+	if err := validateWorkloadVmbusNoRpConfig(config); err != nil {
+		return nil, nil, err
 	}
 	if err := config.validateResources(); err != nil {
 		return nil, nil, err
@@ -145,9 +288,11 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 		base.SiblingRoot || strings.EqualFold(base.GuestStateFilePath, config.WorkloadGuestStateFile) {
 		return nil, nil, errors.New("sibling pair requires GCS, SNP dm-verity boot, a bundle directory and SCSI")
 	}
-	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 || len(base.AssignedDevices) != 0 {
-		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership or assigned devices")
+	if len(base.SharedMemoryRegions) != 0 || len(base.SiblingCommunicationEndpoints) != 0 ||
+		len(base.AssignedDevices) != 0 || base.TimesyncRelayID != nil || base.WorkloadVmbusNoRp {
+		return nil, nil, errors.New("sibling pair cannot inherit shared regions, endpoint ownership, assigned devices, a timesync route or WorkloadVmbusNoRp")
 	}
+	// Each guest owns independent mutable option structs; policy bytes are unchanged.
 	clone := func(role Role, id, bundle string) (*uvm.OptionsLCOW, error) {
 		options := *base
 		common := *base.Options
@@ -164,17 +309,14 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 			config.VMResources[index].Apply(options.Options)
 		}
 		options.KernelBootOptions = strings.TrimSpace(base.KernelBootOptions + " hcs_shmem_diag.role=" + string(role))
-		options.SharedMemoryRegions = []uvm.LCOWSharedMemoryRegion{{
-			SectionName: section.HCSName, Length: int32(section.Size), AllowGuestWrite: true,
-		}}
 		endpoint, err := Endpoint(role, group)
 		if err != nil {
 			return nil, err
 		}
-		endpoint.SharedMemorySectionName = section.HCSName
 		options.SiblingCommunicationEndpoints = []hcsschema.SiblingCommunicationEndpoint{endpoint}
 		if role == Workload {
 			options.SiblingRoot = true
+			options.WorkloadVmbusNoRp = config.WorkloadVmbusNoRp
 			options.GuestStateFilePath = config.WorkloadGuestStateFile
 			options.VPMemDeviceCount = 0
 		} else {
@@ -190,26 +332,41 @@ func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *S
 	return workload, diode, err
 }
 
+// pairOptions adds ordinary mapped-section settings to the common role options.
+func pairOptions(base *uvm.OptionsLCOW, config *Config, group string, section *Section) (*uvm.OptionsLCOW, *uvm.OptionsLCOW, error) {
+	workload, diode, err := commonPairOptions(base, config, group)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, options := range []*uvm.OptionsLCOW{workload, diode} {
+		options.SharedMemoryRegions = []uvm.LCOWSharedMemoryRegion{{
+			SectionName: section.HCSName, Length: int32(section.Size), AllowGuestWrite: true,
+		}}
+		options.SiblingCommunicationEndpoints[0].SharedMemorySectionName = section.HCSName
+	}
+	return workload, diode, nil
+}
+
 // Start creates and bootstraps a pair in-process. Workload boot and diode root
 // provider bootstrap must overlap: the workload cannot reach GCS without root0.
+// Protected errors run the single cleanup decision; incomplete owners stay
+// retained in-process even when no sandbox task was published.
 func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair, resultErr error) {
 	ctx, cancelStartup := context.WithCancel(ctx)
 	defer cancelStartup()
 	if config == nil {
 		return nil, errors.New("sibling pair config is nil")
 	}
-	consoleDirectory := config.directory
-	if err := config.validateResources(); err != nil {
-		return nil, err
-	}
-	// Validate programmatic callers as strictly as annotation/config-file callers.
-	encoded, err := json.Marshal(config)
+	config, err := config.validatedCopy()
 	if err != nil {
 		return nil, err
 	}
-	config, err = decodeConfig(strings.NewReader(string(encoded)))
-	if err != nil {
-		return nil, err
+	if config.ProtectedShared {
+		pair, err := startProtectedPair(ctx, base, config)
+		if err != nil && pair != nil {
+			err = errors.Join(err, pair.Close())
+		}
+		return pair, err
 	}
 	if config.Standalone {
 		return startStandalone(ctx, base, config)
@@ -273,7 +430,7 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 		return nil, fmt.Errorf("create sibling workload: %w", err)
 	}
 	if native != nil {
-		if err := pair.prepareOwnedUnikraft(diodeOptions, native, consoleDirectory); err != nil {
+		if err := pair.prepareOwnedUnikraft(diodeOptions, native, config.directory); err != nil {
 			return nil, err
 		}
 		cancelOnProviderLoss(ctx, pair.unikraftConsole, cancelStartup)
@@ -429,13 +586,13 @@ func Start(ctx context.Context, base *uvm.OptionsLCOW, config *Config) (_ *Pair,
 	if native != nil {
 		provider, diodeUplink = "unikraft", native.Network.Uplink.String()
 	}
-	if consoleDirectory != "" {
+	if config.directory != "" {
 		metadata, err := newBenchmarkNetwork(ip, diodeUplink, provider, pair.Workload.ID(), pair.Diode.ID())
 		if err != nil {
 			return nil, err
 		}
 		metadata.PublishedTCPPorts = append([]uint16(nil), config.PublishedTCPPorts...)
-		if err := writeBenchmarkNetwork(consoleDirectory, metadata); err != nil {
+		if err := writeBenchmarkNetwork(config.directory, metadata); err != nil {
 			return nil, err
 		}
 	}
@@ -511,12 +668,25 @@ func workloadNICCommand() string {
 }
 
 func workloadNICCommandForMAC(mac string) string {
+	return BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
+		workloadNICDiscoveryCommandForMAC(mac)
+}
+
+// workloadNICDiscoveryCommandForMAC selects the peer NIC without provisioning
+// modules. Callers must first load or require the registered sibling adapter.
+func workloadNICDiscoveryCommandForMAC(mac string) string {
+	return workloadNICDiscoveryCommand(mac, false)
+}
+
+// workloadNICDiscoveryCommand shares peer NIC discovery with protected setup,
+// which requires an explicit kernel mode on every context-owned readiness poll.
+func workloadNICDiscoveryCommand(mac string, requireMode bool) string {
 	checkMAC := ""
 	if mac != "" {
 		checkMAC = `[ "$(cat "$p/address")" = ` + Quote(mac) + ` ] || { echo 'workload peer MAC differs from Unikraft manifest' >&2; exit 1; }; `
 	}
-	return BusLoadCommand("/run/sibling/sibling_bus.ko/sibling_bus.ko") +
-		guestInstanceCommand(3, 4) +
+	return DiscoveryShell + `until ` + OwnerReadyCommand(requireMode) + `; do sleep 0.1; done; ` +
+		`set -- $(cat "$sb_instance"); [ "$#" -eq 5 ]; sb_bus=${1#*=}; [ "${2#*=}" = 3 ]; [ "${3#*=}" = 4 ]; [ "${4#*=}" = 4 ]; [ "${5#*=}" = 1 ]; ` +
 		`until count=0; dev=; for p in /sys/class/net/*; do [ -e "$p/device" ] || continue; ` +
 		`d=$(readlink -f "$p/device"); case ${d##*/} in bus${sb_bus}-relid*) ` +
 		`[ "$(basename "$(readlink "$p/device/driver")")" = hv_netvsc ] || exit 1; ` + checkMAC + `dev=${d##*/}; count=$((count+1));; ` +
@@ -524,6 +694,9 @@ func workloadNICCommandForMAC(mac string) string {
 		`[ "$count" -eq 1 ]; do sleep 0.1; done; printf '%s\n' "$dev"`
 }
 
+// Close makes one cleanup decision. Protected native dispatch is serialized with
+// termination and reclaim, independently of child-task or guest IO completion.
+// Native incompleteness and released-with-publication-failure are cached, never replayed.
 func (p *Pair) Close() error {
 	return p.close(nil)
 }
@@ -531,6 +704,14 @@ func (p *Pair) Close() error {
 func (p *Pair) close(cause error) error {
 	if p == nil {
 		return nil
+	}
+	if p.protected != nil {
+		p.protected.stop(cause)
+		// All callers share the one decision, including publication failures.
+		p.closeOnce.Do(func() {
+			p.closeErr = p.protected.close()
+		})
+		return p.closeErr
 	}
 	p.closeOnce.Do(func() {
 		p.closeErr = cause

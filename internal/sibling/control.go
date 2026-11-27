@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,40 @@ func runGuest(ctx context.Context, vm *uvm.UtilityVM, script string) (string, er
 			err, guestOutputTail(out.String()), guestOutputTail(stderr.String()))
 	}
 	return out.String(), nil
+}
+
+// joinedGuestCommand binds creation and all command-owned callbacks to ctx.
+// The caller retains vm and output until Run/Wait returns, even past deadlines.
+func joinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) *cmd.Cmd {
+	command := NewJoinedGuestCommand(ctx, vm, "/bin/sh", "-ec", script)
+	command.Stdout, command.Stderr = output, output
+	return command
+}
+
+// NewJoinedGuestCommand reuses Cmd's joined lifetime for protected direct guest
+// borrowers. The caller retains vm and joins any external input producer.
+func NewJoinedGuestCommand(ctx context.Context, vm *uvm.UtilityVM, name string, args ...string) *cmd.Cmd {
+	command := cmd.CommandContext(ctx, contextHost{vm, ctx}, name, args...)
+	command.JoinBackgroundOperations = true
+	command.CopyAfterExitTimeout = 5 * time.Second
+	return command
+}
+
+// runGuestJoined is the protected setup/export path; ordinary runGuest stays
+// unchanged. Capture required control output independently of best-effort logging;
+// a log write failure is not a guest-command or protected-ownership failure.
+func runGuestJoined(ctx context.Context, vm *uvm.UtilityVM, script string, output io.Writer) (string, error) {
+	var out, stderr bytes.Buffer
+	command := joinedGuestCommand(ctx, vm, script, output)
+	command.Stdout, command.Stderr = &out, &stderr
+	err := command.Run()
+	if _, logErr := fmt.Fprint(output, out.String(), stderr.String()); logErr != nil {
+		log.G(ctx).WithError(logErr).Warn("protected guest output could not be logged")
+	}
+	if err != nil {
+		return out.String(), fmt.Errorf("protected guest %s: %w: %s", vm.ID(), err, strings.TrimSpace(stderr.String()))
+	}
+	return out.String(), ctx.Err()
 }
 
 func guestOutputTail(output string) string {

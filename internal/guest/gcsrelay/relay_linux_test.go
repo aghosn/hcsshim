@@ -17,9 +17,344 @@ import (
 	"time"
 
 	"github.com/Microsoft/hcsshim/internal/guest/prot"
+	"github.com/Microsoft/hcsshim/internal/protocol/guestresource"
 	"github.com/linuxkit/virtsock/pkg/vsock"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+// startLoggingTest runs the real outer relay with existing local-socket fakes.
+// Cleanup cancels and joins the run, including any independently blocked logs.
+func startLoggingTest(t *testing.T, logging bool) (*ioHarness, func(), <-chan struct{}) {
+	t.Helper()
+	h := &ioHarness{}
+	d := h.dependencies(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	path := filepath.Join(t.TempDir(), "ready")
+	done := make(chan struct{})
+	var runErr error
+	// Exercise production readiness and concurrent log/control acceptance.
+	go func() {
+		runErr = runWithLogging(ctx, path, d, logging)
+		close(done)
+	}()
+	var once sync.Once
+	// Joining is idempotent so scenarios can explicitly test shutdown.
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("outer relay did not join workers")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return h, stop, done
+		}
+		select {
+		case <-done:
+			t.Fatalf("relay exited before readiness: %v", runErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("relay never became ready")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// logTestEndpoints snapshots fully set-up endpoints after readiness. Deadlines
+// keep a broken forwarding implementation from hanging the test process.
+func logTestEndpoints(t *testing.T, h *ioHarness, port, rootPort uint32) (net.Conn, *net.TCPConn) {
+	t.Helper()
+	h.mu.Lock()
+	listener, root := h.listeners[port], h.roots[rootPort]
+	h.mu.Unlock()
+	if listener == nil || root == nil {
+		t.Fatal("missing relay endpoint")
+	}
+	workload, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { workload.Close() })
+	workload.SetDeadline(time.Now().Add(3 * time.Second))
+	root.SetDeadline(time.Now().Add(3 * time.Second))
+	return workload, root
+}
+
+// TestLogRelayForwardsBeforeControl verifies raw fragmented/coalesced diagnostics
+// and EOF reach the root before GCS connects, preventing the boot dependency cycle.
+func TestLogRelayForwardsBeforeControl(t *testing.T) {
+	h, _, _ := startLoggingTest(t, true)
+	workload, root := logTestEndpoints(t, h, guestresource.LinuxLogVsockPort, guestresource.GCSRelayLogPort)
+	input := bytes.Repeat([]byte("not JSON\x00\xff\nkernel diagnostic\n{\"log\":1}\n"), 4096)
+	// Fragment writes independently of record boundaries; the relay must not parse.
+	go func() {
+		for _, chunk := range [][]byte{input[:1], input[1:7], input[7:]} {
+			if err := writeAll(workload, chunk); err != nil {
+				return
+			}
+		}
+		workload.Close()
+	}()
+	got, err := io.ReadAll(root)
+	if err != nil || !bytes.Equal(got, input) {
+		t.Fatalf("early log bytes/EOF changed: %q %v", got, err)
+	}
+}
+
+// TestLogRelayDoesNotForwardRootData verifies the independent log leg is one-way:
+// root application bytes must not enter the workload's inherited output socket.
+func TestLogRelayDoesNotForwardRootData(t *testing.T) {
+	h, _, _ := startLoggingTest(t, true)
+	workload, root := logTestEndpoints(t, h, guestresource.LinuxLogVsockPort, guestresource.GCSRelayLogPort)
+	if err := writeAll(root, []byte("root application bytes")); err != nil {
+		t.Fatal(err)
+	}
+	workload.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := workload.Read(make([]byte, 1)); err == nil {
+		t.Fatal("root bytes were forwarded to workload output")
+	} else if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+		t.Fatalf("log leg failed before forwarding: %v", err)
+	}
+}
+
+// TestLogRelayDisabledHasNoEndpoints checks Run compatibility: ordinary relay
+// readiness must not bind or dial either dedicated log endpoint.
+func TestLogRelayDisabledHasNoEndpoints(t *testing.T) {
+	h, _, _ := startLoggingTest(t, false)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.listeners) != 1 || len(h.roots) != 1 ||
+		h.listeners[guestresource.LinuxLogVsockPort] != nil || h.roots[guestresource.GCSRelayLogPort] != nil {
+		t.Fatal("default relay acquired log endpoints")
+	}
+}
+
+// TestLogRelayFailureLeavesControlAlive forces an established root write failure,
+// then exchanges control frames both ways: logs must not enter session.launch.
+func TestLogRelayFailureLeavesControlAlive(t *testing.T) {
+	var diagnostics bytes.Buffer
+	logger := logrus.StandardLogger()
+	output := logger.Out
+	logger.SetOutput(&diagnostics)
+	t.Cleanup(func() { logger.SetOutput(output) })
+	h, stop, _ := startLoggingTest(t, true)
+	logs, sink := logTestEndpoints(t, h, guestresource.LinuxLogVsockPort, guestresource.GCSRelayLogPort)
+	sink.SetLinger(0)
+	sink.Close()
+	// A reset is observed on a later write; send until the log leg is closed.
+	logClosed := make(chan struct{})
+	go func() {
+		defer close(logClosed)
+		for {
+			if err := writeAll(logs, bytes.Repeat([]byte("failure"), 1024)); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-logClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("failed log stream stayed open")
+	}
+	workload, root := logTestEndpoints(t, h, prot.LinuxGcsVsockPort, RootControlPort)
+	input := frame(prot.ComputeSystemGetPropertiesV1, 7, "unmodified")
+	if err := writeAll(root, input); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(input))
+	if _, err := io.ReadFull(workload, got); err != nil || !bytes.Equal(input, got) {
+		t.Fatalf("log failure terminated control request: %v", err)
+	}
+	if err := writeAll(workload, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(root, got); err != nil || !bytes.Equal(input, got) {
+		t.Fatalf("log failure terminated control response: %v", err)
+	}
+	stop()
+	if count := bytes.Count(diagnostics.Bytes(), []byte("gcsrelay: log stream stopped")); count != 1 {
+		t.Fatalf("established log failure reported %d times: %s", count, diagnostics.String())
+	}
+}
+
+// TestLogRelayControlShutdownJoins verifies control loss closes and joins logs
+// blocked in accept/read/write, rather than leaving an independently lived worker.
+func TestLogRelayControlShutdownJoins(t *testing.T) {
+	for _, state := range []string{"accept", "read", "write"} {
+		t.Run(state, func(t *testing.T) {
+			h, _, done := startLoggingTest(t, true)
+			var logs net.Conn
+			if state != "accept" {
+				logs, _ = logTestEndpoints(t, h, guestresource.LinuxLogVsockPort, guestresource.GCSRelayLogPort)
+			}
+			workload, root := logTestEndpoints(t, h, prot.LinuxGcsVsockPort, RootControlPort)
+			input := frame(prot.ComputeSystemGetPropertiesV1, 8, "before control shutdown")
+			if err := writeAll(root, input); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(workload, make([]byte, len(input))); err != nil {
+				t.Fatal(err)
+			}
+			var sent chan error
+			if state == "write" {
+				sent = make(chan error, 1)
+				// Fill the socket while its root peer intentionally does not drain.
+				go func() { sent <- writeAll(logs, make([]byte, 16<<20)) }()
+				select {
+				case err := <-sent:
+					t.Fatalf("sink did not apply pressure: %v", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			root.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("control shutdown retained log workers")
+			}
+			if sent != nil {
+				select {
+				case <-sent:
+				case <-time.After(time.Second):
+					t.Fatal("control shutdown retained log sender")
+				}
+			}
+			if logs != nil {
+				if _, err := logs.Read(make([]byte, 1)); err == nil {
+					t.Fatal("control shutdown retained log socket")
+				}
+			}
+		})
+	}
+}
+
+// TestLogRelaySetupRollback checks every required endpoint failure, including
+// later control setup, returns explicitly without readiness or leaked log legs.
+func TestLogRelaySetupRollback(t *testing.T) {
+	for _, failure := range []string{"log-listen", "log-dial", "control-listen", "control-dial"} {
+		t.Run(failure, func(t *testing.T) {
+			h := &ioHarness{}
+			d := h.dependencies(t)
+			listen, dial := d.listen, d.dial
+			injected := errors.New(failure)
+			// Fail precisely one setup operation, leaving rollback to production.
+			d.listen = func(cid, port uint32) (net.Listener, error) {
+				if failure == "log-listen" && port == guestresource.LinuxLogVsockPort ||
+					failure == "control-listen" && port == prot.LinuxGcsVsockPort {
+					return nil, injected
+				}
+				return listen(cid, port)
+			}
+			d.dial = func(ctx context.Context, cid, port uint32) (net.Conn, error) {
+				if failure == "log-dial" && port == guestresource.GCSRelayLogPort ||
+					failure == "control-dial" && port == RootControlPort {
+					return nil, injected
+				}
+				return dial(ctx, cid, port)
+			}
+			path := filepath.Join(t.TempDir(), "ready")
+			if err := runWithLogging(context.Background(), path, d, true); !errors.Is(err, injected) {
+				t.Fatalf("setup error: %v", err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("failed setup advertised readiness")
+			}
+			for _, listener := range h.listeners {
+				if c, err := listener.Accept(); err == nil {
+					c.Close()
+					t.Fatal("setup rollback leaked listener")
+				}
+			}
+			for _, root := range h.roots {
+				root.SetReadDeadline(time.Now().Add(time.Second))
+				if _, err := root.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+					t.Fatalf("setup rollback retained root: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestLogRelayPeerAndCancellation covers wrong-peer rejection and blocked
+// accept/read/write shutdown. Unbuffered pipes prove sink pressure reaches the
+// sender instead of being absorbed in an unbounded application queue.
+func TestLogRelayPeerAndCancellation(t *testing.T) {
+	for _, state := range []string{"peer", "accept", "read", "write"} {
+		t.Run(state, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			root, sink := net.Pipe()
+			defer sink.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			accepted := make(chan struct{})
+			d := dependencies{workloadPeer: func(net.Conn) bool {
+				close(accepted)
+				return state != "peer"
+			}}
+			done := make(chan error, 1)
+			// Serve exactly one log session without the control session launcher.
+			go func() { done <- serveLog(ctx, listener, root, d) }()
+			var sender net.Conn
+			var sent chan error
+			if state != "accept" {
+				sender, err = net.Dial("tcp", listener.Addr().String())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sender.Close()
+				select {
+				case <-accepted:
+				case <-time.After(time.Second):
+					t.Fatal("log peer never checked")
+				}
+			}
+			if state == "write" {
+				sent = make(chan error, 1)
+				// Exceed TCP buffers while the unbuffered root sink does not read.
+				go func() { sent <- writeAll(sender, make([]byte, 16<<20)) }()
+				select {
+				case err := <-sent:
+					t.Fatalf("slow sink did not backpressure sender: %v", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			if state != "peer" {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("peer/cancellation unexpectedly succeeded")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("log worker did not join")
+			}
+			if sent != nil {
+				select {
+				case <-sent:
+				case <-time.After(time.Second):
+					t.Fatal("sender retained by cancelled log leg")
+				}
+			}
+			sink.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := sink.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Fatalf("log root remained open: %v", err)
+			}
+		})
+	}
+}
 
 func frame(kind prot.MessageIdentifier, id uint64, body string) []byte {
 	b := make([]byte, headerSize+len(body))

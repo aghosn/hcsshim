@@ -9,6 +9,32 @@
 
 package hcsschema
 
+// ProtectedSharedAction selects a private admission/cleanup operation. Native
+// startup alone initializes and installs; the retired values remain wire names,
+// not supported Modify actions. Empty/None is valid only at creation.
+type ProtectedSharedAction string
+
+const (
+	ProtectedSharedNone          ProtectedSharedAction = "None"
+	ProtectedSharedInitialize    ProtectedSharedAction = "Initialize"
+	ProtectedSharedInstall       ProtectedSharedAction = "Install"
+	ProtectedSharedSeal          ProtectedSharedAction = "Seal"
+	ProtectedSharedBeginTeardown ProtectedSharedAction = "BeginTeardown"
+	ProtectedSharedRemove        ProtectedSharedAction = "Remove"
+	ProtectedSharedReclaim       ProtectedSharedAction = "Reclaim"
+)
+
+// ProtectedSharedBackingMode is an immutable, explicit startup role. Bootstrap
+// acquires fresh backing and revokes RP access before Install; Import attaches
+// fully initialized lease backing without a content view or reinitialization.
+type ProtectedSharedBackingMode string
+
+const (
+	ProtectedSharedBackingNone      ProtectedSharedBackingMode = "None"
+	ProtectedSharedBackingBootstrap ProtectedSharedBackingMode = "Bootstrap"
+	ProtectedSharedBackingImport    ProtectedSharedBackingMode = "Import"
+)
+
 type SharedMemoryRegion struct {
 	SectionName string `json:"SectionName,omitempty"`
 
@@ -19,4 +45,19 @@ type SharedMemoryRegion struct {
 	AllowGuestWrite bool `json:"AllowGuestWrite,omitempty"`
 
 	HiddenFromGuest bool `json:"HiddenFromGuest,omitempty"`
+
+	// Protected regions are explicitly non-hidden and installed by native
+	// startup before sibling offers, without GCS. URI selects a real operation
+	// file capability, not authority supplied by this JSON.
+	ProtectedShared              bool                       `json:"ProtectedShared,omitempty"`
+	ProtectedSharedControllerUri string                     `json:"ProtectedSharedControllerUri,omitempty"`
+	ProtectedSharedBackingMode   ProtectedSharedBackingMode `json:"ProtectedSharedBackingMode,omitempty"`
+	ProtectedSharedOperation     ProtectedSharedAction      `json:"ProtectedSharedOperation,omitempty"`
+	// Bootstrap create requires lease zero; Import create and all modifies
+	// require the actual lease. Lifetime zero uses VID-owned descriptors.
+	// Offset/Length above are bytes; private indices/counts are 4-KiB pages.
+	ProtectedSharedLeaseId    uint64 `json:"ProtectedSharedLeaseId,omitempty"`
+	ProtectedSharedLifetimeId uint64 `json:"ProtectedSharedLifetimeId,omitempty"`
+	ProtectedSharedPageIndex  uint64 `json:"ProtectedSharedPageIndex,omitempty"`
+	ProtectedSharedPageCount  uint32 `json:"ProtectedSharedPageCount,omitempty"`
 }
